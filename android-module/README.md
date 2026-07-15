@@ -131,6 +131,13 @@ WeChat's service-locator initialization guard from the module worker thread, so
 the builder is the safer primary path. Both paths are WeChat-process calls; the
 module does not parse or execute commands.
 
+The final boolean returned by `w11.n1.a()` is NetScene queue admission, not
+builder construction. The builder has already inserted one local message at
+that point. When the queue is busy, the module waits on its outbox worker and
+retries the same prepared request on WeChat's main thread. It never rebuilds the
+message or switches to a fallback after a request exists, which prevents a
+queue-busy result from creating duplicate outgoing rows.
+
 On WeChat Android `8.0.75`, the installed app can run through Tinker. The send
 adapter must resolve WeChat classes with the patched runtime loader returned by
 `Application.getClassLoader()`, which can be a `DelegateLastClassLoader` over
@@ -142,10 +149,9 @@ After changing WeChat versions, validate the send path on a test account before
 using it with real conversations. The module should ACK `sent` only after the
 WeChat-process send call returns without an error.
 
-The send path currently returns a successful ACK without `chat_record_id`
-because the WeChat send calls do not return it. Precise local message-id
-correlation can be added later by matching the subsequent self-sent message DB
-insert.
+The builder request exposes its local message ID on the current compatibility
+target. The module includes that value as `chat_record_id` when it can read it;
+the field remains optional for fallback paths and future WeChat versions.
 
 ## Contact Snapshot
 

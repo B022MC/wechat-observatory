@@ -43,6 +43,7 @@ import cc.wechat.observatory.config.BridgeConfig;
 import cc.wechat.observatory.gateway.WebSocketFrame;
 import cc.wechat.observatory.model.MessagePayload;
 import cc.wechat.observatory.util.BridgeLogger;
+import cc.wechat.observatory.wechat.QueueSubmissionRetrier;
 import cc.wechat.observatory.wechat.SendResult;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -77,6 +78,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_REGISTER_SUCCESS_AT = 0L;
     private static volatile Context APP_CONTEXT;
     private static volatile ClassLoader WECHAT_CLASS_LOADER;
+    private static final int SEND_QUEUE_MAX_ATTEMPTS = 5;
+    private static final long SEND_QUEUE_RETRY_DELAY_MS = 500L;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -2173,24 +2176,70 @@ public final class HookEntry implements IXposedHookLoadPackage {
         final String targetWxid = wxid;
         final String targetText = text;
         try {
-            return callOnMainThread(new Callable<SendResult>() {
+            final PreparedTextSend prepared = callOnMainThread(new Callable<PreparedTextSend>() {
                 @Override
-                public SendResult call() {
-                    return sendTextOnWeChatThread(targetClassLoader, targetWxid, targetText);
+                public PreparedTextSend call() {
+                    return prepareTextSendOnWeChatThread(targetClassLoader, targetWxid, targetText);
                 }
             });
+            if (prepared.result != null) {
+                return prepared.result;
+            }
+
+            final int[] attempts = new int[]{0};
+            boolean accepted = QueueSubmissionRetrier.awaitAccepted(
+                    new QueueSubmissionRetrier.Attempt() {
+                        @Override
+                        public boolean submit() throws Exception {
+                            attempts[0]++;
+                            final Object request = prepared.builderRequest;
+                            boolean queued = callOnMainThread(new Callable<Boolean>() {
+                                @Override
+                                public Boolean call() throws Exception {
+                                    return executeSendBuilderRequest(request);
+                                }
+                            });
+                            if (!queued) {
+                                log("w11.r1 queue busy; keep same request wxid=" + targetWxid
+                                        + " msgType=" + prepared.msgType
+                                        + " msgId=" + prepared.chatRecordId
+                                        + " attempt=" + attempts[0] + "/" + SEND_QUEUE_MAX_ATTEMPTS);
+                            }
+                            return queued;
+                        }
+                    },
+                    new QueueSubmissionRetrier.Sleeper() {
+                        @Override
+                        public void sleep(long delayMillis) throws InterruptedException {
+                            Thread.sleep(delayMillis);
+                        }
+                    },
+                    SEND_QUEUE_MAX_ATTEMPTS,
+                    SEND_QUEUE_RETRY_DELAY_MS);
+            if (!accepted) {
+                return SendResult.failed("WeChat send builder queue stayed busy after "
+                        + SEND_QUEUE_MAX_ATTEMPTS + " attempts; local msg id=" + prepared.chatRecordId);
+            }
+            log("sendText queued via w11.r1 builder wxid=" + targetWxid
+                    + " msgType=" + prepared.msgType
+                    + " msgId=" + prepared.chatRecordId
+                    + " attempts=" + attempts[0]);
+            return SendResult.sent(prepared.chatRecordId);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return SendResult.failed("WeChat send interrupted while waiting for queue");
         } catch (Throwable t) {
             return SendResult.failed("WeChat send failed on main thread: " + shortError(t));
         }
     }
 
-    private static SendResult sendTextOnWeChatThread(ClassLoader classLoader, String wxid, String text) {
+    private static PreparedTextSend prepareTextSendOnWeChatThread(ClassLoader classLoader, String wxid, String text) {
         classLoader = runtimeClassLoader(classLoader);
         if (classLoader == null) {
-            return SendResult.failed("WeChat classLoader is not available");
+            return PreparedTextSend.completed(SendResult.failed("WeChat classLoader is not available"));
         }
         if (isBlank(wxid) || isBlank(text)) {
-            return SendResult.failed("wxid and text are required");
+            return PreparedTextSend.completed(SendResult.failed("wxid and text are required"));
         }
 
         int msgType = resolveMessageType(classLoader, wxid);
@@ -2198,23 +2247,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Throwable directUnavailable = null;
         Throwable eventUnavailable = null;
         try {
-            boolean sent = sendViaSendBuilder(classLoader, wxid, text, msgType);
-            if (!sent) {
-                return SendResult.failed("WeChat send builder returned false");
-            }
-            log("sendText sent via w11.r1 builder wxid=" + wxid + " msgType=" + msgType);
-            return SendResult.sent(0L);
+            PreparedBuilderSend prepared = prepareSendBuilder(classLoader, wxid, text, msgType);
+            return PreparedTextSend.builder(prepared.request, prepared.chatRecordId, msgType);
         } catch (ClassNotFoundException | NoSuchMethodException e) {
             builderUnavailable = e;
             log("w11.r1 builder path unavailable, trying dk5.s5.fj: " + shortError(e));
         } catch (Throwable t) {
-            return SendResult.failed("WeChat send failed via w11.r1 builder: " + shortError(t));
+            return PreparedTextSend.completed(
+                    SendResult.failed("WeChat send failed via w11.r1 builder: " + shortError(t)));
         }
 
         try {
             long msgId = sendViaNetScene(classLoader, wxid, text, msgType);
             log("sendText sent via w11.r0 NetScene wxid=" + wxid + " msgType=" + msgType + " msgId=" + msgId);
-            return SendResult.sent(msgId);
+            return PreparedTextSend.completed(SendResult.sent(msgId));
         } catch (ClassNotFoundException | NoSuchMethodException e) {
             directUnavailable = e;
             log("w11.r0 NetScene path unavailable, trying dk5.s5.fj: " + shortError(e));
@@ -2229,7 +2275,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 throw new IllegalStateException("SendMsgEvent had no listener");
             }
             log("sendText published SendMsgEvent wxid=" + wxid + " msgType=" + msgType);
-            return SendResult.sent(0L);
+            return PreparedTextSend.completed(SendResult.sent(0L));
         } catch (ClassNotFoundException | NoSuchMethodException e) {
             eventUnavailable = e;
             log("SendMsgEvent path unavailable, trying dk5.s5.fj: " + shortError(e));
@@ -2241,13 +2287,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
         try {
             sendViaSendMsgMgr(classLoader, wxid, text, msgType);
             log("sendText sent via dk5.s5.fj wxid=" + wxid + " msgType=" + msgType);
-            return SendResult.sent(0L);
+            return PreparedTextSend.completed(SendResult.sent(0L));
         } catch (Throwable t) {
-            return SendResult.failed("WeChat send failed via dk5.s5.fj fallback: "
-                    + shortError(t)
-                    + "; event unavailable: " + shortError(eventUnavailable)
-                    + "; direct unavailable: " + shortError(directUnavailable)
-                    + "; builder unavailable: " + shortError(builderUnavailable));
+            return PreparedTextSend.completed(
+                    SendResult.failed("WeChat send failed via dk5.s5.fj fallback: "
+                            + shortError(t)
+                            + "; event unavailable: " + shortError(eventUnavailable)
+                            + "; direct unavailable: " + shortError(directUnavailable)
+                            + "; builder unavailable: " + shortError(builderUnavailable)));
         }
     }
 
@@ -2305,7 +2352,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         send.invoke(service, wxid, text, msgType, 0);
     }
 
-    private static boolean sendViaSendBuilder(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
+    private static PreparedBuilderSend prepareSendBuilder(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
         ensureSendBuilderFactory(classLoader);
         Class<?> builderFactory = findClass(classLoader, "w11.s1");
         Method create = findMethod(builderFactory, "a", String.class);
@@ -2325,6 +2372,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (request == null) {
             throw new IllegalStateException("w11.r1.a returned null");
         }
+        long chatRecordId = getOptionalLongField(request, "f459336b", "b");
+        return new PreparedBuilderSend(request, chatRecordId);
+    }
+
+    private static boolean executeSendBuilderRequest(Object request) throws Exception {
         Object result = findNoArgMethod(request.getClass(), "a").invoke(request);
         return !(result instanceof Boolean) || (Boolean) result;
     }
@@ -2388,7 +2440,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     }
                     return ctor.newInstance(args);
                 } catch (Throwable t) {
-                    log("constructor " + cls.getName() + "(" + ctor.getParameterCount() + ") failed: " + shortError(t));
+                    log("constructor " + cls.getName() + "(" + ctor.getParameterTypes().length + ") failed: " + shortError(t));
                 }
             }
             throw new NoSuchMethodException(cls.getName() + " constructors=" + describeConstructors(constructors));
@@ -2497,6 +2549,47 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return ((Number) value).longValue();
         }
         return Long.parseLong(String.valueOf(value));
+    }
+
+    private static long getOptionalLongField(Object target, String... names) {
+        try {
+            return getLongField(target, names);
+        } catch (Throwable t) {
+            log("optional long fields " + joinNames(names) + " read failed: " + shortError(t));
+            return 0L;
+        }
+    }
+
+    private static final class PreparedBuilderSend {
+        private final Object request;
+        private final long chatRecordId;
+
+        private PreparedBuilderSend(Object request, long chatRecordId) {
+            this.request = request;
+            this.chatRecordId = chatRecordId;
+        }
+    }
+
+    private static final class PreparedTextSend {
+        private final SendResult result;
+        private final Object builderRequest;
+        private final long chatRecordId;
+        private final int msgType;
+
+        private PreparedTextSend(SendResult result, Object builderRequest, long chatRecordId, int msgType) {
+            this.result = result;
+            this.builderRequest = builderRequest;
+            this.chatRecordId = chatRecordId;
+            this.msgType = msgType;
+        }
+
+        private static PreparedTextSend completed(SendResult result) {
+            return new PreparedTextSend(result, null, 0L, 0);
+        }
+
+        private static PreparedTextSend builder(Object request, long chatRecordId, int msgType) {
+            return new PreparedTextSend(null, request, chatRecordId, msgType);
+        }
     }
 
     private static String joinNames(String... names) {
