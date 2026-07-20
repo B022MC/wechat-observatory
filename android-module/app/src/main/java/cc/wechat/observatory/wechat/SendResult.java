@@ -16,6 +16,10 @@ public final class SendResult {
     }
 
     public static SendResult failed(String error) {
-        return new SendResult(false, 0L, error == null ? "send failed" : error);
+        return failed(0L, error);
+    }
+
+    public static SendResult failed(long chatRecordId, String error) {
+        return new SendResult(false, chatRecordId, error == null ? "send failed" : error);
     }
 }

@@ -43,6 +43,7 @@ import cc.wechat.observatory.config.BridgeConfig;
 import cc.wechat.observatory.gateway.WebSocketFrame;
 import cc.wechat.observatory.model.MessagePayload;
 import cc.wechat.observatory.util.BridgeLogger;
+import cc.wechat.observatory.wechat.LocalMessageConfirmation;
 import cc.wechat.observatory.wechat.QueueSubmissionRetrier;
 import cc.wechat.observatory.wechat.SendResult;
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -80,6 +81,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile ClassLoader WECHAT_CLASS_LOADER;
     private static final int SEND_QUEUE_MAX_ATTEMPTS = 5;
     private static final long SEND_QUEUE_RETRY_DELAY_MS = 500L;
+    private static final int SEND_STATUS_MAX_CHECKS = 10;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -2217,8 +2219,21 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     SEND_QUEUE_MAX_ATTEMPTS,
                     SEND_QUEUE_RETRY_DELAY_MS);
             if (!accepted) {
-                return SendResult.failed("WeChat send builder queue stayed busy after "
-                        + SEND_QUEUE_MAX_ATTEMPTS + " attempts; local msg id=" + prepared.chatRecordId);
+                LocalMessageConfirmation.Result confirmation = confirmLocalMessage(prepared.chatRecordId);
+                if (confirmation == LocalMessageConfirmation.Result.SENT) {
+                    log("sendText confirmed by local message status wxid=" + targetWxid
+                            + " msgType=" + prepared.msgType
+                            + " msgId=" + prepared.chatRecordId);
+                    return SendResult.sent(prepared.chatRecordId);
+                }
+                if (confirmation == LocalMessageConfirmation.Result.FAILED) {
+                    return SendResult.failed(prepared.chatRecordId,
+                            "WeChat local message marked failed; local msg id=" + prepared.chatRecordId);
+                }
+                return SendResult.failed(prepared.chatRecordId,
+                        "WeChat send builder queue stayed busy after "
+                                + SEND_QUEUE_MAX_ATTEMPTS + " attempts and local message did not reach a terminal status; local msg id="
+                                + prepared.chatRecordId);
             }
             log("sendText queued via w11.r1 builder wxid=" + targetWxid
                     + " msgType=" + prepared.msgType
@@ -2230,6 +2245,50 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return SendResult.failed("WeChat send interrupted while waiting for queue");
         } catch (Throwable t) {
             return SendResult.failed("WeChat send failed on main thread: " + shortError(t));
+        }
+    }
+
+    private static LocalMessageConfirmation.Result confirmLocalMessage(final long chatRecordId) throws Exception {
+        if (chatRecordId <= 0L) {
+            return LocalMessageConfirmation.Result.TIMEOUT;
+        }
+        return LocalMessageConfirmation.awaitTerminal(
+                new LocalMessageConfirmation.StatusReader() {
+                    @Override
+                    public int readStatus() throws Exception {
+                        return readLocalMessageStatus(chatRecordId);
+                    }
+                },
+                new LocalMessageConfirmation.Sleeper() {
+                    @Override
+                    public void sleep(long delayMillis) throws InterruptedException {
+                        Thread.sleep(delayMillis);
+                    }
+                },
+                SEND_STATUS_MAX_CHECKS,
+                SEND_QUEUE_RETRY_DELAY_MS);
+    }
+
+    private static int readLocalMessageStatus(long chatRecordId) throws Exception {
+        Object db = LAST_DATABASE;
+        if (db == null) {
+            return LocalMessageConfirmation.STATUS_UNKNOWN;
+        }
+        Object cursor = rawQuery(
+                db,
+                "SELECT status FROM message WHERE msgId = ? LIMIT 1",
+                new String[]{String.valueOf(chatRecordId)});
+        if (cursor == null) {
+            return LocalMessageConfirmation.STATUS_UNKNOWN;
+        }
+        try {
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (!Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return LocalMessageConfirmation.STATUS_UNKNOWN;
+            }
+            return intColumn(cursor, 0);
+        } finally {
+            closeQuietly(cursor);
         }
     }
 
