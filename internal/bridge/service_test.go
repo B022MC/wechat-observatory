@@ -356,6 +356,16 @@ func TestAdminSendTextRequiresCurrentOwnerWxID(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
 	}
+	var sendPayload struct {
+		OK       bool  `json:"ok"`
+		OutboxID int64 `json:"outbox_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sendPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !sendPayload.OK || sendPayload.OutboxID != 1 || bytes.Contains(rec.Body.Bytes(), []byte("chat_record_id")) {
+		t.Fatalf("send response must expose only the queue id: %s", rec.Body.String())
+	}
 	items := pollOutbox(t, service, "phone-a", 10)
 	if len(items) != 1 || items[0].OwnerWxID != "wxid_self" || items[0].WxID != "wxid_friend" || items[0].Text != "manual reply" {
 		t.Fatalf("unexpected outbox items: %+v", items)

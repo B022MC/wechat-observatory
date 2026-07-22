@@ -139,7 +139,7 @@ export async function sendText(params: {
   wxid: string;
   text: string;
 }) {
-  return requestJSON<{ ok: boolean; chat_record_id?: number }>("/api/send/text", {
+  return requestJSON<{ ok: boolean; outbox_id?: number }>("/api/send/text", {
     password: params.password,
     method: "POST",
     body: {

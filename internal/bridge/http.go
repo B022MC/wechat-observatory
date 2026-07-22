@@ -434,12 +434,12 @@ func (s *HTTPServer) sendText(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "owner_wxid_required", "owner_wxid is required for admin sends")
 		return
 	}
-	recordID, err := s.service.SendText(r.Context(), req)
+	outboxID, err := s.service.SendText(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "send_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "chat_record_id": recordID})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "outbox_id": outboxID})
 }
 
 func (s *HTTPServer) registerModule(w http.ResponseWriter, r *http.Request) {
