@@ -2,19 +2,51 @@ package bridge
 
 import (
 	"context"
-	"strings"
+	"errors"
+	"time"
 
 	"wechat-observatory/internal/config"
 )
 
+var ErrModuleSessionActive = errors.New("module device session is active")
+
 type Persistence interface {
 	UpdateDeviceIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error
-	RecordInboundEvent(ctx context.Context, event MessageEvent) error
-	RecordOutboundEvent(ctx context.Context, event MessageEvent) error
+	RecordInboundEvent(ctx context.Context, event MessageEvent) (MessageEvent, error)
+	RecordOutboundEvent(ctx context.Context, event MessageEvent) (MessageEvent, error)
+}
+
+// EventTailReader supplies durable SSE replay for any HTTP replica.
+type EventTailReader interface {
+	LatestLiveEventID(ctx context.Context) (int64, error)
+	ListLiveEventsAfter(ctx context.Context, afterID int64, limit int) ([]MessageEvent, error)
 }
 
 type DeviceLocator interface {
 	LookupDeviceByWxID(ctx context.Context, wxid string) (config.Device, bool, error)
+}
+
+// ModuleConfigReader makes MySQL the cross-replica authority for module
+// authentication and the device's current WeChat identity.
+type ModuleConfigReader interface {
+	LookupAPIKey(ctx context.Context, code string) (config.APIKey, bool, error)
+	LookupDevice(ctx context.Context, name string) (config.Device, bool, error)
+}
+
+type ModuleSessionLease struct {
+	Device    string
+	OwnerWxID string
+	HolderID  string
+	Token     string
+	TTL       time.Duration
+}
+
+// ModuleSessionLeaser coordinates long-lived outbox WebSockets across Pods.
+// The existing Outbox lease remains the per-message delivery guarantee.
+type ModuleSessionLeaser interface {
+	ClaimModuleSession(ctx context.Context, lease ModuleSessionLease) (bool, error)
+	RenewModuleSession(ctx context.Context, lease ModuleSessionLease) (bool, error)
+	ReleaseModuleSession(ctx context.Context, lease ModuleSessionLease) error
 }
 
 type Outbox interface {
@@ -70,6 +102,7 @@ type APIKeyView struct {
 
 type StoredEventView struct {
 	ID           int64  `json:"id"`
+	EventKey     string `json:"event_key,omitempty"`
 	SourceID     string `json:"source_id,omitempty"`
 	EventID      int64  `json:"event_id,omitempty"`
 	ChatRecordID int64  `json:"chat_record_id,omitempty"`
@@ -202,11 +235,5 @@ func WithOutbox(outbox Outbox) Option {
 func WithAdminReader(reader AdminReader) Option {
 	return func(s *Service) {
 		s.adminReader = reader
-	}
-}
-
-func WithMediaDir(mediaDir string) Option {
-	return func(s *Service) {
-		s.mediaDir = strings.TrimSpace(mediaDir)
 	}
 }

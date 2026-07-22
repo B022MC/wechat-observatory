@@ -36,7 +36,6 @@ Admin endpoints use `X-Bridge-Password: <BRIDGE_ADMIN_PASSWORD>` or
 - `GET /api/live/events`
 - `GET /api/modules/status`
 - `GET /api/module-contacts`
-- `GET /api/media/...`
 - `POST /api/devices`
 - `POST /api/api-keys`
 - `POST /api/api-keys/{key}/disable`
@@ -159,9 +158,9 @@ Message payloads may include:
 - `media_base64`
 - `media_url`
 
-If `media_base64` is present, the gateway decodes it, stores the file under
-`BRIDGE_MEDIA_DIR`, clears raw base64 from the persisted event, sets
-`media_url`, and serves the file through admin-protected `/api/media/...`.
+If `media_base64` is present, the gateway discards the raw bytes before
+persistence. The current transport deployment does not create a `media_url`
+or expose a media download endpoint.
 
 If media bytes are missing, the event is still valid when `text` carries a
 placeholder such as `[图片]` or `[语音]` and `media_kind` identifies the attachment.
@@ -263,7 +262,6 @@ It should:
 - Show module runtime status.
 - Show friend/group/contact lists from `/api/module-contacts`.
 - Show recent-message conversation rows from `/api/messages`.
-- Render image/voice/video/file attachments from `media_url` when available.
 - Open `/api/live/events` while auto-refresh is enabled.
 - Keep periodic refresh as a fallback.
 - Hide external business identity fields from normal console cards.

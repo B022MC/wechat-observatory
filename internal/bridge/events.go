@@ -1,7 +1,10 @@
 package bridge
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +25,8 @@ const (
 )
 
 type MessageEvent struct {
+	Sequence     int64     `json:"-"`
+	EventKey     string    `json:"event_key,omitempty"`
 	APIKey       string    `json:"api_key,omitempty"`
 	ID           string    `json:"id"`
 	EventID      int64     `json:"event_id"`
@@ -107,6 +112,36 @@ func (e MessageEvent) Timestamp() int64 {
 		return e.CreateTime
 	}
 	return time.Now().Unix()
+}
+
+// CanonicalEventKey identifies one source event across replay and replicas.
+// It deliberately uses a digest so raw message text and identifiers do not
+// become index keys or operational labels.
+func (e MessageEvent) CanonicalEventKey() string {
+	if key := strings.TrimSpace(e.EventKey); key != "" {
+		return key
+	}
+	parts := []string{
+		strings.TrimSpace(e.Device),
+		strings.TrimSpace(e.OwnerWxID),
+		string(e.Direction),
+		strings.TrimSpace(e.ID),
+		strconv.FormatInt(e.EventID, 10),
+		strconv.FormatInt(e.ChatRecordID, 10),
+		strings.TrimSpace(e.From),
+		strings.TrimSpace(e.To),
+		strings.TrimSpace(e.RoomID),
+		strings.TrimSpace(e.Sender),
+		strings.TrimSpace(e.Text),
+		strconv.FormatInt(int64(e.MessageType), 10),
+		strings.TrimSpace(e.MediaKind),
+		strings.TrimSpace(e.MediaMime),
+		strings.TrimSpace(e.MediaName),
+		strconv.FormatInt(e.MediaSize, 10),
+		strings.TrimSpace(e.RawProvider),
+	}
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "evt_" + hex.EncodeToString(digest[:])
 }
 
 type SendTextRequest struct {

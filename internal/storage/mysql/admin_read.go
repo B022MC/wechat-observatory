@@ -49,7 +49,7 @@ func (s *Store) ListAPIKeys(ctx context.Context, limit int) ([]bridge.APIKeyView
 
 func (s *Store) ListStoredEvents(ctx context.Context, limit int) ([]bridge.StoredEventView, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
+		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
 			to_wxid, room_id, sender_wxid, text, message_type, media_kind,
 			media_mime, media_name, media_url, media_size, raw_provider, create_time, created_at
 		FROM bridge_message_events
@@ -61,6 +61,37 @@ func (s *Store) ListStoredEvents(ctx context.Context, limit int) ([]bridge.Store
 	defer rows.Close()
 
 	return scanStoredEventViews(rows)
+}
+
+func (s *Store) LatestLiveEventID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM bridge_message_events`).Scan(&id)
+	return id, err
+}
+
+func (s *Store) ListLiveEventsAfter(ctx context.Context, afterID int64, limit int) ([]bridge.MessageEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid,
+			direction, from_wxid, to_wxid, room_id, sender_wxid, text, message_type,
+			media_kind, media_mime, media_name, media_url, media_size, raw_provider, create_time
+		FROM bridge_message_events
+		WHERE id > ?
+		ORDER BY id ASC
+		LIMIT ?`, afterID, normalizeLimit(limit))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]bridge.MessageEvent, 0)
+	for rows.Next() {
+		event, err := scanMessageEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, event)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListMessages(ctx context.Context, filter bridge.MessageFilter) ([]bridge.StoredEventView, error) {
@@ -108,7 +139,7 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 	}
 	args = append(args, normalizeLimit(filter.Limit))
 	return `
-		SELECT id, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
+		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
 			to_wxid, room_id, sender_wxid, text, message_type, media_kind,
 			media_mime, media_name, media_url, media_size, raw_provider, create_time, created_at
 		FROM bridge_message_events
@@ -127,6 +158,7 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 		var createdAt time.Time
 		if err := rows.Scan(
 			&item.ID,
+			&item.EventKey,
 			&sourceID,
 			&eventID,
 			&chatRecordID,
@@ -177,6 +209,60 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanMessageEvent(row rowScanner) (bridge.MessageEvent, error) {
+	var event bridge.MessageEvent
+	var sourceID, ownerWxID, fromWxID, toWxID, roomID, senderWxID, rawProvider sql.NullString
+	var mediaKind, mediaMime, mediaName, mediaURL sql.NullString
+	var eventID, chatRecordID, mediaSize sql.NullInt64
+	var direction string
+	err := row.Scan(
+		&event.Sequence,
+		&event.EventKey,
+		&sourceID,
+		&eventID,
+		&chatRecordID,
+		&event.Device,
+		&ownerWxID,
+		&direction,
+		&fromWxID,
+		&toWxID,
+		&roomID,
+		&senderWxID,
+		&event.Text,
+		&event.MessageType,
+		&mediaKind,
+		&mediaMime,
+		&mediaName,
+		&mediaURL,
+		&mediaSize,
+		&rawProvider,
+		&event.CreateTime,
+	)
+	if err != nil {
+		return bridge.MessageEvent{}, err
+	}
+	event.ID = sourceID.String
+	event.EventID = eventID.Int64
+	event.ChatRecordID = chatRecordID.Int64
+	event.OwnerWxID = ownerWxID.String
+	event.Direction = bridge.Direction(direction)
+	event.From = fromWxID.String
+	event.To = toWxID.String
+	event.RoomID = roomID.String
+	event.Sender = senderWxID.String
+	event.MediaKind = mediaKind.String
+	event.MediaMime = mediaMime.String
+	event.MediaName = mediaName.String
+	event.MediaURL = mediaURL.String
+	event.MediaSize = mediaSize.Int64
+	event.RawProvider = rawProvider.String
+	return event.Normalize(), nil
 }
 
 func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusView, error) {

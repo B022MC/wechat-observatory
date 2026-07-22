@@ -13,7 +13,6 @@
 | `BRIDGE_API_KEYS` | 无 MySQL 时建议填 | 初始 API Key，格式 `key|device|nickname` |
 | `BRIDGE_MYSQL_DSN` | 生产建议填 | MySQL DSN |
 | `BRIDGE_MYSQL_AUTO_MIGRATE` | 否 | 是否启动时自动迁移，生产建议 `false` |
-| `BRIDGE_MEDIA_DIR` | 否 | 图片、语音、文件等附件保存目录 |
 
 ## Docker Compose
 
@@ -78,13 +77,7 @@ cp deploy/k3s/secrets.example.yaml deploy/k3s/secrets.yaml
 
 ## 媒体文件
 
-模块上传 `media_base64` 后，服务端会把文件写到 `BRIDGE_MEDIA_DIR`，并在消息里保存 `media_url`。
-
-生产环境建议：
-
-- 给 `BRIDGE_MEDIA_DIR` 配持久化卷。
-- 通过备份策略保护媒体目录。
-- 如果要接 CDN，对外只暴露受控下载地址，避免直接公开原始目录。
+模块上传的 `media_base64` 会在入口处丢弃；当前部署不会写附件文件，也不会生成可下载的 `media_url`。因此不需要媒体卷、对象存储或媒体备份策略。
 
 ## 网络建议
 

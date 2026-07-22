@@ -72,6 +72,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureMessageEventOwnerColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureMessageEventEventKey(ctx); err != nil {
+		return err
+	}
 	if err := s.backfillMessageEventOwnerWxID(ctx); err != nil {
 		return err
 	}
@@ -82,6 +85,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureAPIKeyEnabledColumn(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureDeviceSessionLeaseTable(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -119,6 +125,25 @@ func (s *Store) ensureMessageEventOwnerColumns(ctx context.Context) error {
 	statements := []string{
 		`ALTER TABLE bridge_message_events ADD COLUMN owner_wxid VARCHAR(191) NULL AFTER device`,
 		`CREATE INDEX idx_bridge_message_events_owner_time ON bridge_message_events (device, owner_wxid, id)`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			lower := strings.ToLower(err.Error())
+			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureMessageEventEventKey(ctx context.Context) error {
+	statements := []string{
+		`ALTER TABLE bridge_message_events ADD COLUMN event_key VARCHAR(191) NULL AFTER id`,
+		`UPDATE bridge_message_events SET event_key = CONCAT('legacy_', id) WHERE event_key IS NULL OR event_key = ''`,
+		`ALTER TABLE bridge_message_events MODIFY event_key VARCHAR(191) NOT NULL`,
+		`CREATE UNIQUE INDEX uniq_bridge_message_events_event_key ON bridge_message_events (event_key)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -191,6 +216,20 @@ func (s *Store) ensureAPIKeyEnabledColumn(ctx context.Context) error {
 	return err
 }
 
+func (s *Store) ensureDeviceSessionLeaseTable(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS bridge_device_session_lease (
+		device VARCHAR(128) NOT NULL,
+		owner_wxid VARCHAR(191) NOT NULL,
+		holder_id VARCHAR(191) NOT NULL,
+		lease_token VARCHAR(191) NOT NULL,
+		lease_until TIMESTAMP(6) NOT NULL,
+		updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+		PRIMARY KEY (device, owner_wxid),
+		KEY idx_bridge_device_session_lease_until (lease_until)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`)
+	return err
+}
+
 func Migrations() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS bridge_api_keys (
@@ -212,6 +251,7 @@ func Migrations() []string {
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS bridge_message_events (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			event_key VARCHAR(191) NOT NULL,
 			source_id VARCHAR(191) NULL,
 			event_id BIGINT NULL,
 			chat_record_id BIGINT NULL,
@@ -235,7 +275,8 @@ func Migrations() []string {
 			KEY idx_bridge_message_events_device_time (device, create_time),
 			KEY idx_bridge_message_events_owner_time (device, owner_wxid, id),
 			KEY idx_bridge_message_events_chat_record (chat_record_id),
-			KEY idx_bridge_message_events_direction (direction)
+			KEY idx_bridge_message_events_direction (direction),
+			UNIQUE KEY uniq_bridge_message_events_event_key (event_key)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS bridge_module_outbox (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -290,6 +331,16 @@ func Migrations() []string {
 			KEY idx_bridge_module_contacts_device_deleted (device, is_deleted, updated_at),
 			KEY idx_bridge_module_contacts_owner_deleted (device, owner_wxid, is_deleted, updated_at),
 			KEY idx_bridge_module_contacts_wxid (wxid)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS bridge_device_session_lease (
+			device VARCHAR(128) NOT NULL,
+			owner_wxid VARCHAR(191) NOT NULL,
+			holder_id VARCHAR(191) NOT NULL,
+			lease_token VARCHAR(191) NOT NULL,
+			lease_until TIMESTAMP(6) NOT NULL,
+			updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+			PRIMARY KEY (device, owner_wxid),
+			KEY idx_bridge_device_session_lease_until (lease_until)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 	}
 }
@@ -352,6 +403,135 @@ func (s *Store) UpdateDeviceIdentity(ctx context.Context, deviceName string, wxi
 	return err
 }
 
+func (s *Store) LookupAPIKey(ctx context.Context, code string) (config.APIKey, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT code, device, nickname, enabled
+		FROM bridge_api_keys
+		WHERE code = ?`, strings.TrimSpace(code))
+	var key config.APIKey
+	var device, nickname sql.NullString
+	var enabled bool
+	if err := row.Scan(&key.Code, &device, &nickname, &enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return config.APIKey{}, false, nil
+		}
+		return config.APIKey{}, false, err
+	}
+	key.Device = device.String
+	key.Nickname = nickname.String
+	key.Disabled = !enabled
+	return key, true, nil
+}
+
+func (s *Store) LookupDevice(ctx context.Context, name string) (config.Device, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT name, wxid, nickname, timeout_ms
+		FROM bridge_devices
+		WHERE name = ?`, strings.TrimSpace(name))
+	var device config.Device
+	var timeoutMS int64
+	if err := row.Scan(&device.Name, &device.WxID, &device.Nickname, &timeoutMS); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return config.Device{}, false, nil
+		}
+		return config.Device{}, false, err
+	}
+	device.Timeout = time.Duration(timeoutMS) * time.Millisecond
+	return device, true, nil
+}
+
+func (s *Store) ClaimModuleSession(ctx context.Context, lease bridge.ModuleSessionLease) (bool, error) {
+	if err := validateModuleSessionLease(lease); err != nil {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var holderID, token string
+	var expired bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT holder_id, lease_token, lease_until < CURRENT_TIMESTAMP(6)
+		FROM bridge_device_session_lease
+		WHERE device = ? AND owner_wxid = ?
+		FOR UPDATE`, lease.Device, lease.OwnerWxID).Scan(&holderID, &token, &expired)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO bridge_device_session_lease (
+				device, owner_wxid, holder_id, lease_token, lease_until
+			) VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND))`,
+			lease.Device, lease.OwnerWxID, lease.HolderID, lease.Token, leaseMicroseconds(lease.TTL))
+		if err != nil {
+			return false, err
+		}
+		return true, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+	if !expired && (holderID != lease.HolderID || token != lease.Token) {
+		return false, tx.Commit()
+	}
+	_, err = tx.ExecContext(ctx, `
+		UPDATE bridge_device_session_lease
+		SET holder_id = ?, lease_token = ?,
+			lease_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)
+		WHERE device = ? AND owner_wxid = ?`,
+		lease.HolderID, lease.Token, leaseMicroseconds(lease.TTL), lease.Device, lease.OwnerWxID)
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) RenewModuleSession(ctx context.Context, lease bridge.ModuleSessionLease) (bool, error) {
+	if err := validateModuleSessionLease(lease); err != nil {
+		return false, err
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE bridge_device_session_lease
+		SET lease_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)
+		WHERE device = ? AND owner_wxid = ? AND holder_id = ? AND lease_token = ?
+			AND lease_until >= CURRENT_TIMESTAMP(6)`,
+		leaseMicroseconds(lease.TTL), lease.Device, lease.OwnerWxID, lease.HolderID, lease.Token)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
+}
+
+func (s *Store) ReleaseModuleSession(ctx context.Context, lease bridge.ModuleSessionLease) error {
+	if err := validateModuleSessionLease(lease); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM bridge_device_session_lease
+		WHERE device = ? AND owner_wxid = ? AND holder_id = ? AND lease_token = ?`,
+		lease.Device, lease.OwnerWxID, lease.HolderID, lease.Token)
+	return err
+}
+
+func validateModuleSessionLease(lease bridge.ModuleSessionLease) error {
+	if strings.TrimSpace(lease.Device) == "" || strings.TrimSpace(lease.OwnerWxID) == "" ||
+		strings.TrimSpace(lease.HolderID) == "" || strings.TrimSpace(lease.Token) == "" {
+		return errors.New("module session lease device, owner_wxid, holder_id, and token are required")
+	}
+	if lease.TTL <= 0 {
+		return errors.New("module session lease ttl must be positive")
+	}
+	return nil
+}
+
+func leaseMicroseconds(ttl time.Duration) int64 {
+	if ttl <= 0 {
+		return int64(time.Second / time.Microsecond)
+	}
+	return int64(ttl / time.Microsecond)
+}
+
 func (s *Store) LookupDeviceByWxID(ctx context.Context, wxid string) (config.Device, bool, error) {
 	wxid = strings.TrimSpace(wxid)
 	if wxid == "" {
@@ -391,11 +571,11 @@ func (s *Store) LookupDeviceByWxID(ctx context.Context, wxid string) (config.Dev
 	return device, true, nil
 }
 
-func (s *Store) RecordInboundEvent(ctx context.Context, event bridge.MessageEvent) error {
+func (s *Store) RecordInboundEvent(ctx context.Context, event bridge.MessageEvent) (bridge.MessageEvent, error) {
 	return s.recordMessageEvent(ctx, event)
 }
 
-func (s *Store) RecordOutboundEvent(ctx context.Context, event bridge.MessageEvent) error {
+func (s *Store) RecordOutboundEvent(ctx context.Context, event bridge.MessageEvent) (bridge.MessageEvent, error) {
 	return s.recordMessageEvent(ctx, event)
 }
 
@@ -689,13 +869,17 @@ func (s *Store) listOutboxItemsForDevice(ctx context.Context, ids []int64, devic
 	return out, rows.Err()
 }
 
-func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEvent) error {
-	_, err := s.db.ExecContext(ctx, `
+func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEvent) (bridge.MessageEvent, error) {
+	event = event.Normalize()
+	event.EventKey = event.CanonicalEventKey()
+	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO bridge_message_events (
-			source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
+			event_key, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
 			to_wxid, room_id, sender_wxid, text, message_type, media_kind,
 			media_mime, media_name, media_url, media_size, raw_provider, create_time
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)`,
+		event.EventKey,
 		nullString(event.ID),
 		nullInt64(event.EventID),
 		nullInt64(event.ChatRecordID),
@@ -716,7 +900,24 @@ func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEven
 		nullString(event.RawProvider),
 		event.Timestamp(),
 	)
-	return err
+	if err != nil {
+		return bridge.MessageEvent{}, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return bridge.MessageEvent{}, err
+	}
+	return s.messageEventByID(ctx, id)
+}
+
+func (s *Store) messageEventByID(ctx context.Context, id int64) (bridge.MessageEvent, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid,
+			direction, from_wxid, to_wxid, room_id, sender_wxid, text, message_type,
+			media_kind, media_mime, media_name, media_url, media_size, raw_provider, create_time
+		FROM bridge_message_events
+		WHERE id = ?`, id)
+	return scanMessageEvent(row)
 }
 
 func upsertAPIKey(ctx context.Context, exec sqlExecutor, key config.APIKey) error {

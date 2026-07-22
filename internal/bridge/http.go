@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,7 +37,6 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("GET /api/live/events", s.requireAdmin(s.liveEvents))
 	mux.HandleFunc("GET /api/modules/status", s.requireAdmin(s.moduleStatuses))
 	mux.HandleFunc("GET /api/module-contacts", s.requireAdmin(s.moduleContacts))
-	mux.HandleFunc("GET /api/media/", s.requireAdmin(s.mediaFile))
 	mux.HandleFunc("POST /api/send/text", s.requireAdmin(s.sendText))
 	mux.HandleFunc("GET /admin", s.adminPage)
 	mux.HandleFunc("GET /admin/", s.adminPage)
@@ -235,7 +232,7 @@ func (s *HTTPServer) messages(w http.ResponseWriter, r *http.Request) {
 		Limit:     queryLimit(r, 100),
 	}
 	if filter.OwnerWxID == "" && filter.Device != "" {
-		filter.OwnerWxID = s.service.deviceWxID(filter.Device)
+		filter.OwnerWxID = s.service.deviceWxID(r.Context(), filter.Device)
 	}
 	messages, err := reader.ListMessages(r.Context(), filter)
 	if err != nil {
@@ -259,6 +256,12 @@ func (s *HTTPServer) liveEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	tailer, durable := s.service.AdminReader().(EventTailReader)
+	if durable {
+		s.liveDurableEvents(w, r, flusher, tailer)
+		return
+	}
+
 	writeSSE(w, "ready", map[string]any{"ok": true, "time": time.Now().Unix()})
 	flusher.Flush()
 
@@ -280,6 +283,88 @@ func (s *HTTPServer) liveEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *HTTPServer) liveDurableEvents(w http.ResponseWriter, r *http.Request, flusher http.Flusher, tailer EventTailReader) {
+	cursor, supplied, err := liveEventCursor(r)
+	if err != nil {
+		writeSSE(w, "error", map[string]any{"code": "invalid_cursor", "message": err.Error()})
+		flusher.Flush()
+		return
+	}
+	if !supplied {
+		cursor, err = tailer.LatestLiveEventID(r.Context())
+		if err != nil {
+			writeSSE(w, "error", map[string]any{"code": "event_tail_failed", "message": err.Error()})
+			flusher.Flush()
+			return
+		}
+	}
+	writeSSE(w, "ready", map[string]any{"ok": true, "time": time.Now().Unix(), "cursor": cursor})
+	flusher.Flush()
+
+	wake := s.service.Hub().Subscribe(r.Context())
+	poll := time.NewTicker(time.Second)
+	ping := time.NewTicker(20 * time.Second)
+	defer poll.Stop()
+	defer ping.Stop()
+
+	drain := func() bool {
+		for {
+			events, err := tailer.ListLiveEventsAfter(r.Context(), cursor, 100)
+			if err != nil {
+				writeSSE(w, "error", map[string]any{"code": "event_tail_failed", "message": err.Error()})
+				flusher.Flush()
+				return false
+			}
+			for _, event := range events {
+				if event.Sequence <= cursor {
+					continue
+				}
+				writeSSEID(w, event.Sequence, "message", event)
+				cursor = event.Sequence
+			}
+			if len(events) < 100 {
+				flusher.Flush()
+				return true
+			}
+		}
+	}
+	if !drain() {
+		return
+	}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case _, ok := <-wake:
+			if !ok || !drain() {
+				return
+			}
+		case <-poll.C:
+			if !drain() {
+				return
+			}
+		case <-ping.C:
+			writeSSE(w, "ping", map[string]any{"time": time.Now().Unix(), "cursor": cursor})
+			flusher.Flush()
+		}
+	}
+}
+
+func liveEventCursor(r *http.Request) (int64, bool, error) {
+	raw := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if raw == "" {
+		raw = strings.TrimSpace(r.URL.Query().Get("cursor"))
+	}
+	if raw == "" {
+		return 0, false, nil
+	}
+	cursor, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || cursor < 0 {
+		return 0, true, fmt.Errorf("cursor must be a non-negative integer")
+	}
+	return cursor, true, nil
 }
 
 func (s *HTTPServer) moduleStatuses(w http.ResponseWriter, r *http.Request) {
@@ -434,20 +519,6 @@ func (s *HTTPServer) ingestMessageFrom(provider string) http.HandlerFunc {
 	}
 }
 
-func (s *HTTPServer) mediaFile(w http.ResponseWriter, r *http.Request) {
-	rel := strings.TrimPrefix(r.URL.Path, "/api/media/")
-	fullPath, err := s.service.MediaFilePath(rel)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_media_path", err.Error())
-		return
-	}
-	if _, err := os.Stat(fullPath); err != nil {
-		writeError(w, http.StatusNotFound, "media_not_found", "media file not found")
-		return
-	}
-	http.ServeFile(w, r, filepath.Clean(fullPath))
-}
-
 func (s *HTTPServer) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		got := strings.TrimSpace(r.Header.Get("X-Bridge-Password"))
@@ -496,12 +567,19 @@ func writeError(w http.ResponseWriter, status int, code string, message string) 
 }
 
 func writeSSE(w http.ResponseWriter, event string, payload any) {
+	writeSSEID(w, 0, event, payload)
+}
+
+func writeSSEID(w http.ResponseWriter, id int64, event string, payload any) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		data = []byte(`{"error":"marshal_failed"}`)
 	}
 	if event != "" {
 		_, _ = fmt.Fprintf(w, "event: %s\n", event)
+	}
+	if id > 0 {
+		_, _ = fmt.Fprintf(w, "id: %d\n", id)
 	}
 	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 }

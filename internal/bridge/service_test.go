@@ -12,9 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,9 +54,105 @@ func TestIngestPublishesAndPersistsWithoutBusinessReply(t *testing.T) {
 	}
 }
 
-func TestIngestStoresMediaAttachment(t *testing.T) {
+func TestAcquireOutboxSessionRejectsConcurrentDeviceSession(t *testing.T) {
+	leaser := &fakeSessionPersistence{leases: map[string]ModuleSessionLease{}}
+	first := newTestService("", WithPersistence(leaser))
+	first.instanceID = "pod-a"
+	second := newTestService("", WithPersistence(leaser))
+	second.instanceID = "pod-b"
+
+	lease, err := first.AcquireOutboxSession(t.Context(), testAPIKey, "phone-a", "wxid_self")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.AcquireOutboxSession(t.Context(), testAPIKey, "phone-a", "wxid_self"); err != ErrModuleSessionActive {
+		t.Fatalf("expected active-session rejection, got %v", err)
+	}
+	first.ReleaseOutboxSession(t.Context(), lease)
+	if _, err := second.AcquireOutboxSession(t.Context(), testAPIKey, "phone-a", "wxid_self"); err != nil {
+		t.Fatalf("expected session claim after release, got %v", err)
+	}
+}
+
+func TestIngestUsesDatabaseAuthoritativeModuleConfiguration(t *testing.T) {
+	persistence := &fakeDynamicConfigPersistence{
+		fakePersistence: &fakePersistence{},
+		keys: map[string]config.APIKey{
+			testAPIKey: {Code: testAPIKey, Device: "phone-b"},
+		},
+		devices: map[string]config.Device{
+			"phone-b": {Name: "phone-b", WxID: "wxid_database_current"},
+		},
+	}
+	service := newTestService("", WithPersistence(persistence))
+	_, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:    testAPIKey,
+		Device:    "phone-a",
+		From:      "wxid_friend",
+		To:        "wxid_database_current",
+		Text:      "database authority",
+		Direction: DirectionRecv,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persistence.inboundEvents) != 1 {
+		t.Fatalf("expected one persisted event, got %+v", persistence.inboundEvents)
+	}
+	event := persistence.inboundEvents[0]
+	if event.Device != "phone-b" || event.OwnerWxID != "wxid_database_current" {
+		t.Fatalf("event should use database device identity, got %+v", event)
+	}
+}
+
+func TestLiveEventsReplaysDurableCursor(t *testing.T) {
+	tailer := &fakeEventTailReader{
+		fakeAdminReader: &fakeAdminReader{},
+		latest:          4,
+		events: []MessageEvent{{
+			Sequence:  4,
+			EventKey:  "evt_4",
+			ID:        "source-4",
+			Device:    "phone-a",
+			From:      "wxid_friend",
+			To:        "wxid_self",
+			Text:      "replayed",
+			Direction: DirectionRecv,
+		}},
+	}
+	service := newTestService("", WithAdminReader(tailer))
+	server := NewHTTPServer(service, "admin").Handler()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/live/events", nil).WithContext(ctx)
+	req.Header.Set("X-Bridge-Password", "admin")
+	req.Header.Set("Last-Event-ID", "3")
+	rec := newSSERecorder()
+	done := make(chan struct{})
+	go func() {
+		server.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	deadline := time.After(time.Second)
+	for !strings.Contains(rec.String(), "id: 4\n") {
+		select {
+		case <-deadline:
+			t.Fatalf("durable event was not replayed: %s", rec.String())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("live event handler did not stop after cancellation")
+	}
+}
+
+func TestIngestDiscardsMediaPayload(t *testing.T) {
 	persistence := &fakePersistence{}
-	service := newTestService("", WithPersistence(persistence), WithMediaDir(t.TempDir()))
+	service := newTestService("", WithPersistence(persistence))
 	raw := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 1, 2, 3}
 
 	result, err := service.Ingest(t.Context(), MessageEvent{
@@ -83,27 +179,13 @@ func TestIngestStoresMediaAttachment(t *testing.T) {
 		t.Fatalf("expected one inbound event, got %+v", persistence.inboundEvents)
 	}
 	event := persistence.inboundEvents[0]
-	if event.MediaBase64 != "" || event.MediaURL == "" || event.MediaKind != "image" || event.MediaMime != "image/png" {
+	if event.MediaBase64 != "" || event.MediaURL != "" || event.MediaKind != "image" || event.MediaMime != "image/png" {
 		t.Fatalf("unexpected persisted media fields: %+v", event)
-	}
-	if event.MediaSize != int64(len(raw)) {
-		t.Fatalf("unexpected media size=%d", event.MediaSize)
-	}
-	fullPath, err := service.MediaFilePath(strings.TrimPrefix(event.MediaURL, "/api/media/"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored, err := os.ReadFile(fullPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(stored, raw) {
-		t.Fatalf("stored media mismatch: %x", stored)
 	}
 }
 
 func TestLsposedWebhookStoresInboundMessageOnly(t *testing.T) {
-	outbox := &fakeOutbox{}
+	outbox := NewMemoryOutbox()
 	service := newTestService("", WithOutbox(outbox))
 	server := NewHTTPServer(service, "admin").Handler()
 
@@ -143,6 +225,17 @@ func TestLsposedWebhookStoresInboundMessageOnly(t *testing.T) {
 	items := pollOutbox(t, service, "phone-a", 10)
 	if len(items) != 0 {
 		t.Fatalf("inbound webhook should not enqueue outbox replies: %+v", items)
+	}
+}
+
+func TestMediaRouteIsAbsentWhenMediaStorageIsDisabled(t *testing.T) {
+	server := NewHTTPServer(newTestService(""), "admin").Handler()
+	req := httptest.NewRequest(http.MethodGet, "/api/media/phone-a/file.png", nil)
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected disabled media route to be absent, got status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -761,7 +854,7 @@ func TestModuleOutboxPollAndAckEndpoints(t *testing.T) {
 }
 
 func TestModuleOutboxWebSocketPushAndAck(t *testing.T) {
-	outbox := &fakeOutbox{}
+	outbox := NewMemoryOutbox()
 	persistence := &fakePersistence{}
 	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox), WithPersistence(persistence))
 	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
@@ -799,20 +892,21 @@ func TestModuleOutboxWebSocketPushAndAck(t *testing.T) {
 	if ackMsg.Type != "ack" || !ackMsg.OK || len(ackMsg.Items) != 1 || ackMsg.Items[0].Status != "sent" {
 		t.Fatalf("unexpected ack message: %+v", ackMsg)
 	}
-	if len(persistence.outboundEvents) != 1 ||
-		persistence.outboundEvents[0].ChatRecordID != 9101 ||
-		persistence.outboundEvents[0].RawProvider != RawProviderModuleAck ||
-		persistence.outboundEvents[0].OwnerWxID != "wxid_self" {
-		t.Fatalf("ack did not record outbound event: %+v", persistence.outboundEvents)
+	outboundEvents, moduleActivities := persistence.activitySnapshot()
+	if len(outboundEvents) != 1 ||
+		outboundEvents[0].ChatRecordID != 9101 ||
+		outboundEvents[0].RawProvider != RawProviderModuleAck ||
+		outboundEvents[0].OwnerWxID != "wxid_self" {
+		t.Fatalf("ack did not record outbound event: %+v", outboundEvents)
 	}
 	hasAckActivity := false
-	for _, activity := range persistence.moduleActivities {
+	for _, activity := range moduleActivities {
 		if activity.Kind == "ack" && activity.AckSentCount == 1 {
 			hasAckActivity = true
 		}
 	}
 	if !hasAckActivity {
-		t.Fatalf("module websocket activity was not recorded: %+v", persistence.moduleActivities)
+		t.Fatalf("module websocket activity was not recorded: %+v", moduleActivities)
 	}
 }
 
@@ -903,6 +997,7 @@ func newTestService(legacyEndpoint string, opts ...Option) *Service {
 }
 
 type fakePersistence struct {
+	mu               sync.Mutex
 	deviceName       string
 	deviceWxID       string
 	deviceNickname   string
@@ -914,7 +1009,60 @@ type fakePersistence struct {
 	calls            []string
 }
 
+type fakeSessionPersistence struct {
+	*fakePersistence
+	mu     sync.Mutex
+	leases map[string]ModuleSessionLease
+}
+
+type fakeDynamicConfigPersistence struct {
+	*fakePersistence
+	keys    map[string]config.APIKey
+	devices map[string]config.Device
+}
+
+func (p *fakeDynamicConfigPersistence) LookupAPIKey(_ context.Context, code string) (config.APIKey, bool, error) {
+	key, ok := p.keys[code]
+	return key, ok, nil
+}
+
+func (p *fakeDynamicConfigPersistence) LookupDevice(_ context.Context, name string) (config.Device, bool, error) {
+	device, ok := p.devices[name]
+	return device, ok, nil
+}
+
+func (p *fakeSessionPersistence) ClaimModuleSession(_ context.Context, lease ModuleSessionLease) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := lease.Device + "\x00" + lease.OwnerWxID
+	if _, exists := p.leases[key]; exists {
+		return false, nil
+	}
+	p.leases[key] = lease
+	return true, nil
+}
+
+func (p *fakeSessionPersistence) RenewModuleSession(_ context.Context, lease ModuleSessionLease) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current, ok := p.leases[lease.Device+"\x00"+lease.OwnerWxID]
+	return ok && current.HolderID == lease.HolderID && current.Token == lease.Token, nil
+}
+
+func (p *fakeSessionPersistence) ReleaseModuleSession(_ context.Context, lease ModuleSessionLease) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := lease.Device + "\x00" + lease.OwnerWxID
+	current, ok := p.leases[key]
+	if ok && current.HolderID == lease.HolderID && current.Token == lease.Token {
+		delete(p.leases, key)
+	}
+	return nil
+}
+
 func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName string, wxid string, nickname string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.deviceName = deviceName
 	p.deviceWxID = wxid
 	p.deviceNickname = nickname
@@ -922,6 +1070,8 @@ func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName str
 }
 
 func (p *fakePersistence) LookupDeviceByWxID(_ context.Context, wxid string) (config.Device, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.deviceByWxID == nil {
 		return config.Device{}, false, nil
 	}
@@ -930,42 +1080,104 @@ func (p *fakePersistence) LookupDeviceByWxID(_ context.Context, wxid string) (co
 }
 
 func (p *fakePersistence) UpsertAPIKey(_ context.Context, key config.APIKey) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, "upsert-key:"+key.Code)
 	return nil
 }
 
 func (p *fakePersistence) DeleteAPIKey(_ context.Context, code string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, "delete-key:"+code)
 	return nil
 }
 
 func (p *fakePersistence) SetAPIKeyEnabled(_ context.Context, code string, enabled bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, fmt.Sprintf("key-enabled:%s:%t", code, enabled))
 	return nil
 }
 
-func (p *fakePersistence) RecordInboundEvent(_ context.Context, event MessageEvent) error {
+func (p *fakePersistence) RecordInboundEvent(_ context.Context, event MessageEvent) (MessageEvent, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, "inbound")
 	p.inboundEvents = append(p.inboundEvents, event)
-	return nil
+	return event, nil
 }
 
-func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEvent) error {
+func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEvent) (MessageEvent, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, "outbound")
 	p.outboundEvents = append(p.outboundEvents, event)
-	return nil
+	return event, nil
 }
 
 func (p *fakePersistence) RecordModuleActivity(_ context.Context, activity ModuleActivity) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, "module:"+activity.Kind)
 	p.moduleActivities = append(p.moduleActivities, activity)
 	return nil
 }
 
 func (p *fakePersistence) RecordModuleContacts(_ context.Context, snapshot ModuleContactSnapshotRequest) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, "contacts")
 	p.contactSnapshots = append(p.contactSnapshots, snapshot)
 	return nil
+}
+
+func (p *fakePersistence) activitySnapshot() ([]MessageEvent, []ModuleActivity) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	outbound := append([]MessageEvent(nil), p.outboundEvents...)
+	activities := append([]ModuleActivity(nil), p.moduleActivities...)
+	return outbound, activities
+}
+
+type sseRecorder struct {
+	mu     sync.Mutex
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newSSERecorder() *sseRecorder {
+	return &sseRecorder{header: make(http.Header)}
+}
+
+func (r *sseRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *sseRecorder) Write(value []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.body.Write(value)
+}
+
+func (r *sseRecorder) WriteHeader(status int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status == 0 {
+		r.status = status
+	}
+}
+
+func (r *sseRecorder) Flush() {}
+
+func (r *sseRecorder) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.body.String()
 }
 
 type fakeAdminReader struct {
@@ -975,6 +1187,26 @@ type fakeAdminReader struct {
 	modules  []ModuleStatusView
 	contacts []ModuleContactView
 	calls    []string
+}
+
+type fakeEventTailReader struct {
+	*fakeAdminReader
+	latest int64
+	events []MessageEvent
+}
+
+func (r *fakeEventTailReader) LatestLiveEventID(context.Context) (int64, error) {
+	return r.latest, nil
+}
+
+func (r *fakeEventTailReader) ListLiveEventsAfter(_ context.Context, afterID int64, _ int) ([]MessageEvent, error) {
+	out := make([]MessageEvent, 0, len(r.events))
+	for _, event := range r.events {
+		if event.Sequence > afterID {
+			out = append(out, event)
+		}
+	}
+	return out, nil
 }
 
 func (r *fakeAdminReader) ListAPIKeys(_ context.Context, limit int) ([]APIKeyView, error) {

@@ -19,7 +19,9 @@ type Service struct {
 	persistence Persistence
 	outbox      Outbox
 	adminReader AdminReader
-	mediaDir    string
+	instanceID  string
+	sessionTTL  time.Duration
+	pollEvery   time.Duration
 
 	mu               sync.RWMutex
 	nextChatRecordID int64
@@ -32,9 +34,11 @@ const maxOutboxPollBatch = 1
 
 type Config struct {
 	DefaultDevice string
-	MediaDir      string
 	Devices       map[string]config.Device
 	APIKeys       map[string]config.APIKey
+	InstanceID    string
+	SessionTTL    time.Duration
+	PollInterval  time.Duration
 }
 
 func NewService(cfg Config, opts ...Option) *Service {
@@ -44,7 +48,15 @@ func NewService(cfg Config, opts ...Option) *Service {
 		outbox:           NewMemoryOutbox(),
 		outboxNotify:     map[string]map[chan struct{}]struct{}{},
 		nextChatRecordID: time.Now().Unix() * 1000,
-		mediaDir:         strings.TrimSpace(cfg.MediaDir),
+		instanceID:       firstNonEmpty(cfg.InstanceID, "local"),
+		sessionTTL:       cfg.SessionTTL,
+		pollEvery:        cfg.PollInterval,
+	}
+	if service.sessionTTL <= 0 {
+		service.sessionTTL = 15 * time.Second
+	}
+	if service.pollEvery <= 0 {
+		service.pollEvery = time.Second
 	}
 	for _, opt := range opts {
 		opt(service)
@@ -58,6 +70,10 @@ func (s *Service) Hub() *Hub {
 
 func (s *Service) DefaultDevice() string {
 	return s.cfg.DefaultDevice
+}
+
+func (s *Service) OutboxPollInterval() time.Duration {
+	return s.pollEvery
 }
 
 func (s *Service) Device(name string) (config.Device, bool) {
@@ -139,9 +155,9 @@ func (s *Service) DeleteAPIKey(ctx context.Context, apiKey string) error {
 		return fmt.Errorf("api key is required")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.cfg.APIKeys[apiKey]; !ok {
+	if _, ok, err := s.lookupAPIKey(ctx, apiKey); err != nil {
+		return err
+	} else if !ok {
 		return fmt.Errorf("api key %q not found", apiKey)
 	}
 	if writer := s.AdminWriter(); writer != nil {
@@ -149,6 +165,8 @@ func (s *Service) DeleteAPIKey(ctx context.Context, apiKey string) error {
 			return err
 		}
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.cfg.APIKeys, apiKey)
 	return nil
 }
@@ -159,9 +177,10 @@ func (s *Service) SetAPIKeyEnabled(ctx context.Context, apiKey string, enabled b
 		return APIKeyView{}, fmt.Errorf("api key is required")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key, ok := s.cfg.APIKeys[apiKey]
+	key, ok, err := s.lookupAPIKey(ctx, apiKey)
+	if err != nil {
+		return APIKeyView{}, err
+	}
 	if !ok {
 		return APIKeyView{}, fmt.Errorf("api key %q not found", apiKey)
 	}
@@ -171,7 +190,7 @@ func (s *Service) SetAPIKeyEnabled(ctx context.Context, apiKey string, enabled b
 			return APIKeyView{}, err
 		}
 	}
-	s.cfg.APIKeys[apiKey] = key
+	s.setCachedAPIKey(key)
 	return apiKeyView(key), nil
 }
 
@@ -182,9 +201,10 @@ func (s *Service) UpsertDevice(ctx context.Context, req DeviceUpsertRequest) (Mo
 	}
 	nickname := strings.TrimSpace(req.Nickname)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	device, ok := s.cfg.Devices[name]
+	device, ok, err := s.lookupDevice(ctx, name)
+	if err != nil {
+		return ModuleStatusView{}, err
+	}
 	if !ok {
 		return ModuleStatusView{}, fmt.Errorf("unknown device %q", name)
 	}
@@ -194,7 +214,7 @@ func (s *Service) UpsertDevice(ctx context.Context, req DeviceUpsertRequest) (Mo
 			return ModuleStatusView{}, err
 		}
 	}
-	s.cfg.Devices[name] = device
+	s.setCachedDevice(device)
 	status := ModuleStatusView{
 		Device:         device.Name,
 		DeviceWxID:     device.WxID,
@@ -214,9 +234,10 @@ func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequ
 		return nil, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key, ok := s.cfg.APIKeys[req.APIKey]
+	key, ok, err := s.lookupAPIKey(ctx, req.APIKey)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("invalid api key")
 	}
@@ -235,9 +256,15 @@ func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequ
 				return nil, err
 			}
 		}
-		s.cfg.APIKeys[key.Code] = key
+		s.setCachedAPIKey(key)
 	}
-	device := s.cfg.Devices[req.Device]
+	device, found, err := s.lookupDevice(ctx, req.Device)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		device = config.Device{}
+	}
 	if strings.TrimSpace(device.Name) == "" {
 		device.Name = req.Device
 		device.Timeout = 5 * time.Second
@@ -255,14 +282,15 @@ func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequ
 		APIKey: req.APIKey,
 		Kind:   "register",
 	})
-	s.cfg.Devices[req.Device] = device
+	s.setCachedDevice(device)
+	s.setCachedAPIKey(key)
 	return &ModuleRegistrationResult{
 		Device: moduleDeviceView(device),
 	}, nil
 }
 
 func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult, error) {
-	auth, err := s.authorizeModuleAPIKey(event.APIKey)
+	auth, err := s.authorizeModuleAPIKey(ctx, event.APIKey)
 	if err != nil {
 		return nil, err
 	}
@@ -291,20 +319,23 @@ func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult
 		return nil, err
 	}
 	event.Device = auth.Device
-	if ownerWxID := s.deviceWxID(event.Device); ownerWxID != "" {
+	if ownerWxID := s.deviceWxID(ctx, event.Device); ownerWxID != "" {
 		event.OwnerWxID = ownerWxID
 	}
 
-	s.hub.Publish(event)
 	result := &IngestResult{Published: true}
 	if mediaError != "" {
 		result.PersistenceError = "media: " + mediaError
 	}
 	if s.persistence != nil {
-		if err := s.persistence.RecordInboundEvent(ctx, event); err != nil {
+		stored, err := s.persistence.RecordInboundEvent(ctx, event)
+		if err != nil {
 			result.PersistenceError = err.Error()
+		} else {
+			event = stored
 		}
 	}
+	s.hub.Publish(event)
 	return result, nil
 }
 
@@ -313,10 +344,12 @@ func (s *Service) SendText(ctx context.Context, req SendTextRequest) (int64, err
 	if err != nil {
 		return 0, err
 	}
-	if _, ok := s.Device(req.Device); !ok {
+	if _, ok, err := s.lookupDevice(ctx, req.Device); err != nil {
+		return 0, err
+	} else if !ok {
 		return 0, fmt.Errorf("unknown device %q", req.Device)
 	}
-	ownerWxID := s.deviceWxID(req.Device)
+	ownerWxID := s.deviceWxID(ctx, req.Device)
 	if req.OwnerWxID != "" && req.OwnerWxID != ownerWxID {
 		return 0, fmt.Errorf("send owner wxid %q is not current device wxid", req.OwnerWxID)
 	}
@@ -344,12 +377,12 @@ func (s *Service) PollOutbox(ctx context.Context, req ModulePollRequest) ([]Modu
 	if err != nil {
 		return nil, err
 	}
-	auth, err := s.authorizeModuleAPIKey(req.APIKey)
+	auth, err := s.authorizeModuleAPIKey(ctx, req.APIKey)
 	if err != nil {
 		return nil, err
 	}
 	req.Device = auth.Device
-	currentWxID := s.deviceWxID(req.Device)
+	currentWxID := s.deviceWxID(ctx, req.Device)
 	if req.WxID == "" {
 		req.WxID = currentWxID
 	}
@@ -374,17 +407,66 @@ func (s *Service) PollOutbox(ctx context.Context, req ModulePollRequest) ([]Modu
 	return items, nil
 }
 
+func (s *Service) AcquireOutboxSession(ctx context.Context, apiKey, requestedDevice, wxid string) (ModuleSessionLease, error) {
+	auth, err := s.authorizeModuleAPIKey(ctx, apiKey)
+	if err != nil {
+		return ModuleSessionLease{}, err
+	}
+	device := auth.Device
+	if requestedDevice = strings.TrimSpace(requestedDevice); requestedDevice != "" && requestedDevice != device {
+		return ModuleSessionLease{}, fmt.Errorf("device %q does not match api key device", requestedDevice)
+	}
+	currentWxID := s.deviceWxID(ctx, device)
+	wxid = strings.TrimSpace(wxid)
+	if wxid == "" {
+		wxid = currentWxID
+	}
+	if currentWxID != "" && wxid != "" && currentWxID != wxid {
+		return ModuleSessionLease{}, fmt.Errorf("module wxid %q is not current device wxid", wxid)
+	}
+	lease := ModuleSessionLease{
+		Device:    device,
+		OwnerWxID: wxid,
+		HolderID:  s.instanceID,
+		Token:     generateSessionToken(),
+		TTL:       s.sessionTTL,
+	}
+	if leaser, ok := s.persistence.(ModuleSessionLeaser); ok {
+		claimed, err := leaser.ClaimModuleSession(ctx, lease)
+		if err != nil {
+			return ModuleSessionLease{}, err
+		}
+		if !claimed {
+			return ModuleSessionLease{}, ErrModuleSessionActive
+		}
+	}
+	return lease, nil
+}
+
+func (s *Service) RenewOutboxSession(ctx context.Context, lease ModuleSessionLease) (bool, error) {
+	if leaser, ok := s.persistence.(ModuleSessionLeaser); ok {
+		return leaser.RenewModuleSession(ctx, lease)
+	}
+	return true, nil
+}
+
+func (s *Service) ReleaseOutboxSession(ctx context.Context, lease ModuleSessionLease) {
+	if leaser, ok := s.persistence.(ModuleSessionLeaser); ok {
+		_ = leaser.ReleaseModuleSession(ctx, lease)
+	}
+}
+
 func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]ModuleOutboxItem, error) {
 	req, err := req.Validate(s.cfg.DefaultDevice)
 	if err != nil {
 		return nil, err
 	}
-	auth, err := s.authorizeModuleAPIKey(req.APIKey)
+	auth, err := s.authorizeModuleAPIKey(ctx, req.APIKey)
 	if err != nil {
 		return nil, err
 	}
 	req.Device = auth.Device
-	currentWxID := s.deviceWxID(req.Device)
+	currentWxID := s.deviceWxID(ctx, req.Device)
 	if req.WxID == "" {
 		req.WxID = currentWxID
 	}
@@ -414,8 +496,8 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 			EventID:      recordID,
 			ChatRecordID: recordID,
 			Device:       item.Device,
-			OwnerWxID:    firstNonEmpty(item.OwnerWxID, s.deviceWxID(item.Device)),
-			From:         s.deviceWxID(item.Device),
+			OwnerWxID:    firstNonEmpty(item.OwnerWxID, s.deviceWxID(ctx, item.Device)),
+			From:         s.deviceWxID(ctx, item.Device),
 			To:           item.WxID,
 			Text:         item.Text,
 			MessageType:  1,
@@ -423,10 +505,12 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 			CreateTime:   time.Now().Unix(),
 			RawProvider:  RawProviderModuleAck,
 		}.Normalize()
-		s.hub.Publish(event)
 		if s.persistence != nil {
-			_ = s.persistence.RecordOutboundEvent(ctx, event)
+			if stored, err := s.persistence.RecordOutboundEvent(ctx, event); err == nil {
+				event = stored
+			}
 		}
+		s.hub.Publish(event)
 	}
 	return items, nil
 }
@@ -436,13 +520,13 @@ func (s *Service) RecordModuleContacts(ctx context.Context, req ModuleContactSna
 	if err != nil {
 		return 0, err
 	}
-	auth, err := s.authorizeModuleAPIKey(req.APIKey)
+	auth, err := s.authorizeModuleAPIKey(ctx, req.APIKey)
 	if err != nil {
 		return 0, err
 	}
 	req.Device = auth.Device
 	if req.WxID == "" {
-		req.WxID = s.deviceWxID(req.Device)
+		req.WxID = s.deviceWxID(ctx, req.Device)
 	}
 	if s.persistence == nil {
 		return len(req.Contacts), nil
@@ -521,8 +605,8 @@ func ackActivity(req ModuleAckRequest) ModuleActivity {
 	return activity
 }
 
-func (s *Service) deviceWxID(deviceName string) string {
-	if device, ok := s.Device(deviceName); ok {
+func (s *Service) deviceWxID(ctx context.Context, deviceName string) string {
+	if device, ok, err := s.lookupDevice(ctx, deviceName); err == nil && ok {
 		return device.WxID
 	}
 	return ""
@@ -533,14 +617,15 @@ type moduleAPIKeyAuth struct {
 	Device string
 }
 
-func (s *Service) authorizeModuleAPIKey(apiKey string) (moduleAPIKeyAuth, error) {
+func (s *Service) authorizeModuleAPIKey(ctx context.Context, apiKey string) (moduleAPIKeyAuth, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return moduleAPIKeyAuth{}, fmt.Errorf("api_key is required")
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	key, ok := s.cfg.APIKeys[apiKey]
+	key, ok, err := s.lookupAPIKey(ctx, apiKey)
+	if err != nil {
+		return moduleAPIKeyAuth{}, err
+	}
 	if !ok {
 		return moduleAPIKeyAuth{}, fmt.Errorf("invalid api key")
 	}
@@ -551,10 +636,48 @@ func (s *Service) authorizeModuleAPIKey(apiKey string) (moduleAPIKeyAuth, error)
 	if strings.TrimSpace(device) == "" {
 		return moduleAPIKeyAuth{}, fmt.Errorf("device is required")
 	}
-	if _, ok := s.cfg.Devices[device]; !ok {
+	if _, ok, err := s.lookupDevice(ctx, device); err != nil {
+		return moduleAPIKeyAuth{}, err
+	} else if !ok {
 		return moduleAPIKeyAuth{}, fmt.Errorf("unknown device %q", device)
 	}
 	return moduleAPIKeyAuth{Key: key, Device: device}, nil
+}
+
+func (s *Service) lookupAPIKey(ctx context.Context, code string) (config.APIKey, bool, error) {
+	if reader, ok := s.persistence.(ModuleConfigReader); ok {
+		return reader.LookupAPIKey(ctx, code)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.cfg.APIKeys[strings.TrimSpace(code)]
+	return key, ok, nil
+}
+
+func (s *Service) lookupDevice(ctx context.Context, name string) (config.Device, bool, error) {
+	if reader, ok := s.persistence.(ModuleConfigReader); ok {
+		return reader.LookupDevice(ctx, name)
+	}
+	device, ok := s.Device(name)
+	return device, ok, nil
+}
+
+func (s *Service) setCachedDevice(device config.Device) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.Devices == nil {
+		s.cfg.Devices = map[string]config.Device{}
+	}
+	s.cfg.Devices[device.Name] = device
+}
+
+func (s *Service) setCachedAPIKey(key config.APIKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.APIKeys == nil {
+		s.cfg.APIKeys = map[string]config.APIKey{}
+	}
+	s.cfg.APIKeys[key.Code] = key
 }
 
 func (s *Service) nextRecordID() int64 {
@@ -603,6 +726,14 @@ func generateAPIKey() string {
 		return fmt.Sprintf("wg_%d", time.Now().UnixNano())
 	}
 	return "wg_" + hex.EncodeToString(random)
+}
+
+func generateSessionToken() string {
+	bytes := make([]byte, 24)
+	if _, err := rand.Read(bytes); err != nil {
+		return fmt.Sprintf("session-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(bytes)
 }
 
 func safeCodePart(value string) string {

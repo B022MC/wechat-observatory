@@ -42,11 +42,8 @@ services:
       BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:-dev_key_001|phone-a|Test Phone}"
       BRIDGE_MYSQL_DSN: "${MYSQL_USER:-wechat}:${MYSQL_PASSWORD:-change-me}@tcp(${MYSQL_HOST:-mysql}:3306)/${MYSQL_DATABASE:-app_wechat_observatory}?charset=utf8mb4&parseTime=True&loc=Local"
       BRIDGE_MYSQL_AUTO_MIGRATE: "${BRIDGE_MYSQL_AUTO_MIGRATE:-false}"
-      BRIDGE_MEDIA_DIR: "${BRIDGE_MEDIA_DIR:-/var/lib/wechat-observatory/media}"
     ports:
       - "${BRIDGE_HTTP_PORT:-8088}:8088"
-    volumes:
-      - gateway-media:/var/lib/wechat-observatory/media
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/healthz"]
       interval: 20s
@@ -74,4 +71,3 @@ services:
 
 volumes:
   mysql-data:
-  gateway-media:

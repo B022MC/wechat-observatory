@@ -7,6 +7,5 @@ data:
   BRIDGE_HTTP_ADDR: ":8088"
   BRIDGE_DEFAULT_DEVICE: "phone-a"
   BRIDGE_MYSQL_AUTO_MIGRATE: "false"
-  BRIDGE_MEDIA_DIR: "/var/lib/wechat-observatory/media"
   BRIDGE_DEVICES: "phone-a||wechat-phone|5s"
   BRIDGE_API_KEYS: "dev_key_001|phone-a|Test Phone"

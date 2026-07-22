@@ -41,18 +41,29 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 	if device == "" {
 		device = s.service.DefaultDevice()
 	}
-	auth, err := s.service.authorizeModuleAPIKey(apiKey)
+	auth, err := s.service.authorizeModuleAPIKey(r.Context(), apiKey)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	device = auth.Device
+	session, err := s.service.AcquireOutboxSession(r.Context(), apiKey, device, wxid)
+	if err != nil {
+		if errors.Is(err, ErrModuleSessionActive) {
+			writeError(w, http.StatusConflict, "device_session_active", "device session is active; retry shortly")
+			return
+		}
+		writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		return
+	}
 	conn, err := upgradeWebSocket(w, r)
 	if err != nil {
+		s.service.ReleaseOutboxSession(context.Background(), session)
 		writeError(w, http.StatusBadRequest, "websocket_upgrade_failed", err.Error())
 		return
 	}
 	defer conn.close()
+	defer s.service.ReleaseOutboxSession(context.Background(), session)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -65,8 +76,16 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	outgoing <- outboxWSMessage{Type: "ready", OK: true, Time: time.Now().Unix()}
 	outgoing <- outboxWSMessage{Type: "wake"}
-	ticker := time.NewTicker(25 * time.Second)
-	defer ticker.Stop()
+	ping := time.NewTicker(25 * time.Second)
+	defer ping.Stop()
+	poll := time.NewTicker(s.service.OutboxPollInterval())
+	defer poll.Stop()
+	renewInterval := session.TTL / 3
+	if renewInterval <= 0 {
+		renewInterval = 5 * time.Second
+	}
+	renew := time.NewTicker(renewInterval)
+	defer renew.Stop()
 
 	for {
 		select {
@@ -97,7 +116,15 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		case <-notify:
 			outgoing <- outboxWSMessage{Type: "wake"}
-		case <-ticker.C:
+		case <-poll.C:
+			outgoing <- outboxWSMessage{Type: "wake"}
+		case <-renew.C:
+			active, err := s.service.RenewOutboxSession(ctx, session)
+			if err != nil || !active {
+				_ = conn.writeJSON(outboxWSMessage{Type: "error", Error: "device session lease lost", Time: time.Now().Unix()})
+				return
+			}
+		case <-ping.C:
 			if !conn.writeControl(wsOpPing, []byte("ping")) {
 				return
 			}

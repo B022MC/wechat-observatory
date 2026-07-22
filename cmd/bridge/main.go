@@ -56,9 +56,11 @@ func main() {
 	}
 	service := bridge.NewService(bridge.Config{
 		DefaultDevice: cfg.DefaultDevice,
-		MediaDir:      cfg.MediaDir,
 		Devices:       cfg.Devices,
 		APIKeys:       cfg.APIKeys,
+		InstanceID:    cfg.InstanceID,
+		SessionTTL:    cfg.SessionTTL,
+		PollInterval:  cfg.PollInterval,
 	}, opts...)
 
 	httpServer := &http.Server{

@@ -8,6 +8,7 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	t.Setenv("BRIDGE_DEFAULT_DEVICE", "phone-a")
 	t.Setenv("BRIDGE_DEVICES", "phone-a||wechat-phone|5s")
 	t.Setenv("BRIDGE_API_KEYS", "wg_wechat_a|phone-a|WeChat Account")
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
 
 	cfg, err := LoadFromEnv()
 	if err != nil {
@@ -24,6 +25,7 @@ func TestLoadFromEnvAllowsDeviceWithoutWxID(t *testing.T) {
 	t.Setenv("BRIDGE_DEFAULT_DEVICE", "phone-a")
 	t.Setenv("BRIDGE_DEVICES", "phone-a")
 	t.Setenv("BRIDGE_API_KEYS", "wg_wechat_a|phone-a|WeChat Account")
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
 
 	cfg, err := LoadFromEnv()
 	if err != nil {
@@ -58,6 +60,13 @@ func TestLoadFromEnvRejectsInvalidMySQLAutoMigrate(t *testing.T) {
 
 	if _, err := LoadFromEnv(); err == nil {
 		t.Fatal("expected invalid auto migrate error")
+	}
+}
+
+func TestLoadFromEnvRequiresMySQL(t *testing.T) {
+	t.Setenv("BRIDGE_MYSQL_DSN", "")
+	if _, err := LoadFromEnv(); err == nil || err.Error() != "BRIDGE_MYSQL_DSN is required" {
+		t.Fatalf("expected required mysql error, got %v", err)
 	}
 }
 

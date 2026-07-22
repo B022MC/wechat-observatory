@@ -12,7 +12,6 @@ import (
 
 const (
 	defaultHTTPAddr      = ":8088"
-	defaultMediaDir      = "data/media"
 	DefaultAdminPassword = "change-this-password"
 	currentAdminPassEnv  = "BRIDGE_ADMIN_PASSWORD"
 )
@@ -21,7 +20,9 @@ type Config struct {
 	HTTPAddr      string
 	AdminPassword string
 	DefaultDevice string
-	MediaDir      string
+	InstanceID    string
+	SessionTTL    time.Duration
+	PollInterval  time.Duration
 	Devices       map[string]Device
 	APIKeys       map[string]APIKey
 	MySQL         MySQLConfig
@@ -55,7 +56,9 @@ func LoadFromEnv() (Config, error) {
 		HTTPAddr:      getenv("BRIDGE_HTTP_ADDR", defaultHTTPAddr),
 		AdminPassword: adminPasswordFromEnv(),
 		DefaultDevice: strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_DEVICE")),
-		MediaDir:      getenv("BRIDGE_MEDIA_DIR", defaultMediaDir),
+		InstanceID:    instanceID(),
+		SessionTTL:    getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
+		PollInterval:  getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", time.Second),
 		Devices:       map[string]Device{},
 		APIKeys:       map[string]APIKey{},
 		MySQL: MySQLConfig{
@@ -86,9 +89,7 @@ func LoadFromEnv() (Config, error) {
 	cfg.APIKeys = apiKeys
 
 	if !cfg.MySQL.Enabled() {
-		if err := cfg.EnsureRuntimeReady(); err != nil {
-			return Config{}, err
-		}
+		return Config{}, errors.New("BRIDGE_MYSQL_DSN is required")
 	}
 
 	return cfg, nil
@@ -135,6 +136,28 @@ func getenvBool(name string, fallback bool) (bool, error) {
 		return false, fmt.Errorf("%s is invalid: %w", name, err)
 	}
 	return value, nil
+}
+
+func getenvDuration(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func instanceID() string {
+	if value := strings.TrimSpace(os.Getenv("BRIDGE_INSTANCE_ID")); value != "" {
+		return value
+	}
+	if hostname, err := os.Hostname(); err == nil && strings.TrimSpace(hostname) != "" {
+		return hostname
+	}
+	return "wechat-observatory"
 }
 
 func validateListenAddr(name, value string) error {
