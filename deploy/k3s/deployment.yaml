@@ -6,9 +6,12 @@ metadata:
   labels:
     app: wechat-observatory
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: wechat-observatory
@@ -17,17 +20,10 @@ spec:
       labels:
         app: wechat-observatory
     spec:
-      hostNetwork: true
-      nodeSelector:
-        kubernetes.io/hostname: vm-0-16-centos
       containers:
-        - name: gateway
-          image: docker.io/rancher/mirrored-library-busybox:1.37.0
+        - name: bridge
+          image: registry.example.internal/pd/wechat-observatory:replace-me
           imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -ec
-            - /opt/wechat-observatory/wechat-observatory/wechat-observatory-linux-amd64
           envFrom:
             - configMapRef:
                 name: wechat-observatory-config
@@ -39,21 +35,12 @@ spec:
           readinessProbe:
             httpGet:
               path: /healthz
-              port: 8088
+              port: http
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8088
-            initialDelaySeconds: 10
+              port: http
+            initialDelaySeconds: 15
             periodSeconds: 20
-          volumeMounts:
-            - name: runtime
-              mountPath: /opt/wechat-observatory/wechat-observatory
-              readOnly: true
-      volumes:
-        - name: runtime
-          hostPath:
-            path: /opt/wechat-observatory/wechat-observatory
-            type: Directory

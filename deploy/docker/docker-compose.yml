@@ -2,25 +2,57 @@ services:
   mysql:
     image: mysql:8.4
     restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
     environment:
-      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-root-change-me}"
-      MYSQL_DATABASE: "${MYSQL_DATABASE:-app_wechat_observatory}"
-      MYSQL_USER: "${MYSQL_USER:-wechat}"
-      MYSQL_PASSWORD: "${MYSQL_PASSWORD:-change-me}"
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}"
       TZ: "${TZ:-Asia/Shanghai}"
+      OBS_DB_NAME: "${OBS_DB_NAME:-wechat_observatory}"
+      OBS_DB_USER: "${OBS_DB_USER:?set OBS_DB_USER}"
+      OBS_DB_PASSWORD: "${OBS_DB_PASSWORD:?set OBS_DB_PASSWORD}"
+      GATEWAY_DB_NAME: "${GATEWAY_DB_NAME:-pd_wechat_gateway}"
+      GATEWAY_DB_USER: "${GATEWAY_DB_USER:?set GATEWAY_DB_USER}"
+      GATEWAY_DB_PASSWORD: "${GATEWAY_DB_PASSWORD:?set GATEWAY_DB_PASSWORD}"
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=128M
+      - --performance-schema=OFF
+      - --max-connections=60
+      - --table-open-cache=400
     volumes:
       - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 30s
 
-  gateway:
+  observatory-db:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: wechat-observatory:local
+    restart: "no"
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      BRIDGE_ADMIN_PASSWORD: "${BRIDGE_ADMIN_PASSWORD:?set BRIDGE_ADMIN_PASSWORD}"
+      BRIDGE_DEFAULT_DEVICE: "${BRIDGE_DEFAULT_DEVICE:-phone-a}"
+      BRIDGE_DEVICES: "${BRIDGE_DEVICES:-phone-a||wechat-phone|5s}"
+      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:?set BRIDGE_API_KEYS}"
+      BRIDGE_MYSQL_DSN: "${OBS_DB_USER:?set OBS_DB_USER}:${OBS_DB_PASSWORD:?set OBS_DB_PASSWORD}@tcp(mysql:3306)/${OBS_DB_NAME:-wechat_observatory}?charset=utf8mb4&parseTime=True&loc=UTC"
+    entrypoint: ["/usr/local/bin/wechat-observatory-db"]
+    command: ["-create-database", "-migrate", "-seed", "-check"]
+
+  observatory:
     build:
       context: ../..
       dockerfile: Dockerfile
@@ -30,18 +62,16 @@ services:
       - path: .env
         required: false
     depends_on:
-      mysql:
-        condition: service_healthy
-      gateway-db:
+      observatory-db:
         condition: service_completed_successfully
     environment:
-      BRIDGE_HTTP_ADDR: "${BRIDGE_HTTP_ADDR:-:8088}"
-      BRIDGE_ADMIN_PASSWORD: "${BRIDGE_ADMIN_PASSWORD:-change-this-password}"
+      BRIDGE_HTTP_ADDR: ":8088"
+      BRIDGE_ADMIN_PASSWORD: "${BRIDGE_ADMIN_PASSWORD:?set BRIDGE_ADMIN_PASSWORD}"
       BRIDGE_DEFAULT_DEVICE: "${BRIDGE_DEFAULT_DEVICE:-phone-a}"
       BRIDGE_DEVICES: "${BRIDGE_DEVICES:-phone-a||wechat-phone|5s}"
-      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:-dev_key_001|phone-a|Test Phone}"
-      BRIDGE_MYSQL_DSN: "${MYSQL_USER:-wechat}:${MYSQL_PASSWORD:-change-me}@tcp(${MYSQL_HOST:-mysql}:3306)/${MYSQL_DATABASE:-app_wechat_observatory}?charset=utf8mb4&parseTime=True&loc=Local"
-      BRIDGE_MYSQL_AUTO_MIGRATE: "${BRIDGE_MYSQL_AUTO_MIGRATE:-false}"
+      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:?set BRIDGE_API_KEYS}"
+      BRIDGE_MYSQL_DSN: "${OBS_DB_USER:?set OBS_DB_USER}:${OBS_DB_PASSWORD:?set OBS_DB_PASSWORD}@tcp(mysql:3306)/${OBS_DB_NAME:-wechat_observatory}?charset=utf8mb4&parseTime=True&loc=UTC"
+      BRIDGE_MYSQL_AUTO_MIGRATE: "false"
     ports:
       - "${BRIDGE_HTTP_PORT:-8088}:8088"
     healthcheck:
@@ -52,7 +82,10 @@ services:
       start_period: 10s
 
   gateway-db:
-    image: wechat-observatory:local
+    build:
+      context: ../../../pd-wechat-gateway
+      dockerfile: Dockerfile
+    image: pd-wechat-gateway:local
     restart: "no"
     env_file:
       - path: .env
@@ -60,14 +93,54 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    environment: &gateway-env
+      PD_GATEWAY_DB_DRIVER: mysql
+      PD_GATEWAY_DB: "${GATEWAY_DB_USER:?set GATEWAY_DB_USER}:${GATEWAY_DB_PASSWORD:?set GATEWAY_DB_PASSWORD}@tcp(mysql:3306)/${GATEWAY_DB_NAME:-pd_wechat_gateway}?charset=utf8mb4&parseTime=true&loc=UTC"
+      PD_GATEWAY_RUNTIME_MODE: standalone
+      PD_GATEWAY_RUNTIME_ROLE: all
+      PD_GATEWAY_ADDR: ":19090"
+      PD_GATEWAY_ADMIN_DIST: /app/web/admin/dist
+      PD_GATEWAY_SUPER_USERNAME: "${PD_GATEWAY_SUPER_USERNAME:-admin}"
+      PD_GATEWAY_SUPER_PASSWORD: "${PD_GATEWAY_SUPER_PASSWORD:?set PD_GATEWAY_SUPER_PASSWORD}"
+      PD_GATEWAY_SUPER_DISPLAY_NAME: "${PD_GATEWAY_SUPER_DISPLAY_NAME:-Super Admin}"
+    entrypoint: ["/usr/local/bin/pd-wechat-gateway-db"]
+
+  gateway:
+    build:
+      context: ../../../pd-wechat-gateway
+      dockerfile: Dockerfile
+    image: pd-wechat-gateway:local
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      observatory:
+        condition: service_healthy
+      gateway-db:
+        condition: service_completed_successfully
     environment:
-      BRIDGE_ADMIN_PASSWORD: "${BRIDGE_ADMIN_PASSWORD:-change-this-password}"
-      BRIDGE_DEFAULT_DEVICE: "${BRIDGE_DEFAULT_DEVICE:-phone-a}"
-      BRIDGE_DEVICES: "${BRIDGE_DEVICES:-phone-a||wechat-phone|5s}"
-      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:-dev_key_001|phone-a|Test Phone}"
-      BRIDGE_MYSQL_DSN: "${MYSQL_USER:-wechat}:${MYSQL_PASSWORD:-change-me}@tcp(${MYSQL_HOST:-mysql}:3306)/${MYSQL_DATABASE:-app_wechat_observatory}?charset=utf8mb4&parseTime=True&loc=Local"
-    entrypoint: ["/usr/local/bin/wechat-observatory-db"]
-    command: ["-create-database", "-migrate", "-seed", "-check"]
+      <<: *gateway-env
+      PD_GATEWAY_GAME_RUNTIME_ENABLED: "${PD_GATEWAY_GAME_RUNTIME_ENABLED:-false}"
+      PD_GATEWAY_RUNTIME_TEAHOUSE_ID: "${PD_GATEWAY_RUNTIME_TEAHOUSE_ID:-}"
+      PD_GATEWAY_PLAYER_CONTROLS_ENABLED: "${PD_GATEWAY_PLAYER_CONTROLS_ENABLED:-false}"
+      PD_GATEWAY_NATIVE_COMMANDS_ENABLED: "${PD_GATEWAY_NATIVE_COMMANDS_ENABLED:-false}"
+      PD_GATEWAY_NATIVE_COMMAND_HOUSE_GIDS: "${PD_GATEWAY_NATIVE_COMMAND_HOUSE_GIDS:-}"
+      PD_GATEWAY_NATIVE_HOUSE_USER_GIDS: "${PD_GATEWAY_NATIVE_HOUSE_USER_GIDS:-}"
+      PD_GATEWAY_ALL_COMMANDS_ENABLED: "${PD_GATEWAY_ALL_COMMANDS_ENABLED:-false}"
+      PD_GATEWAY_WEALTH_ENABLED: "${PD_GATEWAY_WEALTH_ENABLED:-false}"
+      PD_GATEWAY_WEALTH_HOUSE_GIDS: "${PD_GATEWAY_WEALTH_HOUSE_GIDS:-}"
+      PD_GATEWAY_PROJECTION_TOKEN: "${PD_GATEWAY_PROJECTION_TOKEN:-}"
+      PD_GATEWAY_BOSS_BIND_TOKEN: "${PD_GATEWAY_BOSS_BIND_TOKEN:-}"
+      PD_GATEWAY_PUBLIC_BASE_URL: "${PD_GATEWAY_PUBLIC_BASE_URL:-}"
+    ports:
+      - "${PD_GATEWAY_HTTP_PORT:-19090}:19090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:19090/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   mysql-data:

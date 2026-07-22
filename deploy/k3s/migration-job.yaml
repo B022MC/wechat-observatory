@@ -1,0 +1,20 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wechat-observatory-migrate
+  namespace: wechat-observatory
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: registry.example.internal/pd/wechat-observatory:replace-me
+          command: ["/usr/local/bin/wechat-observatory-db"]
+          args: ["-create-database", "-migrate", "-seed", "-check"]
+          envFrom:
+            - configMapRef:
+                name: wechat-observatory-config
+            - secretRef:
+                name: wechat-observatory-secrets
