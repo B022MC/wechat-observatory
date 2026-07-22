@@ -40,6 +40,16 @@ func TestMigrationsCoverCoreTables(t *testing.T) {
 	}
 }
 
+func TestOutboxLeaseUsesMySQLClock(t *testing.T) {
+	query := strings.Join(strings.Fields(leaseOutboxItemStatement), " ")
+	if !strings.Contains(query, "lease_until = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 60 SECOND)") {
+		t.Fatalf("outbox lease must use the MySQL clock: %s", query)
+	}
+	if strings.Contains(query, "lease_until = ?") {
+		t.Fatalf("outbox lease must not use an application-clock timestamp: %s", query)
+	}
+}
+
 func TestListMessagesQueryExcludesModuleAckEvents(t *testing.T) {
 	query, args := listMessagesQuery(bridge.MessageFilter{
 		Device: "phone-a",

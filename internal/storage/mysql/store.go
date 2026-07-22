@@ -715,7 +715,6 @@ func (s *Store) EnqueueReply(ctx context.Context, action bridge.ReplyAction) (br
 
 func (s *Store) PollReplyActions(ctx context.Context, req bridge.ModulePollRequest) ([]bridge.ModuleOutboxItem, error) {
 	limit := normalizeLimit(req.Limit)
-	leaseUntil := time.Now().Add(60 * time.Second)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -758,13 +757,7 @@ func (s *Store) PollReplyActions(ctx context.Context, req bridge.ModulePollReque
 		return nil, err
 	}
 	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE bridge_module_outbox
-			SET status = 'leased', attempt_count = attempt_count + 1, lease_until = ?
-			WHERE id = ?`,
-			leaseUntil,
-			id,
-		); err != nil {
+		if _, err := tx.ExecContext(ctx, leaseOutboxItemStatement, id); err != nil {
 			return nil, err
 		}
 	}
@@ -776,6 +769,12 @@ func (s *Store) PollReplyActions(ctx context.Context, req bridge.ModulePollReque
 	}
 	return s.listOutboxItems(ctx, ids)
 }
+
+const leaseOutboxItemStatement = `
+	UPDATE bridge_module_outbox
+	SET status = 'leased', attempt_count = attempt_count + 1,
+		lease_until = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 60 SECOND)
+	WHERE id = ?`
 
 func (s *Store) AckReplyActions(ctx context.Context, req bridge.ModuleAckRequest) ([]bridge.ModuleOutboxItem, error) {
 	for _, item := range req.Items {
