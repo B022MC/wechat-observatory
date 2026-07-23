@@ -8,6 +8,9 @@ process can own the configured game account.
 ## Start
 
 1. Copy `.env.example` to `.env` and replace every placeholder secret.
+   A deliberately blank installation may set `BRIDGE_API_KEYS=` and create
+   its first module API Key from the Observatory admin page after startup.
+   `BRIDGE_DEVICES` must still contain one bootstrap device.
 2. Keep `PD_GATEWAY_GAME_RUNTIME_ENABLED=false` until the previous Plaza
    account owner has been stopped and the tea-house binding is verified.
 3. Run `docker compose up -d --build` from this directory.

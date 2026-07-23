@@ -47,7 +47,7 @@ services:
       BRIDGE_ADMIN_PASSWORD: "${BRIDGE_ADMIN_PASSWORD:?set BRIDGE_ADMIN_PASSWORD}"
       BRIDGE_DEFAULT_DEVICE: "${BRIDGE_DEFAULT_DEVICE:-phone-a}"
       BRIDGE_DEVICES: "${BRIDGE_DEVICES:-phone-a||wechat-phone|5s}"
-      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:?set BRIDGE_API_KEYS}"
+      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:-}"
       BRIDGE_MYSQL_DSN: "${OBS_DB_USER:?set OBS_DB_USER}:${OBS_DB_PASSWORD:?set OBS_DB_PASSWORD}@tcp(mysql:3306)/${OBS_DB_NAME:-wechat_observatory}?charset=utf8mb4&parseTime=True&loc=UTC"
     entrypoint: ["/usr/local/bin/wechat-observatory-db"]
     command: ["-create-database", "-migrate", "-seed", "-check"]
@@ -69,7 +69,7 @@ services:
       BRIDGE_ADMIN_PASSWORD: "${BRIDGE_ADMIN_PASSWORD:?set BRIDGE_ADMIN_PASSWORD}"
       BRIDGE_DEFAULT_DEVICE: "${BRIDGE_DEFAULT_DEVICE:-phone-a}"
       BRIDGE_DEVICES: "${BRIDGE_DEVICES:-phone-a||wechat-phone|5s}"
-      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:?set BRIDGE_API_KEYS}"
+      BRIDGE_API_KEYS: "${BRIDGE_API_KEYS:-}"
       BRIDGE_MYSQL_DSN: "${OBS_DB_USER:?set OBS_DB_USER}:${OBS_DB_PASSWORD:?set OBS_DB_PASSWORD}@tcp(mysql:3306)/${OBS_DB_NAME:-wechat_observatory}?charset=utf8mb4&parseTime=True&loc=UTC"
       BRIDGE_MYSQL_AUTO_MIGRATE: "false"
       BRIDGE_HISTORY_RETENTION_DAYS: "${BRIDGE_HISTORY_RETENTION_DAYS:-15}"
