@@ -6,9 +6,7 @@
     <string name="settings_saved">已保存配置，请重启微信生效</string>
     <string name="action_save">保存配置</string>
     <string name="label_bridge_url">服务端地址</string>
-    <string name="action_show_bridge_url">显示服务端地址</string>
     <string name="label_api_key">API Key</string>
-    <string name="action_show_api_key">显示 API Key</string>
     <string name="label_poll_interval">出站轮询间隔毫秒</string>
     <string name="label_poll_limit">单次拉取数量</string>
     <string name="label_contact_sync_interval">通讯录同步间隔毫秒</string>

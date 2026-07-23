@@ -54,8 +54,8 @@ WeChat.
 
 The settings page writes the same keys exposed by `BridgeConfigProvider`, so
 the hooked WeChat process reads the values without manually editing files.
-The server URL and API Key are masked by default, can be revealed independently,
-and are masked again after saving without clearing their stored values.
+The server URL and API Key are always masked and have no plaintext reveal
+control. Saving does not clear unchanged stored values.
 
 Create this file on the phone:
 

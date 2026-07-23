@@ -9,7 +9,6 @@ import android.text.method.PasswordTransformationMethod;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -28,6 +27,7 @@ public final class SettingsActivity extends Activity {
     private static final String DEFAULT_CONTACT_INCLUDE_CHATROOMS = "1";
     private static final String DEFAULT_MEDIA_UPLOAD_ENABLED = "0";
     private static final String DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES = "5242880";
+    private static final String[] SENSITIVE_CONFIG_KEYS = new String[]{"bridge_url", "api_key"};
     private static final Map<String, String> DEFAULTS = new LinkedHashMap<>();
 
     static {
@@ -44,7 +44,6 @@ public final class SettingsActivity extends Activity {
     }
 
     private final Map<String, EditText> fields = new LinkedHashMap<>();
-    private final Map<String, CheckBox> visibilityToggles = new LinkedHashMap<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -77,9 +76,8 @@ public final class SettingsActivity extends Activity {
         root.addView(hint);
 
         addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        addVisibilityToggle(root, "bridge_url", R.string.action_show_bridge_url);
         addField(root, "api_key", R.string.label_api_key, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        addVisibilityToggle(root, "api_key", R.string.action_show_api_key);
+        maskSensitiveFields();
         addField(root, "poll_interval_ms", R.string.label_poll_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "poll_limit", R.string.label_poll_limit, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_sync_interval_ms", R.string.label_contact_sync_interval, InputType.TYPE_CLASS_NUMBER);
@@ -125,32 +123,12 @@ public final class SettingsActivity extends Activity {
         fields.put(key, editText);
     }
 
-    private void addVisibilityToggle(LinearLayout root, String key, int labelResId) {
-        EditText field = fields.get(key);
-        if (field == null) {
-            return;
-        }
-
-        CheckBox toggle = new CheckBox(this);
-        toggle.setText(labelResId);
-        toggle.setChecked(false);
-        toggle.setOnCheckedChangeListener((buttonView, checked) -> setSensitiveFieldVisible(field, checked));
-        root.addView(toggle, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-        visibilityToggles.put(key, toggle);
-        setSensitiveFieldVisible(field, false);
-    }
-
-    private void setSensitiveFieldVisible(EditText field, boolean visible) {
-        int selection = Math.max(0, field.getSelectionStart());
-        field.setTransformationMethod(visible ? null : PasswordTransformationMethod.getInstance());
-        field.setSelection(Math.min(selection, field.length()));
-    }
-
-    private void hideSensitiveFields() {
-        for (CheckBox toggle : visibilityToggles.values()) {
-            toggle.setChecked(false);
+    private void maskSensitiveFields() {
+        for (String key : SENSITIVE_CONFIG_KEYS) {
+            EditText field = fields.get(key);
+            if (field != null) {
+                field.setTransformationMethod(PasswordTransformationMethod.getInstance());
+            }
         }
     }
 
@@ -183,7 +161,7 @@ public final class SettingsActivity extends Activity {
         }
         editor.commit();
         BridgeConfigFiles.writeExternalMirror(this, prefs);
-        hideSensitiveFields();
+        maskSensitiveFields();
         Toast.makeText(this, R.string.settings_saved, Toast.LENGTH_LONG).show();
     }
 
