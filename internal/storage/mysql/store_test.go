@@ -38,6 +38,30 @@ func TestMigrationsCoverCoreTables(t *testing.T) {
 			t.Fatalf("migration missing %q: %s", want, joined)
 		}
 	}
+	for _, want := range []string{"idx_bridge_message_events_retention", "idx_bridge_module_outbox_retention"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("migration missing retention index %q", want)
+		}
+	}
+}
+
+func TestRetentionQueriesUseDatabaseClockAndOnlyDeleteSentOutbox(t *testing.T) {
+	messages, outbox, err := retentionQueries(15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, query := range map[string]string{"messages": messages, "outbox": outbox} {
+		normalized := strings.Join(strings.Fields(query), " ")
+		if !strings.Contains(normalized, "DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 15 DAY)") || !strings.Contains(normalized, "LIMIT ?") {
+			t.Fatalf("%s retention query does not use bounded database time: %s", name, normalized)
+		}
+	}
+	if !strings.Contains(outbox, "status = 'sent'") {
+		t.Fatalf("outbox cleanup must keep pending, leased, and failed rows: %s", outbox)
+	}
+	if _, _, err := retentionQueries(0); err == nil {
+		t.Fatal("zero retention days should fail")
+	}
 }
 
 func TestOutboxLeaseUsesMySQLClock(t *testing.T) {

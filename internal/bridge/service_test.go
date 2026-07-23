@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -236,6 +237,24 @@ func TestMediaRouteIsAbsentWhenMediaStorageIsDisabled(t *testing.T) {
 	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected disabled media route to be absent, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHealthIncludesDatabaseSizeWithoutMakingMetricsAReadinessDependency(t *testing.T) {
+	reader := &fakeMetricsAdminReader{fakeAdminReader: &fakeAdminReader{}, databaseBytes: 123456}
+	server := NewHTTPServer(newTestService("", WithAdminReader(reader)), "admin").Handler()
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"database_bytes":123456`) {
+		t.Fatalf("health response=%d %s", recorder.Code, recorder.Body.String())
+	}
+
+	reader.metricsErr = errors.New("metrics unavailable")
+	recorder = httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"metrics_error":"metrics unavailable"`) {
+		t.Fatalf("metrics failure should not fail health: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -1197,6 +1216,16 @@ type fakeAdminReader struct {
 	modules  []ModuleStatusView
 	contacts []ModuleContactView
 	calls    []string
+}
+
+type fakeMetricsAdminReader struct {
+	*fakeAdminReader
+	databaseBytes int64
+	metricsErr    error
+}
+
+func (r *fakeMetricsAdminReader) DatabaseSizeBytes(context.Context) (int64, error) {
+	return r.databaseBytes, r.metricsErr
 }
 
 type fakeEventTailReader struct {

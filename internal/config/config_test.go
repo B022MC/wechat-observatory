@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	t.Setenv("BRIDGE_HTTP_ADDR", ":8088")
@@ -9,6 +12,8 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	t.Setenv("BRIDGE_DEVICES", "phone-a||wechat-phone|5s")
 	t.Setenv("BRIDGE_API_KEYS", "wg_wechat_a|phone-a|WeChat Account")
 	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
+	t.Setenv("BRIDGE_HISTORY_RETENTION_DAYS", "21")
+	t.Setenv("BRIDGE_HISTORY_RETENTION_INTERVAL", "2h")
 
 	cfg, err := LoadFromEnv()
 	if err != nil {
@@ -16,6 +21,23 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	}
 	if len(cfg.APIKeys) != 1 || cfg.APIKeys["wg_wechat_a"].Device != "phone-a" {
 		t.Fatalf("unexpected api keys: %+v", cfg.APIKeys)
+	}
+	if cfg.RetentionDays != 21 || cfg.RetentionPoll != 2*time.Hour {
+		t.Fatalf("unexpected retention config: days=%d interval=%s", cfg.RetentionDays, cfg.RetentionPoll)
+	}
+}
+
+func TestLoadFromEnvDefaultsHistoryRetentionToFifteenDays(t *testing.T) {
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
+	t.Setenv("BRIDGE_HISTORY_RETENTION_DAYS", "")
+	t.Setenv("BRIDGE_HISTORY_RETENTION_INTERVAL", "")
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetentionDays != 15 || cfg.RetentionPoll != time.Hour {
+		t.Fatalf("unexpected defaults: days=%d interval=%s", cfg.RetentionDays, cfg.RetentionPoll)
 	}
 }
 

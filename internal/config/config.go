@@ -23,6 +23,8 @@ type Config struct {
 	InstanceID    string
 	SessionTTL    time.Duration
 	PollInterval  time.Duration
+	RetentionDays int
+	RetentionPoll time.Duration
 	Devices       map[string]Device
 	APIKeys       map[string]APIKey
 	MySQL         MySQLConfig
@@ -59,6 +61,8 @@ func LoadFromEnv() (Config, error) {
 		InstanceID:    instanceID(),
 		SessionTTL:    getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
 		PollInterval:  getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", time.Second),
+		RetentionDays: getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),
+		RetentionPoll: getenvDuration("BRIDGE_HISTORY_RETENTION_INTERVAL", time.Hour),
 		Devices:       map[string]Device{},
 		APIKeys:       map[string]APIKey{},
 		MySQL: MySQLConfig{
@@ -144,6 +148,18 @@ func getenvDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func getenvPositiveInt(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
 	if err != nil || value <= 0 {
 		return fallback
 	}

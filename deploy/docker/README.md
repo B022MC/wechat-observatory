@@ -15,7 +15,26 @@ process can own the configured game account.
 
 MySQL stores two isolated application databases. The Compose MySQL bootstrap
 uses root only once to create the users; Gateway and Observatory use their own
-DSNs and must never use the root account. No media data is mounted or stored.
+DSNs and must never use the root account. Gateway receives only the additional
+read-only `REPLICATION CLIENT` privilege needed to total MySQL binlog sizes; it
+cannot read the Observatory database. No media data is mounted or stored.
+
+Observatory deletes message history and only successfully sent outbox rows
+after 15 days. Gateway deletes processed command receipts and command logs
+after 30 days. Pending, leased, and failed Observatory outbox rows remain;
+financial, diamond, balance, and game-settlement business ledgers are not
+removed by these jobs.
+
+Gateway checks combined application database size, MySQL binlog size, node
+disk usage, and node/container memory every five minutes. The defaults alert
+at 5 GiB, 4 GiB, 85%, and 85%. Each enabled Boss receives the warning through
+that Boss's own assigned device and `filehelper`, at most once per six hours.
+For an existing MySQL volume, apply the binlog monitoring grant once before
+starting the updated Gateway:
+
+```sql
+GRANT REPLICATION CLIENT ON *.* TO '<gateway-db-user>'@'%';
+```
 
 ## Rollback
 
@@ -28,6 +47,8 @@ required.
 
 1. Run the two migration Jobs, then deploy Observatory and Gateway API/control
    with `PD_GATEWAY_GAME_RUNTIME_ENABLED=false`.
+   The external MySQL administrator must also grant `REPLICATION CLIENT` to
+   the Gateway database user; no cross-database grant is required.
 2. Stop Compose `gateway`; deploy one account-worker manifest with one explicit
    `PD_GATEWAY_RUNTIME_TEAHOUSE_ID`, then enable the intended runtime features.
 3. For takeover testing, deploy a second one-replica worker manifest for the

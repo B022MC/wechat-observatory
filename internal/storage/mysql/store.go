@@ -90,6 +90,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureDeviceSessionLeaseTable(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureRetentionIndexes(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -230,6 +233,22 @@ func (s *Store) ensureDeviceSessionLeaseTable(ctx context.Context) error {
 	return err
 }
 
+func (s *Store) ensureRetentionIndexes(ctx context.Context) error {
+	statements := []string{
+		`CREATE INDEX idx_bridge_message_events_retention ON bridge_message_events (created_at)`,
+		`CREATE INDEX idx_bridge_module_outbox_retention ON bridge_module_outbox (status, updated_at)`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 func Migrations() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS bridge_api_keys (
@@ -276,6 +295,7 @@ func Migrations() []string {
 			KEY idx_bridge_message_events_owner_time (device, owner_wxid, id),
 			KEY idx_bridge_message_events_chat_record (chat_record_id),
 			KEY idx_bridge_message_events_direction (direction),
+			KEY idx_bridge_message_events_retention (created_at),
 			UNIQUE KEY uniq_bridge_message_events_event_key (event_key)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS bridge_module_outbox (
@@ -293,7 +313,8 @@ func Migrations() []string {
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			KEY idx_bridge_module_outbox_device_status (device, status, id),
 			KEY idx_bridge_module_outbox_owner_status (device, owner_wxid, status, id),
-			KEY idx_bridge_module_outbox_lease (lease_until)
+			KEY idx_bridge_module_outbox_lease (lease_until),
+			KEY idx_bridge_module_outbox_retention (status, updated_at)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS bridge_module_runtime (
 			device VARCHAR(128) NOT NULL PRIMARY KEY,
@@ -343,6 +364,90 @@ func Migrations() []string {
 			KEY idx_bridge_device_session_lease_until (lease_until)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 	}
+}
+
+type RetentionCleanup struct {
+	MessageEvents int64
+	SentOutbox    int64
+}
+
+func (s *Store) PurgeExpiredHistory(ctx context.Context, retentionDays int) (RetentionCleanup, error) {
+	const batchSize = 1000
+	messageQuery, outboxQuery, err := retentionQueries(retentionDays)
+	if err != nil {
+		return RetentionCleanup{}, err
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return RetentionCleanup{}, err
+	}
+	defer conn.Close()
+	var acquired int
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK('wechat_observatory_history_retention', 0)`).Scan(&acquired); err != nil {
+		return RetentionCleanup{}, err
+	}
+	if acquired != 1 {
+		return RetentionCleanup{}, nil
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var released sql.NullInt64
+		_ = conn.QueryRowContext(releaseCtx, `SELECT RELEASE_LOCK('wechat_observatory_history_retention')`).Scan(&released)
+	}()
+
+	messages, err := purgeBatches(ctx, conn, messageQuery, batchSize)
+	if err != nil {
+		return RetentionCleanup{}, err
+	}
+	outbox, err := purgeBatches(ctx, conn, outboxQuery, batchSize)
+	if err != nil {
+		return RetentionCleanup{MessageEvents: messages}, err
+	}
+	return RetentionCleanup{MessageEvents: messages, SentOutbox: outbox}, nil
+}
+
+func retentionQueries(retentionDays int) (string, string, error) {
+	if retentionDays <= 0 {
+		return "", "", errors.New("retention days must be positive")
+	}
+	messageQuery := fmt.Sprintf(`DELETE FROM bridge_message_events
+		WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL %d DAY)
+		ORDER BY created_at LIMIT ?`, retentionDays)
+	outboxQuery := fmt.Sprintf(`DELETE FROM bridge_module_outbox
+		WHERE status = 'sent'
+			AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL %d DAY)
+		ORDER BY updated_at LIMIT ?`, retentionDays)
+	return messageQuery, outboxQuery, nil
+}
+
+type retentionExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func purgeBatches(ctx context.Context, execer retentionExecer, query string, batchSize int) (int64, error) {
+	var total int64
+	for {
+		result, err := execer.ExecContext(ctx, query, batchSize)
+		if err != nil {
+			return total, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += count
+		if count < int64(batchSize) {
+			return total, nil
+		}
+	}
+}
+
+func (s *Store) DatabaseSizeBytes(ctx context.Context) (int64, error) {
+	var size int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(data_length + index_length), 0)
+		FROM information_schema.tables WHERE table_schema = DATABASE()`).Scan(&size)
+	return size, err
 }
 
 func (s *Store) SeedFromConfig(ctx context.Context, cfg config.Config) error {

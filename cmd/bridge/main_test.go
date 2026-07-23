@@ -1,11 +1,13 @@
-﻿package main
+package main
 
 import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"wechat-observatory/internal/config"
+	mysqlstore "wechat-observatory/internal/storage/mysql"
 )
 
 func TestPrepareMySQLStoreSkipsSeedWhenAutoMigrateDisabled(t *testing.T) {
@@ -44,11 +46,45 @@ func TestPrepareMySQLStoreStopsWhenMigrationFails(t *testing.T) {
 	}
 }
 
+func TestHistoryRetentionRunsImmediately(t *testing.T) {
+	store := &fakeHistoryRetentionStore{called: make(chan int, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		startHistoryRetention(ctx, store, 15, time.Hour)
+		close(done)
+	}()
+
+	select {
+	case days := <-store.called:
+		if days != 15 {
+			t.Fatalf("retention days=%d", days)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retention cleanup did not run immediately")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retention cleanup did not stop")
+	}
+}
+
 type fakeSetupStore struct {
 	migrated   bool
 	seeded     bool
 	migrateErr error
 	seedErr    error
+}
+
+type fakeHistoryRetentionStore struct {
+	called chan int
+}
+
+func (s *fakeHistoryRetentionStore) PurgeExpiredHistory(_ context.Context, days int) (mysqlstore.RetentionCleanup, error) {
+	s.called <- days
+	return mysqlstore.RetentionCleanup{}, nil
 }
 
 func (s *fakeSetupStore) ApplyMigrations(context.Context) error {

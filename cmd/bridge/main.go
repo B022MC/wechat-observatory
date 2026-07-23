@@ -71,6 +71,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if store != nil {
+		go startHistoryRetention(ctx, store, cfg.RetentionDays, cfg.RetentionPoll)
+	}
 
 	errs := make(chan error, 1)
 	go func() {
@@ -89,6 +92,36 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+}
+
+type historyRetentionStore interface {
+	PurgeExpiredHistory(context.Context, int) (mysqlstore.RetentionCleanup, error)
+}
+
+func startHistoryRetention(ctx context.Context, store historyRetentionStore, retentionDays int, interval time.Duration) {
+	if store == nil || retentionDays <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		result, err := store.PurgeExpiredHistory(cleanupCtx, retentionDays)
+		cancel()
+		if err != nil {
+			log.Printf("retained history cleanup failed: %v", err)
+		} else if result.MessageEvents > 0 || result.SentOutbox > 0 {
+			log.Printf("retained history cleanup complete: messages=%d sent_outbox=%d", result.MessageEvents, result.SentOutbox)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func initializeMySQL(cfg config.Config) (*mysqlstore.Store, error) {

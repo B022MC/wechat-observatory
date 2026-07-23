@@ -78,6 +78,10 @@ type AdminReader interface {
 	ListModuleContacts(ctx context.Context, filter ModuleContactFilter) ([]ModuleContactView, error)
 }
 
+type StorageMetricsReader interface {
+	DatabaseSizeBytes(ctx context.Context) (int64, error)
+}
+
 type APIKeyUpsertRequest struct {
 	Code     string `json:"code,omitempty"`
 	APIKey   string `json:"api_key,omitempty"`

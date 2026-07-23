@@ -50,10 +50,16 @@ func (s *HTTPServer) Handler() http.Handler {
 	return mux
 }
 
-func (s *HTTPServer) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true,
-	})
+func (s *HTTPServer) health(w http.ResponseWriter, r *http.Request) {
+	payload := map[string]any{"ok": true}
+	if reader, ok := s.service.AdminReader().(StorageMetricsReader); ok {
+		if databaseBytes, err := reader.DatabaseSizeBytes(r.Context()); err != nil {
+			payload["metrics_error"] = err.Error()
+		} else {
+			payload["database_bytes"] = databaseBytes
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *HTTPServer) devices(w http.ResponseWriter, r *http.Request) {
