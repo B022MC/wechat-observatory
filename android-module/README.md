@@ -54,6 +54,8 @@ WeChat.
 
 The settings page writes the same keys exposed by `BridgeConfigProvider`, so
 the hooked WeChat process reads the values without manually editing files.
+The server URL and API Key are masked by default, can be revealed independently,
+and are masked again after saving without clearing their stored values.
 
 Create this file on the phone:
 
@@ -77,7 +79,7 @@ poll_limit=1
 contact_sync_interval_ms=600000
 contact_sync_limit=1000
 contact_include_chatrooms=1
-media_upload_enabled=1
+media_upload_enabled=0
 media_upload_limit_bytes=5242880
 ```
 

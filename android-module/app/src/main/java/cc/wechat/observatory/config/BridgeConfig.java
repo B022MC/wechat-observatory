@@ -57,7 +57,7 @@ public final class BridgeConfig {
         config.contactSyncIntervalMs = longSetting(properties, "contact_sync_interval_ms", 600000L);
         config.contactSyncLimit = (int) longSetting(properties, "contact_sync_limit", 1000L);
         config.includeChatrooms = booleanSetting(properties, "contact_include_chatrooms", true);
-        config.mediaUploadEnabled = booleanSetting(properties, "media_upload_enabled", true);
+        config.mediaUploadEnabled = booleanSetting(properties, "media_upload_enabled", false);
         config.mediaUploadLimitBytes = longSetting(properties, "media_upload_limit_bytes", 5L * 1024L * 1024L);
         config.signature = configSignature(properties);
         logConfigOnce(config, properties);
