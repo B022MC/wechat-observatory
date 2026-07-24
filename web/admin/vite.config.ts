@@ -7,7 +7,7 @@ const projectDir = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
-  base: "/admin/",
+  base: "./",
   resolve: {
     alias: {
       "@": resolve(projectDir, "src")

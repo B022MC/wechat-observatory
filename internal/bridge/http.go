@@ -24,6 +24,7 @@ func NewHTTPServer(service *Service, adminPassword string) *HTTPServer {
 
 func (s *HTTPServer) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/devices", s.requireAdmin(s.devices))
 	mux.HandleFunc("POST /api/devices", s.requireAdmin(s.upsertDevice))

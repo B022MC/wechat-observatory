@@ -6,12 +6,23 @@ type ApiOptions = {
   body?: unknown;
 };
 
+const OBSERVATORY_MOUNT = "/observatory";
+
+export function publicPath(path: string) {
+  if (!path.startsWith("/")) {
+    throw new Error("public path must start with /");
+  }
+  const mounted = window.location.pathname === OBSERVATORY_MOUNT
+    || window.location.pathname.startsWith(`${OBSERVATORY_MOUNT}/`);
+  return `${mounted ? OBSERVATORY_MOUNT : ""}${path}`;
+}
+
 async function requestJSON<T>(path: string, options: ApiOptions): Promise<T> {
   const headers: Record<string, string> = { "X-Bridge-Password": options.password };
   if (options.body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
-  const response = await fetch(path, {
+  const response = await fetch(publicPath(path), {
     method: options.method ?? "GET",
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body)
@@ -153,7 +164,7 @@ export async function sendText(params: {
 
 export function openLiveEvents(password: string) {
   const search = new URLSearchParams({ password });
-  return new EventSource(`/api/live/events?${search}`);
+  return new EventSource(publicPath(`/api/live/events?${search}`));
 }
 
 export function parseLiveMessageEvent(raw: string) {

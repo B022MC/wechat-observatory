@@ -36,6 +36,7 @@ import {
   getModules,
   openLiveEvents,
   parseLiveMessageEvent,
+  publicPath,
   setApiKeyEnabled,
   sendText,
   updateDevice
@@ -1479,7 +1480,7 @@ function mediaKindFromType(type?: number) {
 }
 
 function mediaURL(path: string, password: string) {
-  const url = new URL(path, window.location.origin);
+  const url = new URL(path.startsWith("/") ? publicPath(path) : path, window.location.origin);
   if (password) {
     url.searchParams.set("password", password);
   }

@@ -240,6 +240,23 @@ func TestMediaRouteIsAbsentWhenMediaStorageIsDisabled(t *testing.T) {
 	}
 }
 
+func TestAdminRedirectsStayRelativeForReverseProxyMounts(t *testing.T) {
+	server := NewHTTPServer(newTestService(""), "admin").Handler()
+	for _, path := range []string{"/", "/admin"} {
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusPermanentRedirect || recorder.Header().Get("Location") != "admin/" {
+			t.Fatalf("redirect %s = %d location=%q", path, recorder.Code, recorder.Header().Get("Location"))
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown route should remain 404, got %d", recorder.Code)
+	}
+}
+
 func TestHealthIncludesDatabaseSizeWithoutMakingMetricsAReadinessDependency(t *testing.T) {
 	reader := &fakeMetricsAdminReader{fakeAdminReader: &fakeAdminReader{}, databaseBytes: 123456}
 	server := NewHTTPServer(newTestService("", WithAdminReader(reader)), "admin").Handler()
