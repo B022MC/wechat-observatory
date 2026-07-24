@@ -1,0 +1,24 @@
+{
+	admin off
+	default_sni {$PD_WECHAT_HTTPS_HOST}
+}
+
+{$PD_WECHAT_HTTPS_HOST} {
+	encode zstd gzip
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	reverse_proxy gateway:19090
+}

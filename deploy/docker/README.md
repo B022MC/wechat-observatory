@@ -16,6 +16,37 @@ process can own the configured game account.
 3. Run `docker compose up -d --build` from this directory.
 4. Check `http://host:8088/healthz` and `http://host:19090/healthz`.
 
+## HTTPS And Boss PWA
+
+Set `PD_WECHAT_HTTPS_HOST` to the public IP or to a DNS name that points at the
+Docker host, and set the matching `https://` value in
+`PD_GATEWAY_PUBLIC_BASE_URL`. The included Caddy policy requests automatically
+renewed Let's Encrypt short-lived certificates, which also support public IP
+addresses. Then generate a dedicated Boss Key pepper:
+
+```bash
+openssl rand -hex 32
+```
+
+Store the result only as `PD_GATEWAY_BOSS_KEY_PEPPER` in `.env`. Enable the
+Boss app with `PD_GATEWAY_BOSS_APP_ENABLED=true`, keep
+`PD_GATEWAY_BOSS_COOKIE_SECURE=true`, and start the HTTPS proxy after the base
+stack has created `pd-wechat-runtime_default`:
+
+```bash
+docker compose -p pd-wechat-https -f docker-compose.https.yml up -d
+```
+
+Caddy runs as a separate Compose project while joining the base stack through
+`PD_WECHAT_RUNTIME_NETWORK`. Keep its default unless the base stack uses a
+different explicit network name.
+
+Caddy persists ACME certificates in named volumes and proxies the complete
+Gateway origin, including `/admin/`, `/boss/`, `/reports/`, and both API
+namespaces. The Gateway host port binds to `127.0.0.1`; do not reopen 19090 to
+the Internet after HTTPS is verified. Observatory remains separately exposed
+on 8088 for the Android transport module.
+
 MySQL stores two isolated application databases. The Compose MySQL bootstrap
 uses root only once to create the users; Gateway and Observatory use their own
 DSNs and must never use the root account. Gateway receives only the additional
