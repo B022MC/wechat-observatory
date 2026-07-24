@@ -605,7 +605,7 @@ function App() {
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-[1600px] gap-4 p-3 lg:p-4">
+      <main className="mx-auto grid w-full min-w-0 max-w-[1600px] gap-4 p-3 lg:p-4">
         <aside className="grid h-fit gap-4 lg:grid-cols-2">
           <Card>
             <CardHeader>
