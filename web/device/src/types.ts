@@ -3,7 +3,7 @@ export type DeviceModule = {
   device_wxid?: string;
   device_nickname?: string;
   enabled: boolean;
-  runtime_status: "online" | "disabled" | "unregistered" | string;
+  runtime_status: "online" | "offline" | "disabled" | "unregistered" | string;
   last_seen_at?: string;
 };
 

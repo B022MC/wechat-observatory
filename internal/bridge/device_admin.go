@@ -49,9 +49,13 @@ func (s *HTTPServer) deviceAdminModules(w http.ResponseWriter, r *http.Request) 
 
 func (s *HTTPServer) loadModuleStatuses(r *http.Request) ([]ModuleStatusView, error) {
 	if reader := s.service.AdminReader(); reader != nil {
-		return reader.ListModuleStatuses(r.Context())
+		statuses, err := reader.ListModuleStatuses(r.Context())
+		if err != nil {
+			return nil, err
+		}
+		return s.service.NormalizeModuleStatuses(statuses), nil
 	}
-	return s.moduleStatusViews(), nil
+	return s.service.NormalizeModuleStatuses(s.moduleStatusViews()), nil
 }
 
 func newDeviceAdminModuleView(status ModuleStatusView) DeviceAdminModuleView {
@@ -61,6 +65,8 @@ func newDeviceAdminModuleView(status ModuleStatusView) DeviceAdminModuleView {
 		runtimeStatus = "disabled"
 	case !status.Registered:
 		runtimeStatus = "unregistered"
+	case status.RuntimeStatus == "offline":
+		runtimeStatus = "offline"
 	}
 	lastSeenAt := status.RuntimeUpdatedAt
 	if lastSeenAt == "" {

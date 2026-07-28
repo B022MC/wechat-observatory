@@ -174,6 +174,7 @@ function App() {
   const pendingCount = selectedModule?.pending_outbox ?? 0;
   const failedCount = selectedModule?.failed_outbox ?? 0;
   const sentCount = selectedModule?.sent_outbox ?? 0;
+  const selectedModuleOffline = selectedModule?.runtime_status === "offline";
   const messageListActive = contactFilter === "messages";
   const contactQuery = messageListActive ? "" : query;
   const contactIncludeDeleted = messageListActive ? true : includeDeleted;
@@ -438,6 +439,10 @@ function App() {
   };
 
   const openSendDialog = (contact?: ModuleContact) => {
+	if (selectedModuleOffline) {
+	  setNotice("当前微信离线，不能创建发送任务");
+	  return;
+	}
     if (contact) {
       setSelectedWxid(contact.wxid);
     }
@@ -446,7 +451,10 @@ function App() {
   };
 
   const submitSend = async () => {
-    if (!selectedDevice || !selectedWxid || !draft.trim()) return;
+    if (!selectedDevice || !selectedWxid || !draft.trim() || selectedModuleOffline) {
+	  if (selectedModuleOffline) setNotice("当前微信离线，不能创建发送任务");
+	  return;
+	}
     setSending(true);
     setNotice("正在加入发送队列");
     try {
@@ -829,7 +837,7 @@ function App() {
                     <RefreshCw className="h-4 w-4" />
                     刷新消息
                   </Button>
-                  <Button onClick={() => openSendDialog()} disabled={!selectedDevice || !selectedWxid || !adminPassword}>
+                  <Button onClick={() => openSendDialog()} disabled={!selectedDevice || !selectedWxid || !adminPassword || selectedModuleOffline}>
                     <Send className="h-4 w-4" />
                     发消息
                   </Button>
@@ -869,13 +877,13 @@ function App() {
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
                     placeholder="输入要发送到微信的文本"
-                    disabled={!selectedWxid || sending}
+                    disabled={!selectedWxid || sending || selectedModuleOffline}
                   />
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="text-xs text-muted-foreground">
-                      {pendingCount > 0 ? `待发送 ${pendingCount} 条` : failedCount > 0 ? `失败 ${failedCount} 条` : "发送队列空闲"}
+                      {selectedModuleOffline ? "当前微信离线，发送任务已清空" : pendingCount > 0 ? `待发送 ${pendingCount} 条` : failedCount > 0 ? `失败 ${failedCount} 条` : "发送队列空闲"}
                     </span>
-                    <Button onClick={() => void submitSend()} disabled={sending || !adminPassword || !selectedDevice || !selectedWxid || !draft.trim()}>
+                    <Button onClick={() => void submitSend()} disabled={sending || selectedModuleOffline || !adminPassword || !selectedDevice || !selectedWxid || !draft.trim()}>
                       <Send className="h-4 w-4" />
                       {sending ? "发送中" : "加入队列"}
                     </Button>
@@ -1100,6 +1108,7 @@ function App() {
                 onChange={(event) => setDraft(event.target.value)}
                 placeholder="输入要发送到微信的文本"
                 autoFocus
+                disabled={selectedModuleOffline}
               />
             </div>
           </div>
@@ -1107,7 +1116,7 @@ function App() {
             <Button type="button" variant="outline" onClick={() => setSendOpen(false)}>
               取消
             </Button>
-            <Button type="button" onClick={() => void submitSend()} disabled={sending || !draft.trim()}>
+            <Button type="button" onClick={() => void submitSend()} disabled={sending || selectedModuleOffline || !draft.trim()}>
               <Send className="h-4 w-4" />
               {sending ? "发送中" : "加入队列"}
             </Button>
@@ -1263,6 +1272,9 @@ function StatusBadge({ status }: { status?: string }) {
   if (status === "failed" || status === "unregistered") {
     return <Badge variant="destructive">{statusText(status)}</Badge>;
   }
+  if (status === "offline") {
+	return <Badge variant="destructive"><WifiOff className="mr-1 h-3.5 w-3.5" />离线</Badge>;
+  }
   if (status === "disabled") {
     return <Badge variant="secondary">{statusText(status)}</Badge>;
   }
@@ -1413,6 +1425,8 @@ function statusText(status?: string) {
       return "发送中";
     case "failed":
       return "失败";
+	case "offline":
+	  return "离线";
     case "disabled":
       return "已停用";
     case "unregistered":

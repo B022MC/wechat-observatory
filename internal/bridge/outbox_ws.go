@@ -17,12 +17,14 @@ import (
 )
 
 const (
-	websocketGUID      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	wsOpText      byte = 0x1
-	wsOpClose     byte = 0x8
-	wsOpPing      byte = 0x9
-	wsOpPong      byte = 0xA
-	wsMaxPayload       = 1 << 20
+	websocketGUID                  = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	wsOpText                  byte = 0x1
+	wsOpClose                 byte = 0x8
+	wsOpPing                  byte = 0x9
+	wsOpPong                  byte = 0xA
+	wsMaxPayload                   = 1 << 20
+	outboxWSProbeTimeout           = 3 * time.Second
+	outboxWSActivityFreshness      = 30 * time.Second
 )
 
 type outboxWSMessage struct {
@@ -72,10 +74,12 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer unsubscribe()
 
 	outgoing := make(chan outboxWSMessage, 8)
-	go s.readOutboxWS(ctx, cancel, conn, apiKey, device, wxid, outgoing)
+	activity := make(chan struct{}, 1)
+	pong := make(chan struct{}, 1)
+	go s.readOutboxWS(ctx, cancel, conn, apiKey, device, wxid, outgoing, activity, pong)
 
 	outgoing <- outboxWSMessage{Type: "ready", OK: true, Time: time.Now().Unix()}
-	outgoing <- outboxWSMessage{Type: "wake"}
+	outgoing <- outboxWSMessage{Type: "probe"}
 	ping := time.NewTicker(25 * time.Second)
 	defer ping.Stop()
 	poll := time.NewTicker(s.service.OutboxPollInterval())
@@ -87,37 +91,106 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 	renew := time.NewTicker(renewInterval)
 	defer renew.Stop()
 
+	var lastInbound time.Time
+	var inFlight bool
+	var deliveryRequested bool
+	var probeTimer *time.Timer
+	var probeDeadline <-chan time.Time
+	stopProbe := func() {
+		if probeTimer != nil && !probeTimer.Stop() {
+			select {
+			case <-probeTimer.C:
+			default:
+			}
+		}
+		probeTimer = nil
+		probeDeadline = nil
+	}
+	defer stopProbe()
+	startProbe := func() bool {
+		if probeDeadline != nil {
+			return true
+		}
+		if !conn.writeControl(wsOpPing, []byte("outbox-probe")) {
+			return false
+		}
+		probeTimer = time.NewTimer(outboxWSProbeTimeout)
+		probeDeadline = probeTimer.C
+		return true
+	}
+	deliver := func() bool {
+		deliveryRequested = false
+		items, err := s.service.PollOutbox(ctx, ModulePollRequest{APIKey: apiKey, Device: device, WxID: wxid, Limit: 1})
+		if err != nil {
+			if !conn.writeJSON(outboxWSMessage{Type: "error", Error: err.Error(), Time: time.Now().Unix()}) {
+				return false
+			}
+			return !isModuleAuthError(err)
+		}
+		if len(items) == 0 {
+			return true
+		}
+		if !conn.writeJSON(outboxWSMessage{Type: "outbox", OK: true, Items: items, Time: time.Now().Unix()}) {
+			return false
+		}
+		inFlight = true
+		return true
+	}
+	requestDelivery := func(forceProbe bool) bool {
+		deliveryRequested = true
+		if inFlight || probeDeadline != nil {
+			return true
+		}
+		if forceProbe || lastInbound.IsZero() || time.Since(lastInbound) > outboxWSActivityFreshness {
+			return startProbe()
+		}
+		return deliver()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-activity:
+			lastInbound = time.Now()
+		case <-pong:
+			lastInbound = time.Now()
+			if probeDeadline != nil {
+				stopProbe()
+				if deliveryRequested && !inFlight && !deliver() {
+					return
+				}
+			}
+		case <-probeDeadline:
+			return
 		case msg := <-outgoing:
-			if msg.Type == "wake" {
-				items, err := s.service.PollOutbox(ctx, ModulePollRequest{APIKey: apiKey, Device: device, WxID: wxid, Limit: 1})
-				if err != nil {
-					if !conn.writeJSON(outboxWSMessage{Type: "error", Error: err.Error(), Time: time.Now().Unix()}) {
-						return
-					}
-					if isModuleAuthError(err) {
-						return
-					}
-					continue
-				}
-				if len(items) == 0 {
-					continue
-				}
-				if !conn.writeJSON(outboxWSMessage{Type: "outbox", OK: true, Items: items, Time: time.Now().Unix()}) {
+			switch msg.Type {
+			case "probe":
+				if !requestDelivery(true) {
 					return
 				}
 				continue
+			case "wake":
+				if !requestDelivery(false) {
+					return
+				}
+				continue
+			case "ack":
+				if msg.OK && len(msg.Items) > 0 {
+					inFlight = false
+				}
 			}
 			if !conn.writeJSON(msg) {
 				return
 			}
 		case <-notify:
-			outgoing <- outboxWSMessage{Type: "wake"}
+			if !requestDelivery(true) {
+				return
+			}
 		case <-poll.C:
-			outgoing <- outboxWSMessage{Type: "wake"}
+			if !requestDelivery(false) {
+				return
+			}
 		case <-renew.C:
 			active, err := s.service.RenewOutboxSession(ctx, session)
 			if err != nil || !active {
@@ -133,12 +206,26 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *HTTPServer) readOutboxWS(ctx context.Context, cancel context.CancelFunc, conn *wsConn, apiKey string, device string, wxid string, outgoing chan<- outboxWSMessage) {
+func (s *HTTPServer) readOutboxWS(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn *wsConn,
+	apiKey string,
+	device string,
+	wxid string,
+	outgoing chan<- outboxWSMessage,
+	activity chan<- struct{},
+	pong chan<- struct{},
+) {
 	defer cancel()
 	for {
 		payload, op, err := conn.readFrame()
 		if err != nil {
 			return
+		}
+		select {
+		case activity <- struct{}{}:
+		default:
 		}
 		switch op {
 		case wsOpClose:
@@ -148,6 +235,10 @@ func (s *HTTPServer) readOutboxWS(ctx context.Context, cancel context.CancelFunc
 				return
 			}
 		case wsOpPong:
+			select {
+			case pong <- struct{}{}:
+			default:
+			}
 			continue
 		case wsOpText:
 			var msg outboxWSMessage

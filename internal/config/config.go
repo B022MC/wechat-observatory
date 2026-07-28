@@ -25,6 +25,8 @@ type Config struct {
 	InstanceID          string
 	SessionTTL          time.Duration
 	PollInterval        time.Duration
+	ModuleOfflineAfter  time.Duration
+	OfflineOutboxSweep  time.Duration
 	RetentionDays       int
 	RetentionPoll       time.Duration
 	Devices             map[string]Device
@@ -66,6 +68,8 @@ func LoadFromEnv() (Config, error) {
 		InstanceID:          instanceID(),
 		SessionTTL:          getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
 		PollInterval:        getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", time.Second),
+		ModuleOfflineAfter:  getenvDuration("BRIDGE_MODULE_OFFLINE_AFTER", 5*time.Minute),
+		OfflineOutboxSweep:  getenvDuration("BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL", 30*time.Second),
 		RetentionDays:       getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),
 		RetentionPoll:       getenvDuration("BRIDGE_HISTORY_RETENTION_INTERVAL", time.Hour),
 		Devices:             map[string]Device{},

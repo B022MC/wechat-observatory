@@ -297,7 +297,7 @@ func TestDeviceAdminModuleProjectionExcludesMessageAndOutboxMetadata(t *testing.
 		t.Fatalf("module status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{`"device":"phone-a"`, `"runtime_status":"online"`, `"last_seen_at":"2026-07-27T10:00:00Z"`} {
+	for _, want := range []string{`"device":"phone-a"`, `"runtime_status":"offline"`, `"last_seen_at":"2026-07-27T10:00:00Z"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("limited module response missing %s: %s", want, body)
 		}
@@ -327,6 +327,15 @@ func TestDeviceAdminModuleProjectionUsesRegistrationAndRuntimeActivity(t *testin
 			status:       ModuleStatusView{Enabled: true, Registered: false, LastRegisterAt: "2026-07-27T10:02:00Z"},
 			runtimeState: "unregistered",
 			lastSeenAt:   "2026-07-27T10:02:00Z",
+		},
+		{
+			name: "offline is explicit",
+			status: ModuleStatusView{
+				Enabled: true, Registered: true, RuntimeStatus: "offline",
+				RuntimeUpdatedAt: "2026-07-27T10:02:30Z",
+			},
+			runtimeState: "offline",
+			lastSeenAt:   "2026-07-27T10:02:30Z",
 		},
 		{
 			name: "registered ignores outbox state",

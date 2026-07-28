@@ -71,6 +71,31 @@ func TestHistoryRetentionRunsImmediately(t *testing.T) {
 	}
 }
 
+func TestOfflineOutboxCancellationRunsImmediately(t *testing.T) {
+	store := &fakeOfflineOutboxStore{called: make(chan time.Duration, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		startOfflineOutboxCancellation(ctx, store, 5*time.Minute, time.Hour)
+		close(done)
+	}()
+
+	select {
+	case after := <-store.called:
+		if after != 5*time.Minute {
+			t.Fatalf("offline duration=%s", after)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("offline cancellation did not run immediately")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("offline cancellation did not stop")
+	}
+}
+
 type fakeSetupStore struct {
 	migrated   bool
 	seeded     bool
@@ -82,9 +107,18 @@ type fakeHistoryRetentionStore struct {
 	called chan int
 }
 
+type fakeOfflineOutboxStore struct {
+	called chan time.Duration
+}
+
 func (s *fakeHistoryRetentionStore) PurgeExpiredHistory(_ context.Context, days int) (mysqlstore.RetentionCleanup, error) {
 	s.called <- days
 	return mysqlstore.RetentionCleanup{}, nil
+}
+
+func (s *fakeOfflineOutboxStore) CancelOfflineOutbox(_ context.Context, after time.Duration) (int64, error) {
+	s.called <- after
+	return 0, nil
 }
 
 func (s *fakeSetupStore) ApplyMigrations(context.Context) error {

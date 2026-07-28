@@ -8,7 +8,10 @@ import (
 	"wechat-observatory/internal/config"
 )
 
-var ErrModuleSessionActive = errors.New("module device session is active")
+var (
+	ErrModuleOffline       = errors.New("module device is offline")
+	ErrModuleSessionActive = errors.New("module device session is active")
+)
 
 type Persistence interface {
 	UpdateDeviceIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error
@@ -63,6 +66,12 @@ type Outbox interface {
 
 type ModuleActivityRecorder interface {
 	RecordModuleActivity(ctx context.Context, activity ModuleActivity) error
+}
+
+// ModuleLivenessChecker is the durable enqueue-admission boundary. The
+// persistent runtime clock, not an in-process WebSocket map, owns online state.
+type ModuleLivenessChecker interface {
+	ModuleOnline(ctx context.Context, device string, ownerWxID string, offlineAfter time.Duration) (bool, error)
 }
 
 type ModuleContactStore interface {
@@ -224,11 +233,17 @@ type ModuleStatusView struct {
 }
 
 func (v *ModuleStatusView) NormalizeRuntimeStatus() {
+	v.NormalizeRuntimeStatusAt(time.Time{}, 0)
+}
+
+func (v *ModuleStatusView) NormalizeRuntimeStatusAt(now time.Time, offlineAfter time.Duration) {
 	switch {
 	case !v.Enabled:
 		v.RuntimeStatus = "disabled"
 	case !v.Registered:
 		v.RuntimeStatus = "unregistered"
+	case v.runtimeActivityIsStale(now, offlineAfter):
+		v.RuntimeStatus = "offline"
 	case v.LeasedOutbox > 0:
 		v.RuntimeStatus = "sending"
 	case v.PendingOutbox > 0:
@@ -236,6 +251,20 @@ func (v *ModuleStatusView) NormalizeRuntimeStatus() {
 	default:
 		v.RuntimeStatus = "ready"
 	}
+}
+
+func (v ModuleStatusView) runtimeActivityIsStale(now time.Time, offlineAfter time.Duration) bool {
+	if now.IsZero() || offlineAfter <= 0 {
+		return false
+	}
+	latest := time.Time{}
+	for _, value := range []string{v.RuntimeUpdatedAt, v.LastRegisterAt, v.LastPollAt, v.LastAckAt} {
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err == nil && parsed.After(latest) {
+			latest = parsed
+		}
+	}
+	return !latest.IsZero() && latest.Before(now.Add(-offlineAfter))
 }
 
 type Option func(*Service)

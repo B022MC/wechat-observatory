@@ -426,6 +426,36 @@ func TestAdminSendTextRequiresCurrentOwnerWxID(t *testing.T) {
 	}
 }
 
+func TestSendTextRejectsOfflinePersistentModuleBeforeEnqueue(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	persistence := &fakeLivenessPersistence{fakePersistence: &fakePersistence{}, online: false}
+	service := newTestService("", WithPersistence(persistence), WithOutbox(outbox))
+
+	_, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", OwnerWxID: "wxid_self", WxIDs: []string{"wxid_friend"}, Text: "must not queue",
+	})
+	if !errors.Is(err, ErrModuleOffline) {
+		t.Fatalf("offline send error=%v", err)
+	}
+	if len(snapshotMemoryOutbox(outbox)) != 0 {
+		t.Fatalf("offline send created outbox rows: %+v", snapshotMemoryOutbox(outbox))
+	}
+	if persistence.device != "phone-a" || persistence.ownerWxID != "wxid_self" || persistence.offlineAfter != 5*time.Minute {
+		t.Fatalf("liveness request=%+v", persistence)
+	}
+
+	persistence.online = true
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", OwnerWxID: "wxid_self", WxIDs: []string{"wxid_friend"}, Text: "queue when online",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 1 || items[0].Status != "pending" || items[0].Text != "queue when online" {
+		t.Fatalf("online send outbox=%+v", items)
+	}
+}
+
 func TestRegisterModuleKeepsIdentityStableAcrossWeChatSwitch(t *testing.T) {
 	service := newTestService("http://127.0.0.1:1")
 
@@ -916,6 +946,47 @@ func TestModuleStatusEndpointFallsBackToRuntimeSnapshot(t *testing.T) {
 	}
 }
 
+func TestModuleStatusOfflinePrecedesOutboxCountsAtFiveMinutes(t *testing.T) {
+	now := time.Date(2026, time.July, 28, 3, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		status ModuleStatusView
+		want   string
+	}{
+		{name: "disabled wins", status: ModuleStatusView{Enabled: false, Registered: true, RuntimeUpdatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), PendingOutbox: 2}, want: "disabled"},
+		{name: "unregistered wins", status: ModuleStatusView{Enabled: true, Registered: false, RuntimeUpdatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), PendingOutbox: 2}, want: "unregistered"},
+		{name: "exact cutoff is online pending", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-5 * time.Minute).Format(time.RFC3339Nano), PendingOutbox: 2}, want: "pending"},
+		{name: "older than cutoff is offline", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-5*time.Minute - time.Nanosecond).Format(time.RFC3339Nano), PendingOutbox: 2, LeasedOutbox: 1}, want: "offline"},
+		{name: "fresh lease is sending", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), LeasedOutbox: 1}, want: "sending"},
+		{name: "fresh ready", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}, want: "ready"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.status.NormalizeRuntimeStatusAt(now, 5*time.Minute)
+			if test.status.RuntimeStatus != test.want {
+				t.Fatalf("runtime status=%q want=%q", test.status.RuntimeStatus, test.want)
+			}
+		})
+	}
+}
+
+func TestModuleStatusEndpointProjectsOfflineFromPersistentActivity(t *testing.T) {
+	reader := &fakeAdminReader{modules: []ModuleStatusView{{
+		Device: "phone-a", Enabled: true, Registered: true,
+		RuntimeUpdatedAt: time.Now().Add(-6 * time.Minute).UTC().Format(time.RFC3339Nano),
+		PendingOutbox:    2,
+	}}}
+	service := newTestService("", WithAdminReader(reader))
+	server := NewHTTPServer(service, "admin").Handler()
+	req := httptest.NewRequest(http.MethodGet, "/api/modules/status", nil)
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"runtime_status":"offline"`) {
+		t.Fatalf("offline module status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAdminReadEndpointsRequireAdminPassword(t *testing.T) {
 	service := newTestService("http://127.0.0.1:1")
 	server := NewHTTPServer(service, "admin").Handler()
@@ -1049,6 +1120,140 @@ func TestModuleOutboxWebSocketPushAndAck(t *testing.T) {
 	}
 }
 
+func TestModuleOutboxWebSocketProbesBeforeLeasing(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox))
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	conn := dialTestWebSocket(t, server.URL, "/module/outbox/ws?api_key=wechat-a-key&device=phone-a&wxid=wxid_self")
+	defer conn.close()
+	if ready := readTestWSMessage(t, conn); ready.Type != "ready" || !ready.OK {
+		t.Fatalf("unexpected ready message: %+v", ready)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "probe before lease",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	payload, op, err := conn.readFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != wsOpPing {
+		t.Fatalf("first delivery frame opcode = %d, want ping", op)
+	}
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 1 || items[0].Status != "pending" || items[0].AttemptCount != 0 {
+		t.Fatalf("outbox leased before liveness proof: %+v", items)
+	}
+	if !conn.writeControl(wsOpPong, payload) {
+		t.Fatal("failed to answer delivery probe")
+	}
+	outboxMsg := readTestWSMessageOfType(t, conn, "outbox")
+	if len(outboxMsg.Items) != 1 || outboxMsg.Items[0].Status != "leased" || outboxMsg.Items[0].AttemptCount != 1 {
+		t.Fatalf("unexpected outbox after liveness proof: %+v", outboxMsg)
+	}
+}
+
+func TestModuleOutboxWebSocketProbeTimeoutLeavesItemPending(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox))
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	conn := dialTestWebSocket(t, server.URL, "/module/outbox/ws?api_key=wechat-a-key&device=phone-a&wxid=wxid_self")
+	defer conn.close()
+	if ready := readTestWSMessage(t, conn); ready.Type != "ready" || !ready.OK {
+		t.Fatalf("unexpected ready message: %+v", ready)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "keep pending on stale socket",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, op, err := conn.readFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != wsOpPing {
+		t.Fatalf("first delivery frame opcode = %d, want ping", op)
+	}
+	started := time.Now()
+	if _, _, err := conn.readFrame(); err == nil {
+		t.Fatal("stale websocket remained open after probe timeout")
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("stale websocket close took %s", elapsed)
+	}
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 1 || items[0].Status != "pending" || items[0].AttemptCount != 0 {
+		t.Fatalf("probe timeout leased pending outbox: %+v", items)
+	}
+}
+
+func TestModuleOutboxWebSocketKeepsSecondItemPendingUntilAck(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox))
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	conn := dialTestWebSocket(t, server.URL, "/module/outbox/ws?api_key=wechat-a-key&device=phone-a&wxid=wxid_self")
+	defer conn.close()
+	if ready := readTestWSMessage(t, conn); ready.Type != "ready" || !ready.OK {
+		t.Fatalf("unexpected ready message: %+v", ready)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "first single-flight reply",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := readTestWSMessageOfType(t, conn, "outbox")
+	if len(first.Items) != 1 || first.Items[0].Text != "first single-flight reply" {
+		t.Fatalf("unexpected first outbox message: %+v", first)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "second single-flight reply",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 2 || items[0].Status != "leased" || items[1].Status != "pending" || items[1].AttemptCount != 0 {
+		t.Fatalf("second outbox item leased before first ACK: %+v", items)
+	}
+
+	ack := ModuleAckRequest{Items: []ModuleAckItem{{ID: first.Items[0].ID, Status: "sent", ChatRecordID: 9201}}}
+	if !conn.writeJSON(outboxWSMessage{Type: "ack", Ack: &ack}) {
+		t.Fatal("failed to write first ACK")
+	}
+	ackMsg := readTestWSMessageOfType(t, conn, "ack")
+	if !ackMsg.OK || len(ackMsg.Items) != 1 || ackMsg.Items[0].Status != "sent" {
+		t.Fatalf("unexpected first ACK response: %+v", ackMsg)
+	}
+	second := readTestWSMessageOfType(t, conn, "outbox")
+	if len(second.Items) != 1 || second.Items[0].Text != "second single-flight reply" || second.Items[0].AttemptCount != 1 {
+		t.Fatalf("unexpected second outbox message: %+v", second)
+	}
+}
+
+func snapshotMemoryOutbox(outbox *MemoryOutbox) []ModuleOutboxItem {
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	items := make([]ModuleOutboxItem, 0, len(outbox.items))
+	for _, item := range outbox.items {
+		items = append(items, item.ModuleOutboxItem)
+	}
+	return items
+}
+
 func TestModuleOutboxPollIsSerializedForWeChatSender(t *testing.T) {
 	service := newTestService("")
 	for _, text := range []string{"first queued reply", "second queued reply"} {
@@ -1154,10 +1359,26 @@ type fakeSessionPersistence struct {
 	leases map[string]ModuleSessionLease
 }
 
+type fakeLivenessPersistence struct {
+	*fakePersistence
+	online       bool
+	err          error
+	device       string
+	ownerWxID    string
+	offlineAfter time.Duration
+}
+
 type fakeDynamicConfigPersistence struct {
 	*fakePersistence
 	keys    map[string]config.APIKey
 	devices map[string]config.Device
+}
+
+func (p *fakeLivenessPersistence) ModuleOnline(_ context.Context, device string, ownerWxID string, offlineAfter time.Duration) (bool, error) {
+	p.device = device
+	p.ownerWxID = ownerWxID
+	p.offlineAfter = offlineAfter
+	return p.online, p.err
 }
 
 func (p *fakeDynamicConfigPersistence) LookupAPIKey(_ context.Context, code string) (config.APIKey, bool, error) {

@@ -429,17 +429,12 @@ func liveEventCursor(r *http.Request) (int64, bool, error) {
 }
 
 func (s *HTTPServer) moduleStatuses(w http.ResponseWriter, r *http.Request) {
-	reader := s.service.AdminReader()
-	if reader != nil {
-		statuses, err := reader.ListModuleStatuses(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "admin_read_failed", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"modules": statuses})
+	statuses, err := s.loadModuleStatuses(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "admin_read_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"modules": s.moduleStatusViews()})
+	writeJSON(w, http.StatusOK, map[string]any{"modules": statuses})
 }
 
 func (s *HTTPServer) moduleContacts(w http.ResponseWriter, r *http.Request) {

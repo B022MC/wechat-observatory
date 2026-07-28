@@ -309,6 +309,7 @@ function App() {
 
 function StatusBadge({ status }: { status?: string }) {
   if (status === "online") return <Badge variant="success"><CheckCircle2 className="mr-1 h-3 w-3" />在线</Badge>;
+  if (status === "offline") return <Badge variant="destructive"><WifiOff className="mr-1 h-3 w-3" />离线</Badge>;
   if (status === "disabled") return <Badge variant="secondary">停用</Badge>;
   return <Badge variant="warning"><WifiOff className="mr-1 h-3 w-3" />未注册</Badge>;
 }
@@ -323,6 +324,7 @@ function Detail({ label, value }: { label: string; value: string }) {
 
 function statusText(status?: string) {
   if (status === "online") return "在线";
+  if (status === "offline") return "离线";
   if (status === "disabled") return "已停用";
   if (status === "unregistered") return "未注册";
   return status || "-";

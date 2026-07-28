@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ func TestStoreImplementsBridgePersistence(t *testing.T) {
 	var _ bridge.ModuleConfigReader = (*Store)(nil)
 	var _ bridge.APIKeyCredentialReader = (*Store)(nil)
 	var _ bridge.ModuleSessionLeaser = (*Store)(nil)
+	var _ bridge.ModuleLivenessChecker = (*Store)(nil)
 }
 
 func TestMySQLConfigUsesBeijingTime(t *testing.T) {
@@ -76,7 +78,7 @@ func TestMigrationsCoverCoreTables(t *testing.T) {
 	}
 }
 
-func TestRetentionQueriesUseDatabaseClockAndOnlyDeleteSentOutbox(t *testing.T) {
+func TestRetentionQueriesUseDatabaseClockAndOnlyDeleteTerminalOutbox(t *testing.T) {
 	messages, outbox, err := retentionQueries(15)
 	if err != nil {
 		t.Fatal(err)
@@ -87,11 +89,67 @@ func TestRetentionQueriesUseDatabaseClockAndOnlyDeleteSentOutbox(t *testing.T) {
 			t.Fatalf("%s retention query does not use bounded database time: %s", name, normalized)
 		}
 	}
-	if !strings.Contains(outbox, "status = 'sent'") {
-		t.Fatalf("outbox cleanup must keep pending, leased, and failed rows: %s", outbox)
+	if !strings.Contains(outbox, "status IN ('sent', 'cancelled')") {
+		t.Fatalf("outbox cleanup must include only terminal sent/cancelled rows: %s", outbox)
+	}
+	for _, forbidden := range []string{"'pending'", "'leased'", "'failed'"} {
+		if strings.Contains(outbox, forbidden) {
+			t.Fatalf("outbox retention must keep %s rows: %s", forbidden, outbox)
+		}
 	}
 	if _, _, err := retentionQueries(0); err == nil {
 		t.Fatal("zero retention days should fail")
+	}
+}
+
+func TestModuleOnlineAndOfflineCancellationUseDatabaseClock(t *testing.T) {
+	online := strings.Join(strings.Fields(moduleOnlineStatement), " ")
+	for _, want := range []string{
+		"rt.updated_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)",
+		"d.wxid = rt.wxid",
+		"ak.code = rt.api_key",
+		"ak.enabled = TRUE",
+	} {
+		if !strings.Contains(online, want) {
+			t.Fatalf("online query missing %q: %s", want, online)
+		}
+	}
+
+	selection := strings.Join(strings.Fields(selectOfflineOutboxIDsStatement), " ")
+	for _, want := range []string{
+		"o.status = 'pending'",
+		"o.status = 'leased'",
+		"o.lease_until < CURRENT_TIMESTAMP(6)",
+		"rt.updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)",
+		"LIMIT ?",
+	} {
+		if !strings.Contains(selection, want) {
+			t.Fatalf("offline selection missing %q: %s", want, selection)
+		}
+	}
+
+	cancel := strings.Join(strings.Fields(fmt.Sprintf(cancelOfflineOutboxStatement, "?,?")), " ")
+	for _, want := range []string{
+		"o.status = 'cancelled'",
+		"o.lease_until = NULL",
+		"o.lease_until < CURRENT_TIMESTAMP(6)",
+		"rt.updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)",
+	} {
+		if !strings.Contains(cancel, want) {
+			t.Fatalf("offline cancellation missing %q: %s", want, cancel)
+		}
+	}
+	for _, forbidden := range []string{"o.status = 'sent'", "o.status = 'failed'"} {
+		if strings.Contains(cancel, forbidden) {
+			t.Fatalf("offline cancellation must preserve %s rows: %s", forbidden, cancel)
+		}
+	}
+}
+
+func TestAckUpdatesOnlyLeasedOutboxRows(t *testing.T) {
+	query := strings.Join(strings.Fields(ackOutboxItemStatement), " ")
+	if !strings.Contains(query, "AND status = 'leased'") {
+		t.Fatalf("ACK must transition only currently leased rows: %s", query)
 	}
 }
 

@@ -413,8 +413,8 @@ func Migrations() []string {
 }
 
 type RetentionCleanup struct {
-	MessageEvents int64
-	SentOutbox    int64
+	MessageEvents  int64
+	TerminalOutbox int64
 }
 
 func (s *Store) PurgeExpiredHistory(ctx context.Context, retentionDays int) (RetentionCleanup, error) {
@@ -450,7 +450,7 @@ func (s *Store) PurgeExpiredHistory(ctx context.Context, retentionDays int) (Ret
 	if err != nil {
 		return RetentionCleanup{MessageEvents: messages}, err
 	}
-	return RetentionCleanup{MessageEvents: messages, SentOutbox: outbox}, nil
+	return RetentionCleanup{MessageEvents: messages, TerminalOutbox: outbox}, nil
 }
 
 func retentionQueries(retentionDays int) (string, string, error) {
@@ -461,7 +461,7 @@ func retentionQueries(retentionDays int) (string, string, error) {
 		WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL %d DAY)
 		ORDER BY created_at LIMIT ?`, retentionDays)
 	outboxQuery := fmt.Sprintf(`DELETE FROM bridge_module_outbox
-		WHERE status = 'sent'
+		WHERE status IN ('sent', 'cancelled')
 			AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL %d DAY)
 		ORDER BY updated_at LIMIT ?`, retentionDays)
 	return messageQuery, outboxQuery, nil
@@ -856,6 +856,12 @@ func (s *Store) RecordModuleContacts(ctx context.Context, snapshot bridge.Module
 	return tx.Commit()
 }
 
+const (
+	offlineOutboxBatchSize = 1000
+	offlineOutboxLockName  = "wechat_observatory_offline_outbox"
+	offlineOutboxReason    = "device offline"
+)
+
 func (s *Store) EnqueueReply(ctx context.Context, action bridge.ReplyAction) (bridge.ModuleOutboxItem, error) {
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO bridge_module_outbox (device, owner_wxid, wxid, text, chat_record_id, status)
@@ -875,6 +881,123 @@ func (s *Store) EnqueueReply(ctx context.Context, action bridge.ReplyAction) (br
 	}
 	return s.findOutboxItem(ctx, id)
 }
+
+const moduleOnlineStatement = `
+	SELECT EXISTS (
+		SELECT 1
+		FROM bridge_module_runtime rt
+		JOIN bridge_devices d ON d.name = rt.device AND d.wxid = rt.wxid
+		JOIN bridge_api_keys ak ON ak.device = rt.device AND ak.code = rt.api_key AND ak.enabled = TRUE
+		WHERE rt.device = ? AND rt.wxid = ?
+			AND rt.updated_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)
+	)`
+
+func (s *Store) ModuleOnline(ctx context.Context, device string, ownerWxID string, offlineAfter time.Duration) (bool, error) {
+	device = strings.TrimSpace(device)
+	ownerWxID = strings.TrimSpace(ownerWxID)
+	if device == "" || ownerWxID == "" || offlineAfter <= 0 {
+		return false, nil
+	}
+	var online bool
+	err := s.db.QueryRowContext(ctx, moduleOnlineStatement, device, ownerWxID, leaseMicroseconds(offlineAfter)).Scan(&online)
+	return online, err
+}
+
+func (s *Store) CancelOfflineOutbox(ctx context.Context, offlineAfter time.Duration) (int64, error) {
+	if offlineAfter <= 0 {
+		return 0, errors.New("module offline duration must be positive")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	var acquired int
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 0)`, offlineOutboxLockName).Scan(&acquired); err != nil {
+		return 0, err
+	}
+	if acquired != 1 {
+		return 0, nil
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var released sql.NullInt64
+		_ = conn.QueryRowContext(releaseCtx, `SELECT RELEASE_LOCK(?)`, offlineOutboxLockName).Scan(&released)
+	}()
+
+	offlineMicros := leaseMicroseconds(offlineAfter)
+	total := int64(0)
+	for {
+		rows, err := conn.QueryContext(ctx, selectOfflineOutboxIDsStatement, offlineMicros, offlineOutboxBatchSize)
+		if err != nil {
+			return total, err
+		}
+		ids := make([]int64, 0, offlineOutboxBatchSize)
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return total, err
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Close(); err != nil {
+			return total, err
+		}
+		if err := rows.Err(); err != nil {
+			return total, err
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		query := fmt.Sprintf(cancelOfflineOutboxStatement, placeholders)
+		args := make([]any, 0, len(ids)+2)
+		args = append(args, offlineOutboxReason)
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		args = append(args, offlineMicros)
+		result, err := conn.ExecContext(ctx, query, args...)
+		if err != nil {
+			return total, err
+		}
+		cancelled, err := result.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += cancelled
+		if len(ids) < offlineOutboxBatchSize {
+			return total, nil
+		}
+	}
+}
+
+const selectOfflineOutboxIDsStatement = `
+	SELECT o.id
+	FROM bridge_module_outbox o
+	LEFT JOIN bridge_module_runtime rt ON rt.device = o.device
+	WHERE (
+			o.status = 'pending'
+			OR (o.status = 'leased' AND (o.lease_until IS NULL OR o.lease_until < CURRENT_TIMESTAMP(6)))
+		)
+		AND (rt.updated_at IS NULL OR rt.updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND))
+	ORDER BY o.id
+	LIMIT ?`
+
+const cancelOfflineOutboxStatement = `
+	UPDATE bridge_module_outbox o
+	LEFT JOIN bridge_module_runtime rt ON rt.device = o.device
+	SET o.status = 'cancelled', o.last_error = ?, o.lease_until = NULL
+	WHERE o.id IN (%s)
+		AND (
+			o.status = 'pending'
+			OR (o.status = 'leased' AND (o.lease_until IS NULL OR o.lease_until < CURRENT_TIMESTAMP(6)))
+		)
+		AND (rt.updated_at IS NULL OR rt.updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND))`
 
 func (s *Store) PollReplyActions(ctx context.Context, req bridge.ModulePollRequest) ([]bridge.ModuleOutboxItem, error) {
 	limit := normalizeLimit(req.Limit)
@@ -939,12 +1062,16 @@ const leaseOutboxItemStatement = `
 		lease_until = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 60 SECOND)
 	WHERE id = ?`
 
+const ackOutboxItemStatement = `
+	UPDATE bridge_module_outbox
+	SET status = ?, last_error = ?, chat_record_id = COALESCE(?, chat_record_id), lease_until = NULL
+	WHERE id = ? AND device = ? AND (? = '' OR owner_wxid = ?)
+		AND status = 'leased'`
+
 func (s *Store) AckReplyActions(ctx context.Context, req bridge.ModuleAckRequest) ([]bridge.ModuleOutboxItem, error) {
+	ids := make([]int64, 0, len(req.Items))
 	for _, item := range req.Items {
-		_, err := s.db.ExecContext(ctx, `
-			UPDATE bridge_module_outbox
-			SET status = ?, last_error = ?, chat_record_id = COALESCE(?, chat_record_id), lease_until = NULL
-			WHERE id = ? AND device = ? AND (? = '' OR owner_wxid = ?)`,
+		result, err := s.db.ExecContext(ctx, ackOutboxItemStatement,
 			item.Status,
 			nullString(item.Error),
 			nullInt64(item.ChatRecordID),
@@ -956,10 +1083,11 @@ func (s *Store) AckReplyActions(ctx context.Context, req bridge.ModuleAckRequest
 		if err != nil {
 			return nil, err
 		}
-	}
-	ids := make([]int64, 0, len(req.Items))
-	for _, item := range req.Items {
-		if item.ID > 0 {
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if updated == 1 && item.ID > 0 {
 			ids = append(ids, item.ID)
 		}
 	}

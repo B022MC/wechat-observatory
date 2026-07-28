@@ -14,14 +14,15 @@ import (
 )
 
 type Service struct {
-	cfg         Config
-	hub         *Hub
-	persistence Persistence
-	outbox      Outbox
-	adminReader AdminReader
-	instanceID  string
-	sessionTTL  time.Duration
-	pollEvery   time.Duration
+	cfg          Config
+	hub          *Hub
+	persistence  Persistence
+	outbox       Outbox
+	adminReader  AdminReader
+	instanceID   string
+	sessionTTL   time.Duration
+	pollEvery    time.Duration
+	offlineAfter time.Duration
 
 	mu               sync.RWMutex
 	nextChatRecordID int64
@@ -39,6 +40,7 @@ type Config struct {
 	InstanceID    string
 	SessionTTL    time.Duration
 	PollInterval  time.Duration
+	OfflineAfter  time.Duration
 }
 
 func NewService(cfg Config, opts ...Option) *Service {
@@ -51,12 +53,16 @@ func NewService(cfg Config, opts ...Option) *Service {
 		instanceID:       firstNonEmpty(cfg.InstanceID, "local"),
 		sessionTTL:       cfg.SessionTTL,
 		pollEvery:        cfg.PollInterval,
+		offlineAfter:     cfg.OfflineAfter,
 	}
 	if service.sessionTTL <= 0 {
 		service.sessionTTL = 15 * time.Second
 	}
 	if service.pollEvery <= 0 {
 		service.pollEvery = time.Second
+	}
+	if service.offlineAfter <= 0 {
+		service.offlineAfter = 5 * time.Minute
 	}
 	for _, opt := range opts {
 		opt(service)
@@ -79,6 +85,18 @@ func (s *Service) DefaultDevice() string {
 
 func (s *Service) OutboxPollInterval() time.Duration {
 	return s.pollEvery
+}
+
+func (s *Service) ModuleOfflineAfter() time.Duration {
+	return s.offlineAfter
+}
+
+func (s *Service) NormalizeModuleStatuses(statuses []ModuleStatusView) []ModuleStatusView {
+	now := time.Now()
+	for index := range statuses {
+		statuses[index].NormalizeRuntimeStatusAt(now, s.offlineAfter)
+	}
+	return statuses
 }
 
 func (s *Service) Device(name string) (config.Device, bool) {
@@ -405,6 +423,15 @@ func (s *Service) SendText(ctx context.Context, req SendTextRequest) (int64, err
 	ownerWxID := s.deviceWxID(ctx, req.Device)
 	if req.OwnerWxID != "" && req.OwnerWxID != ownerWxID {
 		return 0, fmt.Errorf("send owner wxid %q is not current device wxid", req.OwnerWxID)
+	}
+	if checker, ok := s.persistence.(ModuleLivenessChecker); ok {
+		online, err := checker.ModuleOnline(ctx, req.Device, ownerWxID, s.offlineAfter)
+		if err != nil {
+			return 0, err
+		}
+		if !online {
+			return 0, ErrModuleOffline
+		}
 	}
 	firstID := int64(0)
 	for _, wxid := range req.WxIDs {
