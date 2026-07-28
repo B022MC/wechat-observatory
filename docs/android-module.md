@@ -28,7 +28,7 @@ cd android-module
 
 打开手机上的 **WeChat Observatory**，填写：
 
-- 服务端地址：例如 `http://192.168.1.10:8088`
+- 服务端地址：推荐使用无端口的 HTTPS 地址，例如 `https://47.108.171.42/observatory`
 - API Key：从 Web 管理台生成
 - 轮询间隔：默认 `1000`
 - 通讯录同步间隔：默认 `600000`
@@ -44,7 +44,7 @@ cd android-module
 | Key | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `1` | 是否启用模块逻辑 |
-| `bridge_url` | `http://192.168.1.10:8088` | 服务端地址 |
+| `bridge_url` | `https://47.108.171.42/observatory` | 服务端地址；HTTPS 同时用于 API 和 WSS |
 | `api_key` | 空 | Web 管理台生成的 API Key |
 | `poll_interval_ms` | `1000` | HTTP 轮询出站消息间隔 |
 | `poll_limit` | `1` | 每次最多拉取条数，服务端当前只租约一条 |

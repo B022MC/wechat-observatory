@@ -39,7 +39,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+
 import cc.wechat.observatory.config.BridgeConfig;
+import cc.wechat.observatory.gateway.GatewayEndpoint;
 import cc.wechat.observatory.gateway.WebSocketFrame;
 import cc.wechat.observatory.model.MessagePayload;
 import cc.wechat.observatory.util.BridgeLogger;
@@ -1884,7 +1890,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static boolean runOutboxWebSocket(BridgeConfig config, ClassLoader classLoader) {
-        if (!supportsPlainHttp(config)) {
+        if (!supportsWebSocket(config)) {
             return false;
         }
         try {
@@ -1896,23 +1902,18 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void websocketLoop(BridgeConfig config, ClassLoader classLoader) throws Exception {
-        URL base = new URL(trimRight(config.baseUrl, "/"));
-        int port = base.getPort() > 0 ? base.getPort() : 80;
-        String host = base.getHost();
-        String hostHeader = base.getPort() > 0 ? host + ":" + port : host;
-        String path = trimRight(base.getPath(), "/") + "/module/outbox/ws"
+        GatewayEndpoint endpoint = GatewayEndpoint.parse(config.baseUrl);
+        String host = endpoint.host();
+        String hostHeader = endpoint.hostHeader();
+        String path = endpoint.requestPath("/module/outbox/ws")
                 + "?api_key=" + urlEncode(config.apiKey)
                 + "&device=" + urlEncode(config.device)
                 + "&wxid=" + urlEncode(config.selfWxid);
-        if (path.startsWith("//")) {
-            path = path.substring(1);
-        }
         byte[] nonce = new byte[16];
         new SecureRandom().nextBytes(nonce);
         String key = Base64.encodeToString(nonce, Base64.NO_WRAP);
 
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 5000);
+        try (Socket socket = openGatewaySocket(host, endpoint.port(), endpoint.isTls())) {
             socket.setSoTimeout(30000);
             InputStream input = socket.getInputStream();
             OutputStream output = socket.getOutputStream();
@@ -2137,8 +2138,39 @@ public final class HookEntry implements IXposedHookLoadPackage {
         output.flush();
     }
 
-    private static boolean supportsPlainHttp(BridgeConfig config) {
-        return config.baseUrl != null && config.baseUrl.trim().toLowerCase(Locale.US).startsWith("http://");
+    private static boolean supportsWebSocket(BridgeConfig config) {
+        try {
+            GatewayEndpoint.parse(config.baseUrl);
+            return true;
+        } catch (Throwable t) {
+            logWebSocketFailure("outbox websocket URL unavailable: " + shortError(t));
+            return false;
+        }
+    }
+
+    private static Socket openGatewaySocket(String host, int port, boolean tls) throws Exception {
+        Socket plain = new Socket();
+        try {
+            plain.connect(new InetSocketAddress(host, port), 5000);
+            plain.setSoTimeout(5000);
+            if (!tls) {
+                return plain;
+            }
+
+            SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+            SSLSocket secure = (SSLSocket) factory.createSocket(plain, host, port, true);
+            secure.startHandshake();
+            if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, secure.getSession())) {
+                throw new SSLHandshakeException("TLS hostname verification failed for " + host);
+            }
+            return secure;
+        } catch (Throwable t) {
+            try {
+                plain.close();
+            } catch (IOException ignored) {
+            }
+            throw t;
+        }
     }
 
     private static String urlEncode(String value) {
@@ -2700,7 +2732,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String postJson(BridgeConfig config, String path, String bodyJson) throws Exception {
-        if (config.baseUrl != null && config.baseUrl.trim().toLowerCase(Locale.US).startsWith("http://")) {
+        GatewayEndpoint endpoint = GatewayEndpoint.parse(config.baseUrl);
+        if (!endpoint.isTls()) {
             return postJsonSocket(config, path, bodyJson);
         }
         try {
@@ -2713,14 +2746,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String postJsonSocket(BridgeConfig config, String path, String bodyJson) throws Exception {
-        URL url = new URL(trimRight(config.baseUrl, "/") + path);
+        GatewayEndpoint endpoint = GatewayEndpoint.parse(config.baseUrl);
+        URL url = endpoint.resolve(path);
         String requestPath = url.getFile();
         if (isBlank(requestPath)) {
             requestPath = "/";
         }
-        int port = url.getPort() > 0 ? url.getPort() : 80;
-        String host = url.getHost();
-        String hostHeader = url.getPort() > 0 ? host + ":" + port : host;
+        int port = endpoint.port();
+        String host = endpoint.host();
+        String hostHeader = endpoint.hostHeader();
         byte[] body = bodyJson.getBytes(StandardCharsets.UTF_8);
         log("postJsonSocket path=" + path + " host=" + hostHeader + " bodyBytes=" + body.length);
 
@@ -2814,7 +2848,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String postJsonOnce(BridgeConfig config, String path, String bodyJson) throws Exception {
-        URL url = new URL(trimRight(config.baseUrl, "/") + path);
+        URL url = GatewayEndpoint.parse(config.baseUrl).resolve(path);
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
         connection.setConnectTimeout(5000);
         connection.setReadTimeout(5000);

@@ -19,7 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 public final class SettingsActivity extends Activity {
-    private static final String DEFAULT_BRIDGE_URL = "http://192.168.1.10:8088";
+    private static final String DEFAULT_BRIDGE_URL = "https://47.108.171.42/observatory";
     private static final String DEFAULT_POLL_INTERVAL_MS = "1000";
     private static final String DEFAULT_POLL_LIMIT = "1";
     private static final String DEFAULT_CONTACT_SYNC_INTERVAL_MS = "600000";

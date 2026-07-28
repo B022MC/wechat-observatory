@@ -72,7 +72,7 @@ Example:
 
 ```properties
 enabled=1
-bridge_url=http://192.168.1.10:8088
+bridge_url=https://47.108.171.42/observatory
 api_key=wg_dev_key
 poll_interval_ms=1000
 poll_limit=1
@@ -84,6 +84,11 @@ media_upload_limit_bytes=5242880
 ```
 
 Restart WeChat after changing config.
+
+The recommended public URL is HTTPS without a port, for example
+`https://47.108.171.42/observatory`. The module derives HTTPS API requests and
+the WSS outbox stream from this same URL, validates the system-trusted
+certificate, and keeps HTTP polling as the fallback when WSS is unavailable.
 
 `poll_interval_ms` controls how often the module checks the gateway outbox.
 The worker currently sleeps at least 1000ms between polls, so values below
