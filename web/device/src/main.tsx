@@ -62,6 +62,15 @@ function App() {
   const enabledKeyCount = apiKeys.filter((item) => item.enabled !== false).length;
 
   React.useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const documentPath = window.location.pathname.replace(/\/+$/, "");
+    if (!documentPath.endsWith("/device")) return;
+    const mountPath = documentPath.slice(0, -"/device".length);
+    const workerPath = `${mountPath}/device-sw.js` || "/device-sw.js";
+    void navigator.serviceWorker.register(workerPath, { scope: documentPath }).catch(() => undefined);
+  }, []);
+
+  React.useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);

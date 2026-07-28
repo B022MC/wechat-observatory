@@ -2,9 +2,13 @@ package bridge
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"image/png"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -23,7 +27,10 @@ func deviceAdminRequest(method, path string, body []byte) *http.Request {
 
 func TestDeviceAdminIsDisabledWithoutExplicitPassword(t *testing.T) {
 	handler := NewHTTPServer(newTestService(""), "full-admin").Handler()
-	for _, path := range []string{"/device", "/device/", "/api/device-admin/modules"} {
+	for _, path := range []string{
+		"/device", "/device/", "/device-manifest.webmanifest", "/device-sw.js",
+		"/device-offline.html", "/device-icons/icon-192.png", "/api/device-admin/modules",
+	} {
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 		if recorder.Code != http.StatusNotFound {
@@ -37,7 +44,9 @@ func TestDeviceAdminStaticPageUsesExactCanonicalPath(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/device", nil))
 	body := recorder.Body.String()
-	if recorder.Code != http.StatusOK || !strings.Contains(body, "<title>设备管理</title>") || !strings.Contains(body, `./device-assets/`) {
+	if recorder.Code != http.StatusOK || !strings.Contains(body, "<title>设备管理</title>") ||
+		!strings.Contains(body, `./device-assets/`) || !strings.Contains(body, `./device-manifest.webmanifest`) ||
+		!strings.Contains(body, `apple-touch-icon`) {
 		t.Fatalf("device page = %d body=%s", recorder.Code, recorder.Body.String())
 	}
 	assetStart := strings.Index(body, `src="./device-assets/`)
@@ -60,6 +69,125 @@ func TestDeviceAdminStaticPageUsesExactCanonicalPath(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/device/", nil))
 	if recorder.Code != http.StatusPermanentRedirect || recorder.Header().Get("Location") != "../device" {
 		t.Fatalf("device slash redirect = %d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+}
+
+func TestDeviceAdminPWAResourcesAreMountSafeAndStaticOnly(t *testing.T) {
+	handler := newDeviceAdminTestHandler(newTestService(""))
+
+	manifestRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(manifestRecorder, httptest.NewRequest(http.MethodGet, "/device-manifest.webmanifest", nil))
+	if manifestRecorder.Code != http.StatusOK || !strings.HasPrefix(manifestRecorder.Header().Get("Content-Type"), "application/manifest+json") {
+		t.Fatalf("manifest = %d type=%q body=%s", manifestRecorder.Code, manifestRecorder.Header().Get("Content-Type"), manifestRecorder.Body.String())
+	}
+	var manifest struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		StartURL string `json:"start_url"`
+		Scope    string `json:"scope"`
+		Icons    []struct {
+			Src   string `json:"src"`
+			Sizes string `json:"sizes"`
+		} `json:"icons"`
+	}
+	if err := json.Unmarshal(manifestRecorder.Body.Bytes(), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Name != "设备管理" || manifest.ID != "./device" || manifest.StartURL != "./device" || manifest.Scope != "./device" {
+		t.Fatalf("unexpected mount-safe manifest: %+v", manifest)
+	}
+	if len(manifest.Icons) != 2 {
+		t.Fatalf("manifest icons = %+v", manifest.Icons)
+	}
+
+	for _, icon := range manifest.Icons {
+		iconPath := "/" + strings.TrimPrefix(icon.Src, "./")
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, iconPath, nil))
+		if recorder.Code != http.StatusOK || recorder.Header().Get("Content-Type") != "image/png" {
+			t.Fatalf("icon %s = %d type=%q", iconPath, recorder.Code, recorder.Header().Get("Content-Type"))
+		}
+		image, err := png.Decode(bytes.NewReader(recorder.Body.Bytes()))
+		if err != nil {
+			t.Fatalf("decode %s: %v", iconPath, err)
+		}
+		bounds := image.Bounds()
+		if icon.Sizes != fmt.Sprintf("%dx%d", bounds.Dx(), bounds.Dy()) {
+			t.Fatalf("icon %s manifest=%s actual=%dx%d", iconPath, icon.Sizes, bounds.Dx(), bounds.Dy())
+		}
+	}
+
+	workerRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(workerRecorder, httptest.NewRequest(http.MethodGet, "/device-sw.js", nil))
+	worker := workerRecorder.Body.String()
+	if workerRecorder.Code != http.StatusOK || !strings.HasPrefix(workerRecorder.Header().Get("Content-Type"), "text/javascript") ||
+		workerRecorder.Header().Get("Cache-Control") != "no-cache" {
+		t.Fatalf("worker = %d headers=%v", workerRecorder.Code, workerRecorder.Header())
+	}
+	for _, want := range []string{"observatory-device-static-", "key.startsWith(CACHE_PREFIX)", "url.pathname.startsWith(apiPrefix)"} {
+		if !strings.Contains(worker, want) {
+			t.Fatalf("worker missing %q", want)
+		}
+	}
+	if strings.Contains(worker, "keys.filter((key) => key !== CACHE)") {
+		t.Fatal("worker deletes caches owned by other applications")
+	}
+
+	offlineRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(offlineRecorder, httptest.NewRequest(http.MethodGet, "/device-offline.html", nil))
+	if offlineRecorder.Code != http.StatusOK || !strings.Contains(offlineRecorder.Body.String(), "当前离线") {
+		t.Fatalf("offline = %d body=%s", offlineRecorder.Code, offlineRecorder.Body.String())
+	}
+	for _, forbidden := range []string{"X-Bridge-Device-Password", "wgc_device_admin_password", "/api/device-admin/"} {
+		if strings.Contains(offlineRecorder.Body.String(), forbidden) {
+			t.Fatalf("offline shell contains sensitive/runtime value %q", forbidden)
+		}
+	}
+}
+
+func TestDeviceAdminPWAResolvesBehindObservatoryMount(t *testing.T) {
+	handler := http.StripPrefix("/observatory", newDeviceAdminTestHandler(newTestService("")))
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	documentURL, err := url.Parse(server.URL + "/observatory/device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{
+		"./device-manifest.webmanifest", "./device-sw.js", "./device-offline.html",
+		"./device-icons/icon-180.png", "./device-icons/icon-192.png", "./device-icons/icon-512.png",
+	} {
+		resolved := documentURL.ResolveReference(&url.URL{Path: relative})
+		response, err := server.Client().Get(resolved.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("mounted resource %s resolved to %s: %d", relative, resolved.Path, response.StatusCode)
+		}
+	}
+
+	manifestURL := documentURL.ResolveReference(&url.URL{Path: "./device-manifest.webmanifest"})
+	response, err := server.Client().Get(manifestURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var manifest struct {
+		ID       string `json:"id"`
+		StartURL string `json:"start_url"`
+		Scope    string `json:"scope"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	for field, relative := range map[string]string{"id": manifest.ID, "start_url": manifest.StartURL, "scope": manifest.Scope} {
+		resolved := manifestURL.ResolveReference(&url.URL{Path: relative})
+		if resolved.Path != "/observatory/device" {
+			t.Fatalf("mounted manifest %s=%q resolved to %q", field, relative, resolved.Path)
+		}
 	}
 }
 

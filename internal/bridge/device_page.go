@@ -3,7 +3,9 @@ package bridge
 import (
 	"embed"
 	"io/fs"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strings"
 )
 
@@ -53,6 +55,48 @@ func (s *HTTPServer) deviceAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.FileServer(http.FS(staticFiles)).ServeHTTP(w, r)
+}
+
+func (s *HTTPServer) devicePWAAsset(w http.ResponseWriter, r *http.Request) {
+	if s.deviceAdminPass == "" {
+		http.NotFound(w, r)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	allowed := map[string]string{
+		"device-manifest.webmanifest": "application/manifest+json; charset=utf-8",
+		"device-sw.js":                "text/javascript; charset=utf-8",
+		"device-offline.html":         "text/html; charset=utf-8",
+		"device-icons/icon-180.png":   "image/png",
+		"device-icons/icon-192.png":   "image/png",
+		"device-icons/icon-512.png":   "image/png",
+	}
+	contentType, ok := allowed[path]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	staticFiles, err := deviceStaticFiles()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "device_assets_failed", err.Error())
+		return
+	}
+	content, err := fs.ReadFile(staticFiles, path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if contentType == "" {
+		contentType = mime.TypeByExtension(filepath.Ext(path))
+	}
+	w.Header().Set("Content-Type", contentType)
+	if path == "device-sw.js" || path == "device-manifest.webmanifest" || path == "device-offline.html" {
+		w.Header().Set("Cache-Control", "no-cache")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
 }
 
 func deviceStaticFiles() (fs.FS, error) {
