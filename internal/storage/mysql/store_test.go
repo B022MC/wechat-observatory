@@ -3,6 +3,7 @@ package mysql
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"wechat-observatory/internal/bridge"
 )
@@ -13,7 +14,28 @@ func TestStoreImplementsBridgePersistence(t *testing.T) {
 	var _ bridge.AdminReader = (*Store)(nil)
 	var _ bridge.EventTailReader = (*Store)(nil)
 	var _ bridge.ModuleConfigReader = (*Store)(nil)
+	var _ bridge.APIKeyCredentialReader = (*Store)(nil)
 	var _ bridge.ModuleSessionLeaser = (*Store)(nil)
+}
+
+func TestMySQLConfigUsesBeijingTime(t *testing.T) {
+	cfg, err := parseMySQLConfig("wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true&loc=UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ParseTime {
+		t.Fatal("MySQL time parsing must stay enabled")
+	}
+	if cfg.Loc.String() != "Asia/Shanghai" {
+		t.Fatalf("MySQL location = %q, want Asia/Shanghai", cfg.Loc)
+	}
+	_, offset := time.Now().In(cfg.Loc).Zone()
+	if offset != 8*60*60 {
+		t.Fatalf("MySQL location offset = %d, want +08:00", offset)
+	}
+	if cfg.Params["time_zone"] != "'+08:00'" {
+		t.Fatalf("MySQL session time_zone = %q, want '+08:00'", cfg.Params["time_zone"])
+	}
 }
 
 func TestMigrationsCoverCoreTables(t *testing.T) {
@@ -32,6 +54,15 @@ func TestMigrationsCoverCoreTables(t *testing.T) {
 	}
 	if !strings.Contains(joined, "enabled BOOLEAN NOT NULL DEFAULT TRUE") {
 		t.Fatalf("bridge_api_keys migration should include enabled state: %s", joined)
+	}
+	for _, want := range []string{
+		"credential_id VARCHAR(64) NOT NULL",
+		"auth_version BIGINT NOT NULL DEFAULT 1",
+		"uniq_bridge_api_keys_credential_id",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("bridge_api_keys migration should include %q: %s", want, joined)
+		}
 	}
 	for _, want := range []string{"event_key VARCHAR(191) NOT NULL", "bridge_device_session_lease"} {
 		if !strings.Contains(joined, want) {

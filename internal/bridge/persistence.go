@@ -33,6 +33,12 @@ type ModuleConfigReader interface {
 	LookupDevice(ctx context.Context, name string) (config.Device, bool, error)
 }
 
+// APIKeyCredentialReader resolves the opaque reference returned to trusted
+// service clients after a plaintext API Key login check.
+type APIKeyCredentialReader interface {
+	LookupAPIKeyByCredentialRef(ctx context.Context, credentialRef string) (config.APIKey, bool, error)
+}
+
 type ModuleSessionLease struct {
 	Device    string
 	OwnerWxID string
@@ -87,6 +93,18 @@ type APIKeyUpsertRequest struct {
 	APIKey   string `json:"api_key,omitempty"`
 	Device   string `json:"device,omitempty"`
 	Nickname string `json:"nickname,omitempty"`
+}
+
+type APIKeyIntrospectionRequest struct {
+	APIKey        string `json:"api_key,omitempty"`
+	CredentialRef string `json:"credential_ref,omitempty"`
+}
+
+type APIKeyIntrospection struct {
+	Active        bool   `json:"active"`
+	CredentialRef string `json:"credential_ref,omitempty"`
+	AuthVersion   int64  `json:"auth_version,omitempty"`
+	Device        string `json:"device,omitempty"`
 }
 
 type DeviceUpsertRequest struct {

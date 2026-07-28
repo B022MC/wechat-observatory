@@ -64,8 +64,12 @@ func main() {
 	}, opts...)
 
 	httpServer := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           bridge.NewHTTPServer(service, cfg.AdminPassword).Handler(),
+		Addr: cfg.HTTPAddr,
+		Handler: bridge.NewHTTPServer(
+			service,
+			cfg.AdminPassword,
+			bridge.WithDeviceAdminPassword(cfg.DeviceAdminPassword),
+		).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

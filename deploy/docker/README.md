@@ -11,10 +11,12 @@ process can own the configured game account.
    A deliberately blank installation may set `BRIDGE_API_KEYS=` and create
    its first module API Key from the Observatory admin page after startup.
    `BRIDGE_DEVICES` must still contain one bootstrap device.
+   Set `BRIDGE_DEVICE_ADMIN_PASSWORD` to a secret distinct from
+   `BRIDGE_ADMIN_PASSWORD`; it grants only the message-free `/device` surface.
 2. Keep `PD_GATEWAY_GAME_RUNTIME_ENABLED=false` until the previous Plaza
    account owner has been stopped and the tea-house binding is verified.
 3. Run `docker compose up -d --build` from this directory.
-4. Check `http://host:8088/healthz` and `http://host:19090/healthz`.
+4. Check `http://127.0.0.1:8088/healthz` and `http://127.0.0.1:19090/healthz`.
 
 ## HTTPS And Boss PWA
 
@@ -39,13 +41,14 @@ docker compose -p pd-wechat-https -f docker-compose.https.yml up -d
 
 Caddy runs as a separate Compose project while joining the base stack through
 `PD_WECHAT_RUNTIME_NETWORK`. Keep its default unless the base stack uses a
-different explicit network name.
+different explicit network name. The public phone module URL is
+`https://<host>/observatory`; Caddy strips `/observatory` and forwards the
+module API and WebSocket upgrade to `observatory:8088`.
 
 Caddy persists ACME certificates in named volumes and proxies the complete
 Gateway origin, including `/admin/`, `/boss/`, `/reports/`, and both API
-namespaces. The Gateway host port binds to `127.0.0.1`; do not reopen 19090 to
-the Internet after HTTPS is verified. Observatory remains separately exposed
-on 8088 for the Android transport module.
+namespaces. The Gateway and Observatory host ports bind to `127.0.0.1`; do not
+reopen 19090 or 8088 to the Internet after HTTPS is verified.
 
 MySQL stores two isolated application databases. The Compose MySQL bootstrap
 uses root only once to create the users; Gateway and Observatory use their own

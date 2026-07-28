@@ -1,5 +1,6 @@
 ﻿import React from "react";
 import { createRoot } from "react-dom/client";
+import { formatBeijingClock, formatBeijingDateTime, formatBeijingTimeAgo } from "@/time";
 import {
   Activity,
   CheckCircle2,
@@ -311,7 +312,7 @@ function App() {
       if (device && wxid) {
         await refreshMessages(device, wxid, ownerWxid);
       }
-      setNotice(`已刷新 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`);
+      setNotice(`已刷新 ${formatBeijingClock()}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "请求失败");
     } finally {
@@ -400,7 +401,7 @@ function App() {
         void refreshRecentMessages(selectedDevice, selectedOwnerWxid).catch(() => undefined);
         if (selectedWxid && liveEventTouchesChat(payload, selectedWxid)) {
           void refreshMessages(selectedDevice, selectedWxid, selectedOwnerWxid).catch(() => undefined);
-          setNotice(`实时消息 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`);
+          setNotice(`实时消息 ${formatBeijingClock()}`);
         }
       } catch {
         // Keep the stream open if one event cannot be parsed.
@@ -661,9 +662,9 @@ function App() {
                 实时流和轮询刷新
               </label>
               <div className="grid grid-cols-3 gap-2">
-                <SignalPill label="注册" value={formatTimeAgo(selectedModule?.last_register_at)} />
-                <SignalPill label="拉取" value={formatTimeAgo(selectedModule?.last_poll_at)} />
-                <SignalPill label="回执" value={formatTimeAgo(selectedModule?.last_ack_at)} />
+                <SignalPill label="注册" value={formatBeijingTimeAgo(selectedModule?.last_register_at)} />
+                <SignalPill label="拉取" value={formatBeijingTimeAgo(selectedModule?.last_poll_at)} />
+                <SignalPill label="回执" value={formatBeijingTimeAgo(selectedModule?.last_ack_at)} />
               </div>
             </CardContent>
           </Card>
@@ -751,7 +752,7 @@ function App() {
                           >
                             <div className="flex min-w-0 items-center justify-between gap-2">
                               <div className="min-w-0 truncate text-sm font-medium">{messageContactName(item, contact)}</div>
-                              <span className="shrink-0 text-[11px] text-muted-foreground">{formatTimeAgo(item.created_at)}</span>
+                              <span className="shrink-0 text-[11px] text-muted-foreground">{formatBeijingTimeAgo(item.created_at)}</span>
                             </div>
                             <div className="mt-1 truncate text-xs text-muted-foreground">
                               {messagePreview(item, contactByWxid, selectedModule)}
@@ -796,7 +797,7 @@ function App() {
                           </Badge>
                         </div>
                         <div className="mt-3 text-xs text-muted-foreground">
-                          <span className="truncate">上报：{formatTimeAgo(item.last_seen_at || item.updated_at)}</span>
+                          <span className="truncate">上报：{formatBeijingTimeAgo(item.last_seen_at || item.updated_at)}</span>
                         </div>
                       </button>
                     ))
@@ -839,7 +840,7 @@ function App() {
                   <div className="grid gap-2 text-xs text-muted-foreground md:grid-cols-3">
                     <span className="truncate">好友：{selectedContact ? contactName(selectedContact) : "-"}</span>
                     <span className="truncate">会话类型：{selectedContact ? contactKindText(selectedContact) : "-"}</span>
-                    <span className="truncate">最近上报：{formatDate(selectedContact?.last_seen_at || selectedContact?.updated_at)}</span>
+                    <span className="truncate">最近上报：{formatBeijingDateTime(selectedContact?.last_seen_at || selectedContact?.updated_at)}</span>
                   </div>
                 </div>
 
@@ -1009,7 +1010,7 @@ function App() {
                           </TableCell>
                           <TableCell className="text-xs">{item.device || "自动生成"}</TableCell>
                           <TableCell className="text-xs">{item.nickname || "-"}</TableCell>
-                          <TableCell className="text-xs">{formatTimeAgo(item.updated_at || item.created_at)}</TableCell>
+                          <TableCell className="text-xs">{formatBeijingTimeAgo(item.updated_at || item.created_at)}</TableCell>
                         </TableRow>
                       ))
                     )}
@@ -1066,8 +1067,8 @@ function App() {
                             </div>
                           </TableCell>
                           <TableCell className="text-xs">
-                            <div>拉取：{formatDate(item.last_poll_at)}</div>
-                            <div className="text-muted-foreground">回执：{formatDate(item.last_ack_at || item.last_outbound_ack_at)}</div>
+                            <div>拉取：{formatBeijingDateTime(item.last_poll_at)}</div>
+                            <div className="text-muted-foreground">回执：{formatBeijingDateTime(item.last_ack_at || item.last_outbound_ack_at)}</div>
                           </TableCell>
                         </TableRow>
                       ))
@@ -1145,7 +1146,7 @@ function MessageBubble({
           <span className="font-medium">{senderName}</span>
           {message.raw_provider ? <span>{providerText(message.raw_provider)}</span> : null}
           {message.message_type ? <span>{messageTypeText(message.message_type)}</span> : null}
-          <span>{formatDate(message.created_at)}</span>
+          <span>{formatBeijingDateTime(message.created_at)}</span>
         </div>
         {message.text ? <div className="whitespace-pre-wrap break-words text-sm leading-6">{message.text}</div> : null}
         {hasAttachment ? <MessageAttachment message={message} adminPassword={adminPassword} outgoing={outgoing} /> : null}
@@ -1524,24 +1525,6 @@ function chatKindForContact(wxid: string, contact?: ModuleContact) {
     return "room";
   }
   return "direct";
-}
-
-function formatDate(value?: string) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString("zh-CN", { hour12: false });
-}
-
-function formatTimeAgo(value?: string) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  const diff = Date.now() - date.getTime();
-  if (diff < 60_000) return "刚刚";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
-  return date.toLocaleDateString("zh-CN");
 }
 
 createRoot(document.getElementById("root")!).render(

@@ -47,8 +47,12 @@ curl -fsS http://127.0.0.1:8088/healthz
 管理台地址：
 
 ```text
-http://<server-host>:8088/admin/
+https://<server-host>/admin/
 ```
+
+手机模块使用 `https://<server-host>/observatory` 作为无端口的
+`bridge_url`。Caddy 会把该前缀转发到内部 Observatory，主机上的 8088
+只绑定本机，不能再作为公网入口。
 
 ## 更新版本
 

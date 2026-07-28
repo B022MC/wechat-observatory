@@ -20,5 +20,12 @@
 		-Server
 	}
 
-	reverse_proxy gateway:19090
+	# The phone uses the same trusted HTTPS origin without exposing 8088.
+	redir /observatory /observatory/ 308
+	handle_path /observatory/* {
+		reverse_proxy observatory:8088
+	}
+	handle {
+		reverse_proxy gateway:19090
+	}
 }

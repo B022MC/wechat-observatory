@@ -11,15 +11,30 @@ import (
 )
 
 type HTTPServer struct {
-	service   *Service
-	adminPass string
+	service         *Service
+	adminPass       string
+	deviceAdminPass string
 }
 
-func NewHTTPServer(service *Service, adminPassword string) *HTTPServer {
-	return &HTTPServer{
+type HTTPServerOption func(*HTTPServer)
+
+func WithDeviceAdminPassword(password string) HTTPServerOption {
+	return func(server *HTTPServer) {
+		server.deviceAdminPass = strings.TrimSpace(password)
+	}
+}
+
+func NewHTTPServer(service *Service, adminPassword string, options ...HTTPServerOption) *HTTPServer {
+	server := &HTTPServer{
 		service:   service,
 		adminPass: adminPassword,
 	}
+	for _, option := range options {
+		if option != nil {
+			option(server)
+		}
+	}
+	return server
 }
 
 func (s *HTTPServer) Handler() http.Handler {
@@ -32,6 +47,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /api/api-keys", s.requireAdmin(s.upsertAPIKey))
 	mux.HandleFunc("POST /api/api-keys/", s.requireAdmin(s.updateAPIKeyState))
 	mux.HandleFunc("DELETE /api/api-keys/", s.requireAdmin(s.deleteAPIKey))
+	mux.HandleFunc("POST /internal/api-key/introspect", s.requireAdmin(s.introspectAPIKey))
 	mux.HandleFunc("GET /api/events", s.requireAdmin(s.events))
 	mux.HandleFunc("GET /api/stored-events", s.requireAdmin(s.storedEvents))
 	mux.HandleFunc("GET /api/messages", s.requireAdmin(s.messages))
@@ -41,6 +57,15 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /api/send/text", s.requireAdmin(s.sendText))
 	mux.HandleFunc("GET /admin", s.adminPage)
 	mux.HandleFunc("GET /admin/", s.adminPage)
+	mux.HandleFunc("GET /device", s.devicePage)
+	mux.HandleFunc("GET /device/", s.devicePage)
+	mux.HandleFunc("GET /device-assets/", s.deviceAssets)
+	mux.HandleFunc("GET /api/device-admin/modules", s.requireDeviceAdmin(s.deviceAdminModules))
+	mux.HandleFunc("GET /api/device-admin/api-keys", s.requireDeviceAdmin(s.deviceAdminAPIKeys))
+	mux.HandleFunc("POST /api/device-admin/api-keys", s.requireDeviceAdmin(s.deviceAdminUpsertAPIKey))
+	mux.HandleFunc("POST /api/device-admin/api-keys/", s.requireDeviceAdmin(s.deviceAdminUpdateAPIKeyState))
+	mux.HandleFunc("DELETE /api/device-admin/api-keys/", s.requireDeviceAdmin(s.deviceAdminDeleteAPIKey))
+	mux.HandleFunc("POST /api/device-admin/devices", s.requireDeviceAdmin(s.deviceAdminUpsertDevice))
 	mux.HandleFunc("POST /module/register", s.registerModule)
 	mux.HandleFunc("POST /module/contacts/snapshot", s.recordContacts)
 	mux.HandleFunc("POST /module/outbox/poll", s.pollOutbox)
@@ -49,6 +74,27 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /webhook/lsposed/message", s.ingestMessageFrom("lsposed"))
 	mux.HandleFunc("POST /webhook/module/message", s.ingestMessageFrom("module"))
 	return mux
+}
+
+func (s *HTTPServer) introspectAPIKey(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var req APIKeyIntrospectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "invalid introspection request")
+		return
+	}
+	result, err := s.service.IntrospectAPIKey(r.Context(), req)
+	if err != nil {
+		if strings.Contains(err.Error(), "exactly one") {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "introspection_failed", "credential authority is unavailable")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *HTTPServer) health(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +227,11 @@ func (s *HTTPServer) updateAPIKeyState(w http.ResponseWriter, r *http.Request) {
 }
 
 func parseAPIKeyActionPath(path string) (string, string, bool) {
-	suffix := strings.Trim(strings.TrimPrefix(path, "/api/api-keys/"), "/")
+	return parseAPIKeyActionPathWithPrefix(path, "/api/api-keys/")
+}
+
+func parseAPIKeyActionPathWithPrefix(path, prefix string) (string, string, bool) {
+	suffix := strings.Trim(strings.TrimPrefix(path, prefix), "/")
 	parts := strings.Split(suffix, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || suffix == path {
 		return "", "", false

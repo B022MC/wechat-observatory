@@ -8,6 +8,7 @@ import (
 func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	t.Setenv("BRIDGE_HTTP_ADDR", ":8088")
 	t.Setenv("BRIDGE_ADMIN_PASSWORD", "admin")
+	t.Setenv("BRIDGE_DEVICE_ADMIN_PASSWORD", "device-admin-test")
 	t.Setenv("BRIDGE_DEFAULT_DEVICE", "phone-a")
 	t.Setenv("BRIDGE_DEVICES", "phone-a||wechat-phone|5s")
 	t.Setenv("BRIDGE_API_KEYS", "wg_wechat_a|phone-a|WeChat Account")
@@ -24,6 +25,9 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	}
 	if cfg.RetentionDays != 21 || cfg.RetentionPoll != 2*time.Hour {
 		t.Fatalf("unexpected retention config: days=%d interval=%s", cfg.RetentionDays, cfg.RetentionPoll)
+	}
+	if cfg.DeviceAdminPassword != "device-admin-test" {
+		t.Fatal("device admin password was not loaded")
 	}
 }
 
@@ -101,6 +105,29 @@ func TestLoadFromEnvDefaultsAdminPassword(t *testing.T) {
 	}
 	if cfg.AdminPassword != DefaultAdminPassword {
 		t.Fatalf("unexpected default admin password: %q", cfg.AdminPassword)
+	}
+}
+
+func TestLoadFromEnvLeavesDeviceAdminDisabledByDefault(t *testing.T) {
+	t.Setenv("BRIDGE_DEVICE_ADMIN_PASSWORD", "")
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DeviceAdminPassword != "" {
+		t.Fatal("device admin must remain disabled without explicit configuration")
+	}
+}
+
+func TestLoadFromEnvRejectsSharedAdminPasswords(t *testing.T) {
+	t.Setenv("BRIDGE_ADMIN_PASSWORD", "shared-password")
+	t.Setenv("BRIDGE_DEVICE_ADMIN_PASSWORD", "shared-password")
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
+
+	if _, err := LoadFromEnv(); err == nil || err.Error() != "BRIDGE_DEVICE_ADMIN_PASSWORD must differ from BRIDGE_ADMIN_PASSWORD" {
+		t.Fatalf("expected independent password error, got %v", err)
 	}
 }
 

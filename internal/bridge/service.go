@@ -61,6 +61,11 @@ func NewService(cfg Config, opts ...Option) *Service {
 	for _, opt := range opts {
 		opt(service)
 	}
+	for code, key := range service.cfg.APIKeys {
+		key.Code = firstNonEmpty(key.Code, code)
+		ensureAPIKeyCredential(&key)
+		service.cfg.APIKeys[code] = key
+	}
 	return service
 }
 
@@ -140,6 +145,14 @@ func (s *Service) UpsertAPIKey(ctx context.Context, req APIKeyUpsertRequest) (AP
 	if key.Device == "" {
 		key.Device = apiKeyDeviceName(key)
 	}
+	if existing, ok := s.cfg.APIKeys[key.Code]; ok {
+		key.CredentialID = existing.CredentialID
+		key.AuthVersion = existing.AuthVersion
+		if existing.Device != key.Device || existing.Disabled {
+			key.AuthVersion++
+		}
+	}
+	ensureAPIKeyCredential(&key)
 	if writer := s.AdminWriter(); writer != nil {
 		if err := writer.UpsertAPIKey(ctx, key); err != nil {
 			return APIKeyView{}, err
@@ -184,7 +197,11 @@ func (s *Service) SetAPIKeyEnabled(ctx context.Context, apiKey string, enabled b
 	if !ok {
 		return APIKeyView{}, fmt.Errorf("api key %q not found", apiKey)
 	}
+	if key.Disabled == enabled {
+		key.AuthVersion++
+	}
 	key.Disabled = !enabled
+	ensureAPIKeyCredential(&key)
 	if writer := s.AdminWriter(); writer != nil {
 		if err := writer.SetAPIKeyEnabled(ctx, apiKey, enabled); err != nil {
 			return APIKeyView{}, err
@@ -192,6 +209,40 @@ func (s *Service) SetAPIKeyEnabled(ctx context.Context, apiKey string, enabled b
 	}
 	s.setCachedAPIKey(key)
 	return apiKeyView(key), nil
+}
+
+func (s *Service) IntrospectAPIKey(ctx context.Context, req APIKeyIntrospectionRequest) (APIKeyIntrospection, error) {
+	apiKey := strings.TrimSpace(req.APIKey)
+	credentialRef := strings.TrimSpace(req.CredentialRef)
+	if (apiKey == "") == (credentialRef == "") {
+		return APIKeyIntrospection{}, fmt.Errorf("exactly one of api_key or credential_ref is required")
+	}
+
+	var (
+		key config.APIKey
+		ok  bool
+		err error
+	)
+	if apiKey != "" {
+		key, ok, err = s.lookupAPIKey(ctx, apiKey)
+	} else {
+		key, ok, err = s.lookupAPIKeyByCredentialRef(ctx, credentialRef)
+	}
+	if err != nil {
+		return APIKeyIntrospection{}, err
+	}
+	deviceName := strings.TrimSpace(key.Device)
+	if !ok || key.Disabled || deviceName == "" || strings.TrimSpace(key.CredentialID) == "" || key.AuthVersion <= 0 {
+		return APIKeyIntrospection{Active: false}, nil
+	}
+	if _, found, lookupErr := s.lookupDevice(ctx, deviceName); lookupErr != nil {
+		return APIKeyIntrospection{}, lookupErr
+	} else if !found {
+		return APIKeyIntrospection{Active: false}, nil
+	}
+	return APIKeyIntrospection{
+		Active: true, CredentialRef: key.CredentialID, AuthVersion: key.AuthVersion, Device: deviceName,
+	}, nil
 }
 
 func (s *Service) UpsertDevice(ctx context.Context, req DeviceUpsertRequest) (ModuleStatusView, error) {
@@ -251,6 +302,8 @@ func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequ
 	}
 	if key.Device != req.Device {
 		key.Device = req.Device
+		key.AuthVersion++
+		ensureAPIKeyCredential(&key)
 		if writer := s.AdminWriter(); writer != nil {
 			if err := writer.UpsertAPIKey(ctx, key); err != nil {
 				return nil, err
@@ -654,6 +707,21 @@ func (s *Service) lookupAPIKey(ctx context.Context, code string) (config.APIKey,
 	return key, ok, nil
 }
 
+func (s *Service) lookupAPIKeyByCredentialRef(ctx context.Context, credentialRef string) (config.APIKey, bool, error) {
+	credentialRef = strings.TrimSpace(credentialRef)
+	if reader, ok := s.persistence.(APIKeyCredentialReader); ok {
+		return reader.LookupAPIKeyByCredentialRef(ctx, credentialRef)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, key := range s.cfg.APIKeys {
+		if key.CredentialID == credentialRef {
+			return key, true, nil
+		}
+	}
+	return config.APIKey{}, false, nil
+}
+
 func (s *Service) lookupDevice(ctx context.Context, name string) (config.Device, bool, error) {
 	if reader, ok := s.persistence.(ModuleConfigReader); ok {
 		return reader.LookupDevice(ctx, name)
@@ -726,6 +794,21 @@ func generateAPIKey() string {
 		return fmt.Sprintf("wg_%d", time.Now().UnixNano())
 	}
 	return "wg_" + hex.EncodeToString(random)
+}
+
+func ensureAPIKeyCredential(key *config.APIKey) {
+	if key.AuthVersion <= 0 {
+		key.AuthVersion = 1
+	}
+	if strings.TrimSpace(key.CredentialID) != "" {
+		return
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		key.CredentialID = fmt.Sprintf("ak_%d", time.Now().UnixNano())
+		return
+	}
+	key.CredentialID = "ak_" + hex.EncodeToString(random)
 }
 
 func generateSessionToken() string {

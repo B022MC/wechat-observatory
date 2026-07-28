@@ -7,14 +7,15 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 
 	"wechat-observatory/internal/bridge"
 	"wechat-observatory/internal/config"
 )
 
-const driverName = "mysql"
+var beijingLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
 
 type Store struct {
 	db *sql.DB
@@ -35,10 +36,15 @@ func firstNonEmpty(values ...string) string {
 }
 
 func Open(ctx context.Context, dsn string) (*Store, error) {
-	db, err := sql.Open(driverName, strings.TrimSpace(dsn))
+	cfg, err := parseMySQLConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
+	connector, err := mysqldriver.NewConnector(cfg)
+	if err != nil {
+		return nil, err
+	}
+	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(30 * time.Minute)
@@ -47,6 +53,20 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+func parseMySQLConfig(dsn string) (*mysqldriver.Config, error) {
+	cfg, err := mysqldriver.ParseDSN(strings.TrimSpace(dsn))
+	if err != nil {
+		return nil, err
+	}
+	cfg.ParseTime = true
+	cfg.Loc = beijingLocation
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string)
+	}
+	cfg.Params["time_zone"] = "'+08:00'"
+	return cfg, nil
 }
 
 func New(db *sql.DB) *Store {
@@ -85,6 +105,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureAPIKeyEnabledColumn(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureAPIKeyCredentialColumns(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureDeviceSessionLeaseTable(ctx); err != nil {
@@ -219,6 +242,26 @@ func (s *Store) ensureAPIKeyEnabledColumn(ctx context.Context) error {
 	return err
 }
 
+func (s *Store) ensureAPIKeyCredentialColumns(ctx context.Context) error {
+	statements := []string{
+		`ALTER TABLE bridge_api_keys ADD COLUMN credential_id VARCHAR(64) NULL AFTER code`,
+		`ALTER TABLE bridge_api_keys ADD COLUMN auth_version BIGINT NOT NULL DEFAULT 1 AFTER credential_id`,
+		`UPDATE bridge_api_keys SET credential_id = CONCAT('ak_', REPLACE(UUID(), '-', '')) WHERE credential_id IS NULL OR credential_id = ''`,
+		`ALTER TABLE bridge_api_keys MODIFY credential_id VARCHAR(64) NOT NULL`,
+		`CREATE UNIQUE INDEX uniq_bridge_api_keys_credential_id ON bridge_api_keys (credential_id)`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			lower := strings.ToLower(err.Error())
+			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) ensureDeviceSessionLeaseTable(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS bridge_device_session_lease (
 		device VARCHAR(128) NOT NULL,
@@ -253,11 +296,14 @@ func Migrations() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS bridge_api_keys (
 			code VARCHAR(128) NOT NULL PRIMARY KEY,
+			credential_id VARCHAR(64) NOT NULL,
+			auth_version BIGINT NOT NULL DEFAULT 1,
 			device VARCHAR(128) NULL,
 			nickname VARCHAR(255) NULL,
 			enabled BOOLEAN NOT NULL DEFAULT TRUE,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			UNIQUE KEY uniq_bridge_api_keys_credential_id (credential_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS bridge_devices (
 			name VARCHAR(128) NOT NULL PRIMARY KEY,
@@ -510,13 +556,25 @@ func (s *Store) UpdateDeviceIdentity(ctx context.Context, deviceName string, wxi
 
 func (s *Store) LookupAPIKey(ctx context.Context, code string) (config.APIKey, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT code, device, nickname, enabled
+		SELECT code, credential_id, auth_version, device, nickname, enabled
 		FROM bridge_api_keys
 		WHERE code = ?`, strings.TrimSpace(code))
+	return scanAPIKey(row)
+}
+
+func (s *Store) LookupAPIKeyByCredentialRef(ctx context.Context, credentialRef string) (config.APIKey, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT code, credential_id, auth_version, device, nickname, enabled
+		FROM bridge_api_keys
+		WHERE credential_id = ?`, strings.TrimSpace(credentialRef))
+	return scanAPIKey(row)
+}
+
+func scanAPIKey(row interface{ Scan(...any) error }) (config.APIKey, bool, error) {
 	var key config.APIKey
 	var device, nickname sql.NullString
 	var enabled bool
-	if err := row.Scan(&key.Code, &device, &nickname, &enabled); err != nil {
+	if err := row.Scan(&key.Code, &key.CredentialID, &key.AuthVersion, &device, &nickname, &enabled); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return config.APIKey{}, false, nil
 		}
@@ -1025,14 +1083,24 @@ func (s *Store) messageEventByID(ctx context.Context, id int64) (bridge.MessageE
 }
 
 func upsertAPIKey(ctx context.Context, exec sqlExecutor, key config.APIKey) error {
+	version := key.AuthVersion
+	if version <= 0 {
+		version = 1
+	}
 	_, err := exec.ExecContext(ctx, `
-		INSERT INTO bridge_api_keys (code, device, nickname, enabled)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO bridge_api_keys (code, credential_id, auth_version, device, nickname, enabled)
+		VALUES (?, COALESCE(NULLIF(?, ''), CONCAT('ak_', REPLACE(UUID(), '-', ''))), ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
+			auth_version = CASE
+				WHEN NOT (device <=> VALUES(device)) OR enabled <> VALUES(enabled) THEN auth_version + 1
+				ELSE auth_version
+			END,
 			device = VALUES(device),
 			nickname = VALUES(nickname),
 			enabled = VALUES(enabled)`,
 		strings.TrimSpace(key.Code),
+		strings.TrimSpace(key.CredentialID),
+		version,
 		nullString(key.Device),
 		nullString(key.Nickname),
 		!key.Disabled,
@@ -1090,8 +1158,10 @@ func (s *Store) SetAPIKeyEnabled(ctx context.Context, code string, enabled bool)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE bridge_api_keys
-		SET enabled = ?
+		SET auth_version = auth_version + IF(enabled = ?, 0, 1),
+			enabled = ?
 		WHERE code = ?`,
+		enabled,
 		enabled,
 		code,
 	); err != nil {
@@ -1135,7 +1205,7 @@ func upsertDevice(ctx context.Context, exec sqlExecutor, device config.Device) e
 
 func (s *Store) loadAPIKeys(ctx context.Context, out map[string]config.APIKey) error {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT code, device, nickname, enabled
+		SELECT code, credential_id, auth_version, device, nickname, enabled
 		FROM bridge_api_keys`)
 	if err != nil {
 		return err
@@ -1145,7 +1215,7 @@ func (s *Store) loadAPIKeys(ctx context.Context, out map[string]config.APIKey) e
 		var key config.APIKey
 		var device, nickname sql.NullString
 		var enabled bool
-		if err := rows.Scan(&key.Code, &device, &nickname, &enabled); err != nil {
+		if err := rows.Scan(&key.Code, &key.CredentialID, &key.AuthVersion, &device, &nickname, &enabled); err != nil {
 			return err
 		}
 		key.Device = device.String

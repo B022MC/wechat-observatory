@@ -6,6 +6,16 @@ RUN npm ci
 COPY web/admin ./
 RUN npm run build
 
+FROM node:20-alpine AS device-web-build
+
+WORKDIR /src/web/device
+COPY web/device/package*.json ./
+RUN npm ci
+COPY web/device ./
+COPY web/admin/src /src/web/admin/src
+RUN ln -s /src/web/device/node_modules /src/web/admin/node_modules
+RUN npm run build
+
 FROM golang:1.24.2-alpine AS build
 
 ARG GOPROXY=https://goproxy.cn,direct
@@ -16,6 +26,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=web-build /src/internal/bridge/admin_dist ./internal/bridge/admin_dist
+COPY --from=device-web-build /src/internal/bridge/device_dist ./internal/bridge/device_dist
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/wechat-observatory ./cmd/bridge
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/wechat-observatory-db ./cmd/bridge-db
 

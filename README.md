@@ -78,6 +78,7 @@ docs                       详细文档
 ```powershell
 $env:BRIDGE_HTTP_ADDR=":8088"
 $env:BRIDGE_ADMIN_PASSWORD="change-this-password"
+$env:BRIDGE_DEVICE_ADMIN_PASSWORD="separate-device-admin-password"
 $env:BRIDGE_DEFAULT_DEVICE="phone-a"
 $env:BRIDGE_DEVICES="phone-a||wechat-phone|5s"
 $env:BRIDGE_API_KEYS="dev_key_001|phone-a|Test Phone"
@@ -91,10 +92,17 @@ go run ./cmd/bridge
 http://127.0.0.1:8088/admin/
 ```
 
+只管理设备和 API Key、完全不读取消息的独立页面：
+
+```text
+http://127.0.0.1:8088/device
+```
+
 生产环境请务必设置强密码：
 
 ```text
 BRIDGE_ADMIN_PASSWORD=your-strong-admin-password
+BRIDGE_DEVICE_ADMIN_PASSWORD=your-separate-device-admin-password
 ```
 
 ### 3. 使用 MySQL
@@ -120,9 +128,14 @@ BRIDGE_MYSQL_AUTO_MIGRATE=false
 cd web/admin
 npm install
 npm run build
+
+cd ../device
+npm install
+npm run build
 ```
 
-构建产物会写入 `internal/bridge/admin_dist`，由 Go 服务直接嵌入。
+构建产物会分别写入 `internal/bridge/admin_dist` 和
+`internal/bridge/device_dist`，由 Go 服务直接嵌入。
 
 ### 5. 构建 Android 模块
 
@@ -141,7 +154,7 @@ cd android-module
 
 在 Web 管理台生成 API Key，打开手机上的 **WeChat Observatory** 配置页，填写：
 
-- 服务端地址，例如 `http://192.168.1.10:8088`
+- 服务端地址，例如 `https://47.108.171.42/observatory`（无端口 HTTPS）
 - Web 管理台生成的 API Key
 
 不要手动填写 `wxid`。模块会在微信进程内自动识别当前登录微信。

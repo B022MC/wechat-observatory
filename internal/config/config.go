@@ -14,20 +14,22 @@ const (
 	defaultHTTPAddr      = ":8088"
 	DefaultAdminPassword = "change-this-password"
 	currentAdminPassEnv  = "BRIDGE_ADMIN_PASSWORD"
+	deviceAdminPassEnv   = "BRIDGE_DEVICE_ADMIN_PASSWORD"
 )
 
 type Config struct {
-	HTTPAddr      string
-	AdminPassword string
-	DefaultDevice string
-	InstanceID    string
-	SessionTTL    time.Duration
-	PollInterval  time.Duration
-	RetentionDays int
-	RetentionPoll time.Duration
-	Devices       map[string]Device
-	APIKeys       map[string]APIKey
-	MySQL         MySQLConfig
+	HTTPAddr            string
+	AdminPassword       string
+	DeviceAdminPassword string
+	DefaultDevice       string
+	InstanceID          string
+	SessionTTL          time.Duration
+	PollInterval        time.Duration
+	RetentionDays       int
+	RetentionPoll       time.Duration
+	Devices             map[string]Device
+	APIKeys             map[string]APIKey
+	MySQL               MySQLConfig
 }
 
 type MySQLConfig struct {
@@ -47,24 +49,27 @@ type Device struct {
 }
 
 type APIKey struct {
-	Code     string `json:"-"`
-	Device   string `json:"device,omitempty"`
-	Nickname string `json:"nickname,omitempty"`
-	Disabled bool   `json:"disabled,omitempty"`
+	Code         string `json:"-"`
+	CredentialID string `json:"-"`
+	AuthVersion  int64  `json:"-"`
+	Device       string `json:"device,omitempty"`
+	Nickname     string `json:"nickname,omitempty"`
+	Disabled     bool   `json:"disabled,omitempty"`
 }
 
 func LoadFromEnv() (Config, error) {
 	cfg := Config{
-		HTTPAddr:      getenv("BRIDGE_HTTP_ADDR", defaultHTTPAddr),
-		AdminPassword: adminPasswordFromEnv(),
-		DefaultDevice: strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_DEVICE")),
-		InstanceID:    instanceID(),
-		SessionTTL:    getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
-		PollInterval:  getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", time.Second),
-		RetentionDays: getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),
-		RetentionPoll: getenvDuration("BRIDGE_HISTORY_RETENTION_INTERVAL", time.Hour),
-		Devices:       map[string]Device{},
-		APIKeys:       map[string]APIKey{},
+		HTTPAddr:            getenv("BRIDGE_HTTP_ADDR", defaultHTTPAddr),
+		AdminPassword:       adminPasswordFromEnv(),
+		DeviceAdminPassword: strings.TrimSpace(os.Getenv(deviceAdminPassEnv)),
+		DefaultDevice:       strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_DEVICE")),
+		InstanceID:          instanceID(),
+		SessionTTL:          getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
+		PollInterval:        getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", time.Second),
+		RetentionDays:       getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),
+		RetentionPoll:       getenvDuration("BRIDGE_HISTORY_RETENTION_INTERVAL", time.Hour),
+		Devices:             map[string]Device{},
+		APIKeys:             map[string]APIKey{},
 		MySQL: MySQLConfig{
 			DSN: strings.TrimSpace(os.Getenv("BRIDGE_MYSQL_DSN")),
 		},
@@ -72,6 +77,9 @@ func LoadFromEnv() (Config, error) {
 
 	if err := validateListenAddr("BRIDGE_HTTP_ADDR", cfg.HTTPAddr); err != nil {
 		return Config{}, err
+	}
+	if cfg.DeviceAdminPassword != "" && cfg.DeviceAdminPassword == cfg.AdminPassword {
+		return Config{}, errors.New("BRIDGE_DEVICE_ADMIN_PASSWORD must differ from BRIDGE_ADMIN_PASSWORD")
 	}
 
 	autoMigrate, err := getenvBool("BRIDGE_MYSQL_AUTO_MIGRATE", false)

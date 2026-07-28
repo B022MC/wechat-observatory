@@ -691,6 +691,99 @@ func TestAPIKeyDisableStopsAndEnableRestoresModuleAuth(t *testing.T) {
 	}
 }
 
+func TestAPIKeyIntrospectionUsesOpaqueReferenceAndTracksAuthorityVersion(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(`{"api_key":"wechat-a-key"}`))
+	loginReq.Header.Set("X-Bridge-Password", "admin")
+	loginRec := httptest.NewRecorder()
+	server.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("unexpected introspection status=%d body=%s", loginRec.Code, loginRec.Body.String())
+	}
+	var login APIKeyIntrospection
+	if err := json.Unmarshal(loginRec.Body.Bytes(), &login); err != nil {
+		t.Fatal(err)
+	}
+	if !login.Active || login.CredentialRef == "" || login.AuthVersion != 1 || login.Device != "phone-a" {
+		t.Fatalf("unexpected introspection result: %+v", login)
+	}
+	for _, private := range []string{"wechat-a-key", "wxid_self", "WeChat Phone"} {
+		if strings.Contains(loginRec.Body.String(), private) {
+			t.Fatalf("introspection leaked %q: %s", private, loginRec.Body.String())
+		}
+	}
+	if loginRec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("introspection must be no-store: %v", loginRec.Header())
+	}
+
+	refBody := fmt.Sprintf(`{"credential_ref":%q}`, login.CredentialRef)
+	refReq := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(refBody))
+	refReq.Header.Set("X-Bridge-Password", "admin")
+	refRec := httptest.NewRecorder()
+	server.ServeHTTP(refRec, refReq)
+	if refRec.Code != http.StatusOK || !strings.Contains(refRec.Body.String(), `"active":true`) {
+		t.Fatalf("reference revalidation failed: %d %s", refRec.Code, refRec.Body.String())
+	}
+
+	if _, err := service.SetAPIKeyEnabled(t.Context(), "wechat-a-key", false); err != nil {
+		t.Fatal(err)
+	}
+	disabledReq := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(refBody))
+	disabledReq.Header.Set("X-Bridge-Password", "admin")
+	disabledRec := httptest.NewRecorder()
+	server.ServeHTTP(disabledRec, disabledReq)
+	if disabledRec.Code != http.StatusOK || disabledRec.Body.String() != "{\"active\":false}\n" {
+		t.Fatalf("disabled reference should be generically inactive: %d %s", disabledRec.Code, disabledRec.Body.String())
+	}
+
+	if _, err := service.SetAPIKeyEnabled(t.Context(), "wechat-a-key", true); err != nil {
+		t.Fatal(err)
+	}
+	reenabled, err := service.IntrospectAPIKey(t.Context(), APIKeyIntrospectionRequest{APIKey: "wechat-a-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reenabled.Active || reenabled.CredentialRef != login.CredentialRef || reenabled.AuthVersion <= login.AuthVersion {
+		t.Fatalf("reenabled authority should keep ref and advance version: before=%+v after=%+v", login, reenabled)
+	}
+}
+
+func TestAPIKeyIntrospectionFailsClosed(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	for _, body := range []string{
+		`{"api_key":"unknown"}`,
+		`{"api_key":"wechat-b-key"}`,
+		`{"credential_ref":"ak_unknown"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(body))
+		req.Header.Set("X-Bridge-Password", "admin")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.String() != "{\"active\":false}\n" {
+			t.Fatalf("inactive introspection body=%s status=%d response=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	badShape := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(`{"api_key":"wechat-a-key","credential_ref":"ak_conflict"}`))
+	badShape.Header.Set("X-Bridge-Password", "admin")
+	badShapeRec := httptest.NewRecorder()
+	server.ServeHTTP(badShapeRec, badShape)
+	if badShapeRec.Code != http.StatusBadRequest {
+		t.Fatalf("ambiguous introspection request should fail: %d %s", badShapeRec.Code, badShapeRec.Body.String())
+	}
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(`{"api_key":"wechat-a-key"}`))
+	unauthorizedRec := httptest.NewRecorder()
+	server.ServeHTTP(unauthorizedRec, unauthorized)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("introspection should require admin auth: %d %s", unauthorizedRec.Code, unauthorizedRec.Body.String())
+	}
+}
+
 func TestAdminReadEndpointsUsePersistentReader(t *testing.T) {
 	reader := &fakeAdminReader{
 		keys: []APIKeyView{

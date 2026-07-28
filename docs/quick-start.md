@@ -91,7 +91,9 @@ android-module/app/build/outputs/apk/debug/
 3. 作用域选择微信 `com.tencent.mm`。
 4. 重启微信或重启手机。
 5. 打开手机桌面的 **WeChat Observatory**。
-6. 填写服务端地址，例如 `http://192.168.1.10:8088`。
+6. 填写服务端地址，例如 `https://47.108.171.42/observatory`。该地址不需要
+   端口，模块会使用 HTTPS API 和 WSS 出站流；WSS 失败时自动回退到 HTTP
+   轮询。
 7. 填写 Web 管理台生成的 API Key。
 8. 保存配置并重启微信。
 

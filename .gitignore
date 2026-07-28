@@ -14,6 +14,9 @@ deploy/docker/.env
 web/admin/node_modules/
 web/admin/dist/
 web/admin/*.tsbuildinfo
+web/device/node_modules/
+web/device/dist/
+web/device/*.tsbuildinfo
 android-module/.gradle/
 android-module/build/
 android-module/app/build/
