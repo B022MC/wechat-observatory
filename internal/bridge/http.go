@@ -448,7 +448,7 @@ func (s *HTTPServer) moduleContacts(w http.ResponseWriter, r *http.Request) {
 		OwnerWxID:      strings.TrimSpace(r.URL.Query().Get("owner_wxid")),
 		Query:          strings.TrimSpace(r.URL.Query().Get("q")),
 		IncludeDeleted: parseBoolQuery(r.URL.Query().Get("include_deleted")),
-		Limit:          queryLimit(r, 100),
+		Limit:          queryLimitUpTo(r, 100, 10000),
 	}
 	contacts, err := reader.ListModuleContacts(r.Context(), filter)
 	if err != nil {
@@ -590,9 +590,13 @@ func (s *HTTPServer) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func queryLimit(r *http.Request, fallback int) int {
+	return queryLimitUpTo(r, fallback, 500)
+}
+
+func queryLimitUpTo(r *http.Request, fallback, maximum int) int {
 	limit := fallback
 	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 500 {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= maximum {
 			limit = parsed
 		}
 	}

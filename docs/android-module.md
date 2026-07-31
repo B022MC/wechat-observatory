@@ -26,9 +26,8 @@ cd android-module
 
 ## 手机端配置
 
-打开手机上的 **WeChat Observatory**，填写：
+打开手机上的 **WeChat Observatory**。服务端已固定为正式环境，只需填写：
 
-- 服务端地址：推荐使用无端口的 HTTPS 地址，例如 `https://47.108.171.42/observatory`
 - API Key：从 Web 管理台生成
 - 轮询间隔：默认 `1000`
 - 通讯录同步间隔：默认 `600000`
@@ -37,19 +36,19 @@ cd android-module
 
 模块不会要求用户填写 `wxid`。切换微信账号后，模块会重新识别当前账号并用同一个 API Key 更新服务端绑定。
 
-服务端地址和 API Key 始终以掩码显示，界面不提供明文查看入口。可以直接覆盖输入新值；保存不会清除未修改的已有值。保存配置后需要重启微信。
+服务端已固定为正式环境 `https://47.108.171.42/observatory`，设置页不提供地址输入。API Key 始终以掩码显示，界面不提供明文查看入口；可以直接覆盖输入新值，保存不会清除未修改的已有值。保存配置后需要重启微信。
 
 ## 配置项
 
 | Key | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `1` | 是否启用模块逻辑 |
-| `bridge_url` | `https://47.108.171.42/observatory` | 服务端地址；HTTPS 同时用于 API 和 WSS |
+| `bridge_url` | 不适用 | 旧配置项，正式版模块会忽略该值 |
 | `api_key` | 空 | Web 管理台生成的 API Key |
 | `poll_interval_ms` | `1000` | HTTP 轮询出站消息间隔 |
 | `poll_limit` | `1` | 每次最多拉取条数，服务端当前只租约一条 |
 | `contact_sync_interval_ms` | `600000` | 通讯录同步间隔，`0` 表示关闭 |
-| `contact_sync_limit` | `1000` | 一次同步联系人数量上限 |
+| `contact_sync_limit` | `10000` | 一次同步联系人数量上限 |
 | `contact_include_chatrooms` | `1` | 是否同步群聊 |
 | `media_upload_enabled` | `0` | 是否上传图片、语音、视频、文件等附件 |
 | `media_upload_limit_bytes` | `5242880` | 单个附件上传上限 |

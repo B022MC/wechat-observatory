@@ -1507,12 +1507,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static JSONArray readContacts(Object db, BridgeConfig config) throws Exception {
-        int limit = config.contactSyncLimit <= 0 ? 1000 : Math.min(config.contactSyncLimit, 10000);
-        Object cursor = rawQuery(db, ""
-                + "SELECT username,nickname,conRemark,alias,type,verifyFlag "
-                + "FROM rcontact "
-                + "WHERE username IS NOT NULL AND username <> '' "
-                + "LIMIT ?", new String[]{String.valueOf(limit)});
+        int limit = ContactSnapshotPlan.outputLimit(config.contactSyncLimit);
+        Object cursor = rawQuery(db, ContactSnapshotPlan.CONTACT_QUERY, new String[0]);
         JSONArray out = new JSONArray();
         Set<String> seen = new HashSet<>();
         if (cursor == null) {
@@ -1520,7 +1516,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
         try {
             Method moveToNext = findNoArgMethod(cursor.getClass(), "moveToNext");
-            while (Boolean.TRUE.equals(moveToNext.invoke(cursor))) {
+            while (out.length() < limit && Boolean.TRUE.equals(moveToNext.invoke(cursor))) {
                 String wxid = stringColumn(cursor, 0);
                 int type = intColumn(cursor, 4);
                 boolean chatroom = wxid.toLowerCase(Locale.US).endsWith("@chatroom");

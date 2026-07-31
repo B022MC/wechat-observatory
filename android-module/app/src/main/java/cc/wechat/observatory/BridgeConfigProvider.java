@@ -15,7 +15,6 @@ public final class BridgeConfigProvider extends ContentProvider {
     static final String AUTHORITY = "cc.wechat.observatory.config";
     static final String[] CONFIG_KEYS = new String[]{
             "enabled",
-            "bridge_url",
             "api_key",
             "poll_interval_ms",
             "poll_limit",

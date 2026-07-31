@@ -405,7 +405,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 }
 
 func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleContactFilter) ([]bridge.ModuleContactView, error) {
-	limit := normalizeLimit(filter.Limit)
+	limit := normalizeLimitUpTo(filter.Limit, 10000)
 	conditions := []string{"1=1"}
 	args := []any{}
 	if device := strings.TrimSpace(filter.Device); device != "" {
@@ -474,11 +474,15 @@ func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleCont
 }
 
 func normalizeLimit(limit int) int {
+	return normalizeLimitUpTo(limit, 500)
+}
+
+func normalizeLimitUpTo(limit, maximum int) int {
 	if limit <= 0 {
 		return 50
 	}
-	if limit > 500 {
-		return 500
+	if limit > maximum {
+		return maximum
 	}
 	return limit
 }

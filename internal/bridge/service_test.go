@@ -24,6 +24,21 @@ import (
 
 const testAPIKey = "wechat-a-key"
 
+func TestContactQueryAllowsCompleteSnapshotsWithoutRaisingOtherEndpointLimits(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/module-contacts?limit=10000", nil)
+	if got := queryLimit(req, 100); got != 100 {
+		t.Fatalf("default endpoint limit = %d, want fallback 100", got)
+	}
+	if got := queryLimitUpTo(req, 100, 10000); got != 10000 {
+		t.Fatalf("contact endpoint limit = %d, want 10000", got)
+	}
+
+	overLimit := httptest.NewRequest(http.MethodGet, "/api/module-contacts?limit=10001", nil)
+	if got := queryLimitUpTo(overLimit, 100, 10000); got != 100 {
+		t.Fatalf("over-limit contact query = %d, want fallback 100", got)
+	}
+}
+
 func TestIngestPublishesAndPersistsWithoutBusinessReply(t *testing.T) {
 	outbox := &fakeOutbox{}
 	persistence := &fakePersistence{}

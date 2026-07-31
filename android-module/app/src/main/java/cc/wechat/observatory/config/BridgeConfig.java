@@ -13,11 +13,14 @@ import java.util.Locale;
 import java.util.Properties;
 import java.util.Map;
 
+import cc.wechat.observatory.gateway.GatewayEndpoint;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.util.Strings;
 import de.robv.android.xposed.XSharedPreferences;
 
 public final class BridgeConfig {
+    public static final int DEFAULT_CONTACT_SYNC_LIMIT = 10000;
+
     private static final String CONFIG_PROVIDER_URI = "content://cc.wechat.observatory.config/config";
     private static final String MODULE_PACKAGE = "cc.wechat.observatory";
     private static final String PREFS_NAME = "bridge_config";
@@ -45,9 +48,15 @@ public final class BridgeConfig {
 
     public static BridgeConfig load(Context context) {
         Properties properties = readProperties(context);
+        BridgeConfig config = fromProperties(properties);
+        logConfigOnce(config, properties);
+        return config;
+    }
+
+    static BridgeConfig fromProperties(Properties properties) {
         BridgeConfig config = new BridgeConfig();
         config.enabled = !"0".equals(setting(properties, "enabled", "1"));
-        config.baseUrl = setting(properties, "bridge_url", "");
+        config.baseUrl = GatewayEndpoint.PRODUCTION_BASE_URL;
         config.device = "";
         config.selfWxid = "";
         config.apiKey = setting(properties, "api_key", "");
@@ -55,12 +64,11 @@ public final class BridgeConfig {
         config.pollIntervalMs = longSetting(properties, "poll_interval_ms", 1000L);
         config.pollLimit = (int) longSetting(properties, "poll_limit", 20L);
         config.contactSyncIntervalMs = longSetting(properties, "contact_sync_interval_ms", 600000L);
-        config.contactSyncLimit = (int) longSetting(properties, "contact_sync_limit", 1000L);
+        config.contactSyncLimit = (int) longSetting(properties, "contact_sync_limit", DEFAULT_CONTACT_SYNC_LIMIT);
         config.includeChatrooms = booleanSetting(properties, "contact_include_chatrooms", true);
         config.mediaUploadEnabled = booleanSetting(properties, "media_upload_enabled", false);
         config.mediaUploadLimitBytes = longSetting(properties, "media_upload_limit_bytes", 5L * 1024L * 1024L);
         config.signature = configSignature(properties);
-        logConfigOnce(config, properties);
         return config;
     }
 
@@ -332,7 +340,6 @@ public final class BridgeConfig {
         StringBuilder out = new StringBuilder();
         for (String key : new String[]{
                 "enabled",
-                "bridge_url",
                 "api_key",
                 "poll_interval_ms",
                 "poll_limit",

@@ -65,6 +65,7 @@ import "./index.css";
 const PASSWORD_KEY = "wgc_admin_password";
 const THEME_KEY = "wgc_admin_theme";
 const RAW_PROVIDER_MODULE_ACK = "module_ack";
+const CONTACT_SNAPSHOT_LIMIT = 10000;
 
 type ContactFilter = "all" | "direct" | "room" | "messages";
 type ThemeMode = "light" | "dark";
@@ -111,6 +112,9 @@ function App() {
   const selectedOwnerWxid = moduleOwnerWxid(selectedModule);
   const selectedScopeKey = `${selectedDevice}:${selectedOwnerWxid}`;
   const selectedScopeRef = React.useRef(selectedScopeKey);
+  const messageListRef = React.useRef<HTMLDivElement>(null);
+  const loadedMessageChatRef = React.useRef("");
+  const pendingBottomScrollChatRef = React.useRef("");
 
   React.useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -224,7 +228,7 @@ function App() {
         ownerWxid,
         query: contactQuery,
         includeDeleted: contactIncludeDeleted,
-        limit: 600
+        limit: CONTACT_SNAPSHOT_LIMIT
       });
       if (!scopeMatches(device, ownerWxid)) {
         return [] as ModuleContact[];
@@ -243,6 +247,7 @@ function App() {
   const refreshMessages = React.useCallback(
     async (device: string, wxid: string, ownerWxid = selectedOwnerWxid) => {
       if (!adminPassword || !device || !wxid) {
+        loadedMessageChatRef.current = "";
         setMessages([]);
         return [] as StoredMessage[];
       }
@@ -260,6 +265,7 @@ function App() {
         return [] as StoredMessage[];
       }
       const nextMessages = (payload.messages || []).slice().reverse();
+      loadedMessageChatRef.current = wxid;
       setMessages(nextMessages);
       return nextMessages;
     },
@@ -322,6 +328,8 @@ function App() {
   }, [adminPassword, refreshApiKeys, refreshContacts, refreshMessages, refreshModules, refreshRecentMessages, selectedDevice, selectedWxid]);
 
   React.useEffect(() => {
+    loadedMessageChatRef.current = "";
+    pendingBottomScrollChatRef.current = "";
     setContacts([]);
     setMessages([]);
     setRecentMessages([]);
@@ -362,6 +370,21 @@ function App() {
       setNotice(error instanceof Error ? error.message : "消息刷新失败");
     });
   }, [refreshMessages, selectedDevice, selectedOwnerWxid, selectedWxid]);
+
+  React.useLayoutEffect(() => {
+    const messageList = messageListRef.current;
+    if (
+      !messageList ||
+      !selectedWxid ||
+      messages.length === 0 ||
+      loadedMessageChatRef.current !== selectedWxid ||
+      pendingBottomScrollChatRef.current !== selectedWxid
+    ) {
+      return;
+    }
+    messageList.scrollTop = messageList.scrollHeight;
+    pendingBottomScrollChatRef.current = "";
+  }, [messages, selectedWxid]);
 
   React.useEffect(() => {
     if (!selectedDevice) {
@@ -425,16 +448,38 @@ function App() {
     setMessages([]);
     setRecentMessages([]);
     setSelectedWxid("");
+    loadedMessageChatRef.current = "";
+    pendingBottomScrollChatRef.current = "";
+  };
+
+  const selectChat = (wxid: string) => {
+    pendingBottomScrollChatRef.current = wxid;
+    setSelectedWxid(wxid);
+    if (selectedWxid === wxid && loadedMessageChatRef.current === wxid) {
+      window.requestAnimationFrame(() => {
+        const messageList = messageListRef.current;
+        if (messageList && pendingBottomScrollChatRef.current === wxid) {
+          messageList.scrollTop = messageList.scrollHeight;
+          pendingBottomScrollChatRef.current = "";
+        }
+      });
+    }
+  };
+
+  const cancelPendingBottomScroll = () => {
+    if (pendingBottomScrollChatRef.current === selectedWxid) {
+      pendingBottomScrollChatRef.current = "";
+    }
   };
 
   const selectContact = (contact: ModuleContact) => {
-    setSelectedWxid(contact.wxid);
+    selectChat(contact.wxid);
   };
 
   const selectRecentMessage = (message: StoredMessage) => {
     const chatId = messageChatId(message);
     if (chatId) {
-      setSelectedWxid(chatId);
+      selectChat(chatId);
     }
   };
 
@@ -852,7 +897,14 @@ function App() {
                   </div>
                 </div>
 
-                <div className="grid h-[calc(100vh-492px)] min-h-[440px] content-start gap-3 overflow-y-auto overflow-x-hidden rounded-lg border bg-card p-3">
+                <div
+                  ref={messageListRef}
+                  onPointerDown={cancelPendingBottomScroll}
+                  onScroll={cancelPendingBottomScroll}
+                  onTouchStart={cancelPendingBottomScroll}
+                  onWheel={cancelPendingBottomScroll}
+                  className="grid h-[calc(100vh-492px)] min-h-[440px] content-start gap-3 overflow-y-auto overflow-x-hidden rounded-lg border bg-card p-3"
+                >
                   {!selectedWxid ? (
                     <EmptyState icon={<MessageCircle className="h-5 w-5" />} text="请从好友列表选择一个对象" />
                   ) : messages.length === 0 ? (

@@ -6,6 +6,8 @@ import java.util.Locale;
 
 /** Parses the configured gateway origin once so HTTP and WebSocket share URL rules. */
 public final class GatewayEndpoint {
+    public static final String PRODUCTION_BASE_URL = "https://47.108.171.42/observatory";
+
     private final URL baseUrl;
     private final String base;
     private final boolean tls;

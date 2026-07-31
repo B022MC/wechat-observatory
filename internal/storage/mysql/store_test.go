@@ -20,6 +20,18 @@ func TestStoreImplementsBridgePersistence(t *testing.T) {
 	var _ bridge.ModuleLivenessChecker = (*Store)(nil)
 }
 
+func TestContactLimitCanCoverCompleteModuleSnapshot(t *testing.T) {
+	if got := normalizeLimit(10000); got != 500 {
+		t.Fatalf("shared read limit = %d, want 500", got)
+	}
+	if got := normalizeLimitUpTo(10000, 10000); got != 10000 {
+		t.Fatalf("contact read limit = %d, want 10000", got)
+	}
+	if got := normalizeLimitUpTo(10001, 10000); got != 10000 {
+		t.Fatalf("capped contact read limit = %d, want 10000", got)
+	}
+}
+
 func TestMySQLConfigUsesBeijingTime(t *testing.T) {
 	cfg, err := parseMySQLConfig("wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true&loc=UTC")
 	if err != nil {
