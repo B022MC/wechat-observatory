@@ -134,13 +134,16 @@ func TestLiveEventsReplaysDurableCursor(t *testing.T) {
 			To:        "wxid_self",
 			Text:      "replayed",
 			Direction: DirectionRecv,
+		}, {
+			Sequence: 5, EventKey: "evt_5", ID: "source-5", Device: "phone-b",
+			From: "wxid_other", To: "wxid_self", Text: "other device", Direction: DirectionRecv,
 		}},
 	}
 	service := newTestService("", WithAdminReader(tailer))
 	server := NewHTTPServer(service, "admin").Handler()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, "/api/live/events", nil).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodGet, "/api/live/events?device=phone-a", nil).WithContext(ctx)
 	req.Header.Set("X-Bridge-Password", "admin")
 	req.Header.Set("Last-Event-ID", "3")
 	rec := newSSERecorder()
@@ -157,6 +160,9 @@ func TestLiveEventsReplaysDurableCursor(t *testing.T) {
 			t.Fatalf("durable event was not replayed: %s", rec.String())
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+	if strings.Contains(rec.String(), "other device") {
+		t.Fatalf("durable stream leaked another device event: %s", rec.String())
 	}
 	cancel()
 	select {
@@ -856,9 +862,9 @@ func TestAdminReadEndpointsUsePersistentReader(t *testing.T) {
 	}{
 		{path: "/api/api-keys?limit=1", want: `"api_keys"`},
 		{path: "/api/stored-events?limit=1", want: `"events"`},
-		{path: "/api/messages?device=phone-a&wxid=wxid_friend&limit=1", want: `"messages"`},
+		{path: "/api/messages?device=phone-a&wxid=wxid_friend&after_id=8&limit=1", want: `"messages"`},
 		{path: "/api/modules/status", want: `"modules"`},
-		{path: "/api/module-contacts?device=phone-a&q=Friend&limit=1", want: `"contacts"`},
+		{path: "/api/module-contacts?device=phone-a&wxid=wxid_friend&q=Friend&limit=1", want: `"contacts"`},
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
@@ -871,6 +877,20 @@ func TestAdminReadEndpointsUsePersistentReader(t *testing.T) {
 	}
 	if got := strings.Join(reader.calls, ","); !strings.Contains(got, "keys:1") || !strings.Contains(got, "events:1") || !strings.Contains(got, "messages:phone-a:wxid_friend:1") || !strings.Contains(got, "modules") || !strings.Contains(got, "contacts:phone-a:Friend:1") {
 		t.Fatalf("persistent reader was not used as expected: %+v", reader.calls)
+	}
+	if !reader.lastMessageFilter.AfterIDSet || reader.lastMessageFilter.AfterID != 8 {
+		t.Fatalf("message cursor filter was not forwarded: %+v", reader.lastMessageFilter)
+	}
+	if reader.lastContactFilter.WxID != "wxid_friend" {
+		t.Fatalf("exact contact filter was not forwarded: %+v", reader.lastContactFilter)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/messages?after_id=-1", nil)
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("negative after_id status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1556,12 +1576,14 @@ func (r *sseRecorder) String() string {
 }
 
 type fakeAdminReader struct {
-	keys     []APIKeyView
-	events   []StoredEventView
-	messages []StoredEventView
-	modules  []ModuleStatusView
-	contacts []ModuleContactView
-	calls    []string
+	keys              []APIKeyView
+	events            []StoredEventView
+	messages          []StoredEventView
+	modules           []ModuleStatusView
+	contacts          []ModuleContactView
+	calls             []string
+	lastMessageFilter MessageFilter
+	lastContactFilter ModuleContactFilter
 }
 
 type fakeMetricsAdminReader struct {
@@ -1584,10 +1606,10 @@ func (r *fakeEventTailReader) LatestLiveEventID(context.Context) (int64, error) 
 	return r.latest, nil
 }
 
-func (r *fakeEventTailReader) ListLiveEventsAfter(_ context.Context, afterID int64, _ int) ([]MessageEvent, error) {
+func (r *fakeEventTailReader) ListLiveEventsAfter(_ context.Context, afterID int64, device string, _ int) ([]MessageEvent, error) {
 	out := make([]MessageEvent, 0, len(r.events))
 	for _, event := range r.events {
-		if event.Sequence > afterID {
+		if event.Sequence > afterID && (device == "" || event.Device == device) {
 			out = append(out, event)
 		}
 	}
@@ -1605,6 +1627,7 @@ func (r *fakeAdminReader) ListStoredEvents(_ context.Context, limit int) ([]Stor
 }
 
 func (r *fakeAdminReader) ListMessages(_ context.Context, filter MessageFilter) ([]StoredEventView, error) {
+	r.lastMessageFilter = filter
 	r.calls = append(r.calls, "messages:"+filter.Device+":"+filter.WxID+":"+strconv.Itoa(filter.Limit))
 	return r.messages, nil
 }
@@ -1615,6 +1638,7 @@ func (r *fakeAdminReader) ListModuleStatuses(_ context.Context) ([]ModuleStatusV
 }
 
 func (r *fakeAdminReader) ListModuleContacts(_ context.Context, filter ModuleContactFilter) ([]ModuleContactView, error) {
+	r.lastContactFilter = filter
 	r.calls = append(r.calls, "contacts:"+filter.Device+":"+filter.Query+":"+strconv.Itoa(filter.Limit))
 	return r.contacts, nil
 }

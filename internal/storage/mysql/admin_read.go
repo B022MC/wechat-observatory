@@ -69,15 +69,22 @@ func (s *Store) LatestLiveEventID(ctx context.Context) (int64, error) {
 	return id, err
 }
 
-func (s *Store) ListLiveEventsAfter(ctx context.Context, afterID int64, limit int) ([]bridge.MessageEvent, error) {
+func (s *Store) ListLiveEventsAfter(ctx context.Context, afterID int64, device string, limit int) ([]bridge.MessageEvent, error) {
+	conditions := []string{"id > ?"}
+	args := []any{afterID}
+	if device = strings.TrimSpace(device); device != "" {
+		conditions = append(conditions, "device = ?")
+		args = append(args, device)
+	}
+	args = append(args, normalizeLimit(limit))
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid,
 			direction, from_wxid, to_wxid, room_id, sender_wxid, text, message_type,
 			media_kind, media_mime, media_name, media_url, media_size, raw_provider, create_time
 		FROM bridge_message_events
-		WHERE id > ?
+		WHERE `+strings.Join(conditions, " AND ")+`
 		ORDER BY id ASC
-		LIMIT ?`, afterID, normalizeLimit(limit))
+		LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +123,10 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 		conditions = append(conditions, "owner_wxid = ?")
 		args = append(args, ownerWxID)
 	}
+	if filter.AfterIDSet {
+		conditions = append(conditions, "id > ?")
+		args = append(args, filter.AfterID)
+	}
 	chatID := strings.TrimSpace(filter.ChatID)
 	if chatID == "" {
 		chatID = strings.TrimSpace(filter.WxID)
@@ -137,6 +148,10 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 		conditions = append(conditions, "(from_wxid = ? OR to_wxid = ? OR room_id = ? OR sender_wxid = ?)")
 		args = append(args, wxid, wxid, wxid, wxid)
 	}
+	order := "DESC"
+	if filter.AfterIDSet {
+		order = "ASC"
+	}
 	args = append(args, normalizeLimit(filter.Limit))
 	return `
 		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
@@ -144,7 +159,7 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 			media_mime, media_name, media_url, media_size, raw_provider, create_time, created_at
 		FROM bridge_message_events
 		WHERE ` + strings.Join(conditions, " AND ") + `
-		ORDER BY id DESC
+		ORDER BY id ` + order + `
 		LIMIT ?`, args
 }
 
@@ -205,6 +220,7 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 		}.Normalize()
 		item.ChatID = event.ChatID()
 		item.ChatKind = string(event.Kind())
+		item.SequenceID = item.ID
 		item.CreatedAt = formatTime(createdAt)
 		out = append(out, item)
 	}
@@ -405,35 +421,8 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 }
 
 func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleContactFilter) ([]bridge.ModuleContactView, error) {
-	limit := normalizeLimitUpTo(filter.Limit, 10000)
-	conditions := []string{"1=1"}
-	args := []any{}
-	if device := strings.TrimSpace(filter.Device); device != "" {
-		conditions = append(conditions, "device = ?")
-		args = append(args, device)
-	}
-	if ownerWxID := strings.TrimSpace(filter.OwnerWxID); ownerWxID != "" {
-		conditions = append(conditions, "owner_wxid = ?")
-		args = append(args, ownerWxID)
-	}
-	if !filter.IncludeDeleted {
-		conditions = append(conditions, "is_deleted = FALSE")
-	}
-	if query := strings.TrimSpace(filter.Query); query != "" {
-		like := "%" + query + "%"
-		conditions = append(conditions, "(wxid LIKE ? OR nickname LIKE ? OR remark LIKE ? OR contact_alias LIKE ?)")
-		args = append(args, like, like, like, like)
-	}
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, device, owner_wxid, wxid, nickname, remark, contact_alias,
-			contact_type, verify_flag, is_chatroom, is_deleted, last_seen_at, updated_at
-		FROM bridge_module_contacts
-		WHERE `+strings.Join(conditions, " AND ")+`
-		ORDER BY is_deleted ASC,
-			COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), wxid) ASC,
-			id ASC
-		LIMIT ?`, args...)
+	query, args := listModuleContactsQuery(filter)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -471,6 +460,42 @@ func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleCont
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func listModuleContactsQuery(filter bridge.ModuleContactFilter) (string, []any) {
+	limit := normalizeLimitUpTo(filter.Limit, 10000)
+	conditions := []string{"1=1"}
+	args := []any{}
+	if device := strings.TrimSpace(filter.Device); device != "" {
+		conditions = append(conditions, "device = ?")
+		args = append(args, device)
+	}
+	if ownerWxID := strings.TrimSpace(filter.OwnerWxID); ownerWxID != "" {
+		conditions = append(conditions, "owner_wxid = ?")
+		args = append(args, ownerWxID)
+	}
+	if wxid := strings.TrimSpace(filter.WxID); wxid != "" {
+		conditions = append(conditions, "wxid = ?")
+		args = append(args, wxid)
+	}
+	if !filter.IncludeDeleted {
+		conditions = append(conditions, "is_deleted = FALSE")
+	}
+	if query := strings.TrimSpace(filter.Query); query != "" {
+		like := "%" + query + "%"
+		conditions = append(conditions, "(wxid LIKE ? OR nickname LIKE ? OR remark LIKE ? OR contact_alias LIKE ?)")
+		args = append(args, like, like, like, like)
+	}
+	args = append(args, limit)
+	return `
+		SELECT id, device, owner_wxid, wxid, nickname, remark, contact_alias,
+			contact_type, verify_flag, is_chatroom, is_deleted, last_seen_at, updated_at
+		FROM bridge_module_contacts
+		WHERE ` + strings.Join(conditions, " AND ") + `
+		ORDER BY is_deleted ASC,
+			COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), wxid) ASC,
+			id ASC
+		LIMIT ?`, args
 }
 
 func normalizeLimit(limit int) int {

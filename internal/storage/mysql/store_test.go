@@ -83,7 +83,7 @@ func TestMigrationsCoverCoreTables(t *testing.T) {
 			t.Fatalf("migration missing %q: %s", want, joined)
 		}
 	}
-	for _, want := range []string{"idx_bridge_message_events_retention", "idx_bridge_module_outbox_retention"} {
+	for _, want := range []string{"idx_bridge_message_events_retention", "idx_bridge_module_outbox_retention", "idx_bridge_message_events_device_id"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("migration missing retention index %q", want)
 		}
@@ -220,6 +220,30 @@ func TestListMessagesQueryFiltersByOwnerWxID(t *testing.T) {
 	}
 	if args[0] != bridge.RawProviderModuleAck || args[1] != "phone-a" || args[2] != "wxid_current" || args[3] != 25 {
 		t.Fatalf("owner filter args mismatch: %#v", args)
+	}
+}
+
+func TestListMessagesQuerySupportsIncrementalRecovery(t *testing.T) {
+	query, args := listMessagesQuery(bridge.MessageFilter{
+		Device: "phone-a", AfterID: 123, AfterIDSet: true, Limit: 100,
+	})
+	if !strings.Contains(query, "id > ?") || !strings.Contains(query, "ORDER BY id ASC") {
+		t.Fatalf("incremental message query is not cursor ordered: %s", query)
+	}
+	if len(args) != 4 || args[0] != bridge.RawProviderModuleAck || args[1] != "phone-a" || args[2] != int64(123) || args[3] != 100 {
+		t.Fatalf("incremental message args mismatch: %#v", args)
+	}
+}
+
+func TestListModuleContactsQuerySupportsExactWxID(t *testing.T) {
+	query, args := listModuleContactsQuery(bridge.ModuleContactFilter{
+		Device: "phone-a", OwnerWxID: "wxid_owner", WxID: "wxid_friend", Limit: 1,
+	})
+	if !strings.Contains(query, "wxid = ?") || strings.Contains(query, "wxid LIKE ?") {
+		t.Fatalf("exact contact query is not indexable: %s", query)
+	}
+	if len(args) != 4 || args[0] != "phone-a" || args[1] != "wxid_owner" || args[2] != "wxid_friend" || args[3] != 1 {
+		t.Fatalf("exact contact args mismatch: %#v", args)
 	}
 }
 

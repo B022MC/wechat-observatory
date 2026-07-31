@@ -116,7 +116,18 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureRetentionIndexes(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureMessageEventDeviceCursorIndex(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureMessageEventDeviceCursorIndex(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE INDEX idx_bridge_message_events_device_id ON bridge_message_events (device, id)`)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
+		return nil
+	}
+	return err
 }
 
 const messageEventOwnerBackfillStatement = `
@@ -338,6 +349,7 @@ func Migrations() []string {
 			create_time BIGINT NOT NULL,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			KEY idx_bridge_message_events_device_time (device, create_time),
+			KEY idx_bridge_message_events_device_id (device, id),
 			KEY idx_bridge_message_events_owner_time (device, owner_wxid, id),
 			KEY idx_bridge_message_events_chat_record (chat_record_id),
 			KEY idx_bridge_message_events_direction (direction),

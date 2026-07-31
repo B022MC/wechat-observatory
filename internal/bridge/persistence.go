@@ -22,7 +22,7 @@ type Persistence interface {
 // EventTailReader supplies durable SSE replay for any HTTP replica.
 type EventTailReader interface {
 	LatestLiveEventID(ctx context.Context) (int64, error)
-	ListLiveEventsAfter(ctx context.Context, afterID int64, limit int) ([]MessageEvent, error)
+	ListLiveEventsAfter(ctx context.Context, afterID int64, device string, limit int) ([]MessageEvent, error)
 }
 
 type DeviceLocator interface {
@@ -133,6 +133,7 @@ type APIKeyView struct {
 
 type StoredEventView struct {
 	ID           int64  `json:"id"`
+	SequenceID   int64  `json:"sequence_id"`
 	EventKey     string `json:"event_key,omitempty"`
 	SourceID     string `json:"source_id,omitempty"`
 	EventID      int64  `json:"event_id,omitempty"`
@@ -159,12 +160,14 @@ type StoredEventView struct {
 }
 
 type MessageFilter struct {
-	Device    string
-	WxID      string
-	OwnerWxID string
-	ChatID    string
-	ChatKind  string
-	Limit     int
+	Device     string
+	WxID       string
+	OwnerWxID  string
+	ChatID     string
+	ChatKind   string
+	AfterID    int64
+	AfterIDSet bool
+	Limit      int
 }
 
 type ModuleActivity struct {
@@ -182,6 +185,7 @@ type ModuleActivity struct {
 type ModuleContactFilter struct {
 	Device         string
 	OwnerWxID      string
+	WxID           string
 	Query          string
 	IncludeDeleted bool
 	Limit          int

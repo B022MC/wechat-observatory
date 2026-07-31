@@ -284,13 +284,20 @@ func (s *HTTPServer) messages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"messages": []StoredEventView{}})
 		return
 	}
+	afterID, err := nonNegativeInt64Query(r, "after_id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_after_id", err.Error())
+		return
+	}
 	filter := MessageFilter{
-		Device:    strings.TrimSpace(r.URL.Query().Get("device")),
-		WxID:      strings.TrimSpace(r.URL.Query().Get("wxid")),
-		OwnerWxID: strings.TrimSpace(r.URL.Query().Get("owner_wxid")),
-		ChatID:    strings.TrimSpace(r.URL.Query().Get("chat_id")),
-		ChatKind:  strings.TrimSpace(r.URL.Query().Get("chat_kind")),
-		Limit:     queryLimit(r, 100),
+		Device:     strings.TrimSpace(r.URL.Query().Get("device")),
+		WxID:       strings.TrimSpace(r.URL.Query().Get("wxid")),
+		OwnerWxID:  strings.TrimSpace(r.URL.Query().Get("owner_wxid")),
+		ChatID:     strings.TrimSpace(r.URL.Query().Get("chat_id")),
+		ChatKind:   strings.TrimSpace(r.URL.Query().Get("chat_kind")),
+		AfterID:    afterID,
+		AfterIDSet: strings.TrimSpace(r.URL.Query().Get("after_id")) != "",
+		Limit:      queryLimit(r, 100),
 	}
 	if filter.OwnerWxID == "" && filter.Device != "" {
 		filter.OwnerWxID = s.service.deviceWxID(r.Context(), filter.Device)
@@ -370,9 +377,10 @@ func (s *HTTPServer) liveDurableEvents(w http.ResponseWriter, r *http.Request, f
 	defer poll.Stop()
 	defer ping.Stop()
 
+	device := strings.TrimSpace(r.URL.Query().Get("device"))
 	drain := func() bool {
 		for {
-			events, err := tailer.ListLiveEventsAfter(r.Context(), cursor, 100)
+			events, err := tailer.ListLiveEventsAfter(r.Context(), cursor, device, 100)
 			if err != nil {
 				writeSSE(w, "error", map[string]any{"code": "event_tail_failed", "message": err.Error()})
 				flusher.Flush()
@@ -446,6 +454,7 @@ func (s *HTTPServer) moduleContacts(w http.ResponseWriter, r *http.Request) {
 	filter := ModuleContactFilter{
 		Device:         strings.TrimSpace(r.URL.Query().Get("device")),
 		OwnerWxID:      strings.TrimSpace(r.URL.Query().Get("owner_wxid")),
+		WxID:           strings.TrimSpace(r.URL.Query().Get("wxid")),
 		Query:          strings.TrimSpace(r.URL.Query().Get("q")),
 		IncludeDeleted: parseBoolQuery(r.URL.Query().Get("include_deleted")),
 		Limit:          queryLimitUpTo(r, 100, 10000),
@@ -456,6 +465,18 @@ func (s *HTTPServer) moduleContacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"contacts": contacts})
+}
+
+func nonNegativeInt64Query(r *http.Request, name string) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(name))
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	return value, nil
 }
 
 func (s *HTTPServer) moduleStatusViews() []ModuleStatusView {
