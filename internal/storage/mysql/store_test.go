@@ -83,9 +83,55 @@ func TestMigrationsCoverCoreTables(t *testing.T) {
 			t.Fatalf("migration missing %q: %s", want, joined)
 		}
 	}
-	for _, want := range []string{"idx_bridge_message_events_retention", "idx_bridge_module_outbox_retention", "idx_bridge_message_events_device_id"} {
+	for _, want := range []string{
+		"idx_bridge_message_events_retention",
+		"idx_bridge_module_outbox_retention",
+		"idx_bridge_message_events_device_id",
+		"idx_bridge_message_events_device_direction_created",
+		"idx_bridge_message_events_device_direction_provider_created",
+	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("migration missing retention index %q", want)
+			t.Fatalf("migration missing index %q", want)
+		}
+	}
+}
+
+func TestModuleStatusQueryUsesBoundedLatestEventLookups(t *testing.T) {
+	baseQuery := strings.Join(strings.Fields(listModuleStatusesStatement), " ")
+	if strings.Contains(baseQuery, "bridge_message_events") {
+		t.Fatalf("base module status query still reads message history: %s", baseQuery)
+	}
+	query := strings.Join(strings.Fields(latestModuleEventTimesStatement), " ")
+	for _, want := range []string{
+		"WHERE latest_event.device = ? ORDER BY latest_event.create_time DESC LIMIT 1",
+		"WHERE inbound.device = ? AND inbound.direction = 'recv' ORDER BY inbound.created_at DESC LIMIT 1",
+		"outbound.direction = 'sent'",
+		"outbound.raw_provider = ?",
+		"ORDER BY outbound.created_at DESC LIMIT 1",
+	} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("module status query missing bounded lookup %q: %s", want, query)
+		}
+	}
+	for _, forbidden := range []string{
+		"MAX(created_at)",
+		"GROUP BY device",
+		"MAX(CASE WHEN direction",
+	} {
+		if strings.Contains(query, forbidden) {
+			t.Fatalf("module status query retains global message aggregate %q: %s", forbidden, query)
+		}
+	}
+}
+
+func TestModuleStatusIndexUpgradeStatementsMatchQueryFilters(t *testing.T) {
+	joined := strings.Join(messageEventModuleStatusIndexStatements, "\n")
+	for _, want := range []string{
+		"(device, direction, created_at)",
+		"(device, direction, raw_provider, created_at)",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("module status index upgrade missing %q: %s", want, joined)
 		}
 	}
 }

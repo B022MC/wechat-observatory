@@ -119,6 +119,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureMessageEventDeviceCursorIndex(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureMessageEventModuleStatusIndexes(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -128,6 +131,23 @@ func (s *Store) ensureMessageEventDeviceCursorIndex(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+var messageEventModuleStatusIndexStatements = []string{
+	`CREATE INDEX idx_bridge_message_events_device_direction_created ON bridge_message_events (device, direction, created_at)`,
+	`CREATE INDEX idx_bridge_message_events_device_direction_provider_created ON bridge_message_events (device, direction, raw_provider, created_at)`,
+}
+
+func (s *Store) ensureMessageEventModuleStatusIndexes(ctx context.Context) error {
+	for _, statement := range messageEventModuleStatusIndexStatements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 const messageEventOwnerBackfillStatement = `
@@ -350,6 +370,8 @@ func Migrations() []string {
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			KEY idx_bridge_message_events_device_time (device, create_time),
 			KEY idx_bridge_message_events_device_id (device, id),
+			KEY idx_bridge_message_events_device_direction_created (device, direction, created_at),
+			KEY idx_bridge_message_events_device_direction_provider_created (device, direction, raw_provider, created_at),
 			KEY idx_bridge_message_events_owner_time (device, owner_wxid, id),
 			KEY idx_bridge_message_events_chat_record (chat_record_id),
 			KEY idx_bridge_message_events_direction (direction),

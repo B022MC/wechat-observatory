@@ -281,8 +281,7 @@ func scanMessageEvent(row rowScanner) (bridge.MessageEvent, error) {
 	return event.Normalize(), nil
 }
 
-func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusView, error) {
-	rows, err := s.db.QueryContext(ctx, `
+const listModuleStatusesStatement = `
 		SELECT ak.device, d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), ak.enabled, d.updated_at,
 			rt.last_register_at,
 			rt.last_poll_at,
@@ -302,10 +301,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			obs.last_outbox_id,
 			last_ob.status,
 			last_ob.last_error,
-			last_ob.updated_at,
-			ev.last_event_at,
-			ev.last_inbound_at,
-			ev.last_outbound_ack_at
+			last_ob.updated_at
 		FROM bridge_api_keys ak
 		LEFT JOIN bridge_devices d
 			ON d.name = ak.device
@@ -324,16 +320,56 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		) obs ON obs.device = ak.device AND obs.owner_wxid = d.wxid
 		LEFT JOIN bridge_module_outbox last_ob
 			ON last_ob.id = obs.last_outbox_id
-		LEFT JOIN (
-			SELECT device,
-				MAX(created_at) AS last_event_at,
-				MAX(CASE WHEN direction = 'recv' THEN created_at ELSE NULL END) AS last_inbound_at,
-				MAX(CASE WHEN direction = 'sent' AND raw_provider = ? THEN created_at ELSE NULL END) AS last_outbound_ack_at
-			FROM bridge_message_events
-			GROUP BY device
-		) ev ON ev.device = ak.device
 		WHERE ak.device IS NOT NULL AND ak.device <> ''
-		ORDER BY ak.device ASC`, bridge.RawProviderModuleAck)
+		ORDER BY ak.device ASC`
+
+const latestModuleEventTimesStatement = `
+	SELECT
+		(
+			SELECT latest_event.created_at
+			FROM bridge_message_events latest_event
+			WHERE latest_event.device = ?
+			ORDER BY latest_event.create_time DESC
+			LIMIT 1
+		),
+		(
+			SELECT inbound.created_at
+			FROM bridge_message_events inbound
+			WHERE inbound.device = ? AND inbound.direction = 'recv'
+			ORDER BY inbound.created_at DESC
+			LIMIT 1
+		),
+		(
+			SELECT outbound.created_at
+			FROM bridge_message_events outbound
+			WHERE outbound.device = ?
+				AND outbound.direction = 'sent'
+				AND outbound.raw_provider = ?
+			ORDER BY outbound.created_at DESC
+			LIMIT 1
+		)`
+
+type moduleEventTimes struct {
+	lastEventAt       sql.NullTime
+	lastInboundAt     sql.NullTime
+	lastOutboundAckAt sql.NullTime
+}
+
+func (s *Store) latestModuleEventTimes(ctx context.Context, device string) (moduleEventTimes, error) {
+	var times moduleEventTimes
+	err := s.db.QueryRowContext(
+		ctx,
+		latestModuleEventTimesStatement,
+		device,
+		device,
+		device,
+		bridge.RawProviderModuleAck,
+	).Scan(&times.lastEventAt, &times.lastInboundAt, &times.lastOutboundAckAt)
+	return times, err
+}
+
+func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusView, error) {
+	rows, err := s.db.QueryContext(ctx, listModuleStatusesStatement)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +383,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		var runtimeError, runtimeAPIKey, activeAPIKey sql.NullString
 		var deviceUpdatedAt sql.NullTime
 		var lastRegisterAt, lastPollAt, lastAckAt, runtimeUpdatedAt sql.NullTime
-		var lastOutboxUpdated, lastEventAt, lastInboundAt, lastOutboundAckAt sql.NullTime
+		var lastOutboxUpdated sql.NullTime
 		var lastPollLimit, lastPollItemCount, lastAckSentCount, lastAckFailedCount sql.NullInt64
 		var pending, leased, sent, failed int64
 		var lastOutboxID sql.NullInt64
@@ -377,9 +413,6 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			&lastOutboxStatus,
 			&lastOutboxError,
 			&lastOutboxUpdated,
-			&lastEventAt,
-			&lastInboundAt,
-			&lastOutboundAckAt,
 		); err != nil {
 			return nil, err
 		}
@@ -406,9 +439,6 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		item.LastOutboxStatus = lastOutboxStatus.String
 		item.LastOutboxError = lastOutboxError.String
 		item.LastOutboxUpdated = formatNullTime(lastOutboxUpdated)
-		item.LastEventAt = formatNullTime(lastEventAt)
-		item.LastInboundAt = formatNullTime(lastInboundAt)
-		item.LastOutboundAckAt = formatNullTime(lastOutboundAckAt)
 		item.RuntimeUpdatedAt = formatNullTime(runtimeUpdatedAt)
 		item.DeviceUpdatedAt = formatNullTime(deviceUpdatedAt)
 		if item.LastOutboxError == "" {
@@ -417,7 +447,28 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		item.NormalizeRuntimeStatus()
 		out = append(out, item)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	timesByDevice := make(map[string]moduleEventTimes, len(out))
+	for index := range out {
+		times, ok := timesByDevice[out[index].Device]
+		if !ok {
+			times, err = s.latestModuleEventTimes(ctx, out[index].Device)
+			if err != nil {
+				return nil, err
+			}
+			timesByDevice[out[index].Device] = times
+		}
+		out[index].LastEventAt = formatNullTime(times.lastEventAt)
+		out[index].LastInboundAt = formatNullTime(times.lastInboundAt)
+		out[index].LastOutboundAckAt = formatNullTime(times.lastOutboundAckAt)
+	}
+	return out, nil
 }
 
 func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleContactFilter) ([]bridge.ModuleContactView, error) {
