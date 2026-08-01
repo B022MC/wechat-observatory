@@ -1,6 +1,10 @@
 package mysql
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -290,6 +294,150 @@ func TestListModuleContactsQuerySupportsExactWxID(t *testing.T) {
 	}
 	if len(args) != 4 || args[0] != "phone-a" || args[1] != "wxid_owner" || args[2] != "wxid_friend" || args[3] != 1 {
 		t.Fatalf("exact contact args mismatch: %#v", args)
+	}
+}
+
+type moduleContactExecCall struct {
+	query string
+	args  []any
+}
+
+type recordingModuleContactExecer struct {
+	calls  []moduleContactExecCall
+	failAt int
+}
+
+func (r *recordingModuleContactExecer) ExecContext(_ context.Context, query string, args ...any) (sql.Result, error) {
+	r.calls = append(r.calls, moduleContactExecCall{query: query, args: append([]any(nil), args...)})
+	if r.failAt > 0 && len(r.calls) == r.failAt {
+		return nil, errors.New("planned contact write failure")
+	}
+	return driver.RowsAffected(1), nil
+}
+
+func TestRecordModuleContactsBatchesAndDeletesOnlyMissingOwnerRows(t *testing.T) {
+	contacts := make([]bridge.ModuleContact, 0, 1203)
+	for index := range 1201 {
+		contacts = append(contacts, bridge.ModuleContact{WxID: fmt.Sprintf("wxid-%04d", index), Nickname: "original"})
+	}
+	contacts = append(contacts,
+		bridge.ModuleContact{WxID: "  ", Nickname: "ignored"},
+		bridge.ModuleContact{WxID: " wxid-0000 ", Nickname: " final ", Deleted: true},
+	)
+
+	execer := &recordingModuleContactExecer{}
+	err := recordModuleContacts(context.Background(), execer, bridge.ModuleContactSnapshotRequest{
+		Device: " phone-a ", WxID: " owner-a ", Complete: true, Contacts: contacts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(execer.calls) != 4 {
+		t.Fatalf("contact statements=%d, want three upserts and one delete", len(execer.calls))
+	}
+	for index, wantRows := range []int{500, 500, 201} {
+		call := execer.calls[index]
+		if !strings.Contains(call.query, "INSERT INTO bridge_module_contacts") {
+			t.Fatalf("statement %d is not an upsert: %s", index, call.query)
+		}
+		if len(call.args) != wantRows*10 {
+			t.Fatalf("statement %d args=%d, want %d", index, len(call.args), wantRows*10)
+		}
+		if placeholders := strings.Count(call.query, "?"); placeholders != len(call.args) {
+			t.Fatalf("statement %d placeholders=%d args=%d", index, placeholders, len(call.args))
+		}
+	}
+	first := execer.calls[0].args
+	if first[0] != "phone-a" || first[1] != (sql.NullString{String: "owner-a", Valid: true}) ||
+		first[2] != "wxid-0000" || first[3] != (sql.NullString{String: "final", Valid: true}) || first[9] != true {
+		t.Fatalf("deduplicated first contact args=%#v", first[:10])
+	}
+	deletion := execer.calls[3]
+	normalized := strings.Join(strings.Fields(deletion.query), " ")
+	for _, want := range []string{"WHERE device = ?", "owner_wxid = ?", "wxid NOT IN", "is_deleted = FALSE"} {
+		if !strings.Contains(normalized, want) {
+			t.Fatalf("missing-owner deletion does not contain %q: %s", want, normalized)
+		}
+	}
+	if len(deletion.args) != 1203 || deletion.args[0] != "phone-a" || deletion.args[1] != "owner-a" {
+		t.Fatalf("deletion args=%d first=%#v", len(deletion.args), deletion.args[:2])
+	}
+}
+
+func TestRecordModuleContactsPreservesLegacyEmptyOwnerPreDelete(t *testing.T) {
+	execer := &recordingModuleContactExecer{}
+	err := recordModuleContacts(context.Background(), execer, bridge.ModuleContactSnapshotRequest{
+		Device: "phone-a", Complete: true,
+		Contacts: []bridge.ModuleContact{{WxID: "filehelper", Nickname: "File Helper"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(execer.calls) != 2 {
+		t.Fatalf("contact statements=%d, want pre-delete and upsert", len(execer.calls))
+	}
+	deletion := strings.Join(strings.Fields(execer.calls[0].query), " ")
+	if !strings.Contains(deletion, "UPDATE bridge_module_contacts") || strings.Contains(deletion, "owner_wxid") || strings.Contains(deletion, "NOT IN") {
+		t.Fatalf("legacy empty-owner deletion changed scope: %s", deletion)
+	}
+	if len(execer.calls[0].args) != 1 || execer.calls[0].args[0] != "phone-a" {
+		t.Fatalf("legacy deletion args=%#v", execer.calls[0].args)
+	}
+	if !strings.Contains(execer.calls[1].query, "INSERT INTO bridge_module_contacts") ||
+		execer.calls[1].args[1] != (sql.NullString{}) {
+		t.Fatalf("empty-owner upsert=%+v", execer.calls[1])
+	}
+}
+
+func TestRecordModuleContactsPartialAndEmptyCompleteSnapshots(t *testing.T) {
+	partial := &recordingModuleContactExecer{}
+	if err := recordModuleContacts(context.Background(), partial, bridge.ModuleContactSnapshotRequest{
+		Device: "phone-a", WxID: "owner-a",
+		Contacts: []bridge.ModuleContact{{WxID: ""}, {WxID: "deleted-contact", Deleted: true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(partial.calls) != 1 || !strings.Contains(partial.calls[0].query, "INSERT INTO bridge_module_contacts") {
+		t.Fatalf("partial snapshot statements=%+v", partial.calls)
+	}
+	if len(partial.calls[0].args) != 10 || partial.calls[0].args[9] != true {
+		t.Fatalf("explicit deleted contact args=%#v", partial.calls[0].args)
+	}
+
+	emptyComplete := &recordingModuleContactExecer{}
+	if err := recordModuleContacts(context.Background(), emptyComplete, bridge.ModuleContactSnapshotRequest{
+		Device: "phone-a", WxID: "owner-a", Complete: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyComplete.calls) != 1 {
+		t.Fatalf("empty complete statements=%+v", emptyComplete.calls)
+	}
+	deletion := strings.Join(strings.Fields(emptyComplete.calls[0].query), " ")
+	if !strings.Contains(deletion, "owner_wxid = ?") || strings.Contains(deletion, "NOT IN") || !strings.Contains(deletion, "is_deleted = FALSE") {
+		t.Fatalf("empty complete deletion=%s", deletion)
+	}
+}
+
+func TestRecordModuleContactsStopsBeforeDeletionAfterBatchFailure(t *testing.T) {
+	contacts := make([]bridge.ModuleContact, 1201)
+	for index := range contacts {
+		contacts[index].WxID = fmt.Sprintf("wxid-%04d", index)
+	}
+	execer := &recordingModuleContactExecer{failAt: 2}
+	err := recordModuleContacts(context.Background(), execer, bridge.ModuleContactSnapshotRequest{
+		Device: "phone-a", WxID: "owner-a", Complete: true, Contacts: contacts,
+	})
+	if err == nil || !strings.Contains(err.Error(), "planned contact write failure") {
+		t.Fatalf("batch failure err=%v", err)
+	}
+	if len(execer.calls) != 2 {
+		t.Fatalf("statements after failed second batch=%d, want 2", len(execer.calls))
+	}
+	for _, call := range execer.calls {
+		if strings.Contains(call.query, "UPDATE bridge_module_contacts") {
+			t.Fatalf("missing-contact deletion ran after a failed batch: %s", call.query)
+		}
 	}
 }
 

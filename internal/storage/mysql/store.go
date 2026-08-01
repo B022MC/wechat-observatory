@@ -830,38 +830,63 @@ func (s *Store) RecordModuleActivity(ctx context.Context, activity bridge.Module
 	}
 }
 
-func (s *Store) RecordModuleContacts(ctx context.Context, snapshot bridge.ModuleContactSnapshotRequest) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-	device := strings.TrimSpace(snapshot.Device)
-	if snapshot.Complete {
-		query := `
-			UPDATE bridge_module_contacts
-			SET is_deleted = TRUE
-			WHERE device = ?`
-		args := []any{device}
-		if ownerWxID := strings.TrimSpace(snapshot.WxID); ownerWxID != "" {
-			query += ` AND owner_wxid = ?`
-			args = append(args, ownerWxID)
-		}
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-			return err
-		}
-	}
-	for _, contact := range snapshot.Contacts {
-		if strings.TrimSpace(contact.WxID) == "" {
+const moduleContactBatchSize = 500
+
+type moduleContactExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func normalizeModuleContacts(contacts []bridge.ModuleContact) []bridge.ModuleContact {
+	result := make([]bridge.ModuleContact, 0, len(contacts))
+	indexByWxID := make(map[string]int, len(contacts))
+	for _, contact := range contacts {
+		contact.WxID = strings.TrimSpace(contact.WxID)
+		contact.Nickname = strings.TrimSpace(contact.Nickname)
+		contact.Remark = strings.TrimSpace(contact.Remark)
+		contact.Alias = strings.TrimSpace(contact.Alias)
+		if contact.WxID == "" {
 			continue
 		}
-		_, err := tx.ExecContext(ctx, `
+		if index, ok := indexByWxID[contact.WxID]; ok {
+			result[index] = contact
+			continue
+		}
+		indexByWxID[contact.WxID] = len(result)
+		result = append(result, contact)
+	}
+	return result
+}
+
+func upsertModuleContactBatches(ctx context.Context, execer moduleContactExecer, device, ownerWxID string, contacts []bridge.ModuleContact) error {
+	for start := 0; start < len(contacts); start += moduleContactBatchSize {
+		end := min(start+moduleContactBatchSize, len(contacts))
+		batch := contacts[start:end]
+		var query strings.Builder
+		query.WriteString(`
 			INSERT INTO bridge_module_contacts (
 				device, owner_wxid, wxid, nickname, remark, contact_alias, contact_type,
 				verify_flag, is_chatroom, is_deleted, last_seen_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			) VALUES `)
+		args := make([]any, 0, len(batch)*10)
+		for index, contact := range batch {
+			if index > 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
+			args = append(args,
+				device,
+				nullString(ownerWxID),
+				contact.WxID,
+				nullString(contact.Nickname),
+				nullString(contact.Remark),
+				nullString(contact.Alias),
+				contact.Type,
+				contact.VerifyFlag,
+				contact.Chatroom,
+				contact.Deleted,
+			)
+		}
+		query.WriteString(`
 			ON DUPLICATE KEY UPDATE
 				owner_wxid = VALUES(owner_wxid),
 				nickname = VALUES(nickname),
@@ -871,21 +896,65 @@ func (s *Store) RecordModuleContacts(ctx context.Context, snapshot bridge.Module
 				verify_flag = VALUES(verify_flag),
 				is_chatroom = VALUES(is_chatroom),
 				is_deleted = VALUES(is_deleted),
-				last_seen_at = CURRENT_TIMESTAMP`,
-			device,
-			nullString(snapshot.WxID),
-			strings.TrimSpace(contact.WxID),
-			nullString(contact.Nickname),
-			nullString(contact.Remark),
-			nullString(contact.Alias),
-			contact.Type,
-			contact.VerifyFlag,
-			contact.Chatroom,
-			contact.Deleted,
-		)
-		if err != nil {
+				last_seen_at = CURRENT_TIMESTAMP`)
+		if _, err := execer.ExecContext(ctx, query.String(), args...); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func markModuleContactScopeDeleted(ctx context.Context, execer moduleContactExecer, device, ownerWxID string, present []bridge.ModuleContact) error {
+	query := `
+		UPDATE bridge_module_contacts
+		SET is_deleted = TRUE
+		WHERE device = ?`
+	args := []any{device}
+	if ownerWxID != "" {
+		query += ` AND owner_wxid = ?`
+		args = append(args, ownerWxID)
+	}
+	if len(present) > 0 {
+		query += ` AND wxid NOT IN (` + strings.TrimRight(strings.Repeat("?,", len(present)), ",") + `)`
+		for _, contact := range present {
+			args = append(args, contact.WxID)
+		}
+	}
+	if ownerWxID != "" {
+		query += ` AND is_deleted = FALSE`
+	}
+	_, err := execer.ExecContext(ctx, query, args...)
+	return err
+}
+
+func recordModuleContacts(ctx context.Context, execer moduleContactExecer, snapshot bridge.ModuleContactSnapshotRequest) error {
+	device := strings.TrimSpace(snapshot.Device)
+	ownerWxID := strings.TrimSpace(snapshot.WxID)
+	contacts := normalizeModuleContacts(snapshot.Contacts)
+	if snapshot.Complete && ownerWxID == "" {
+		if err := markModuleContactScopeDeleted(ctx, execer, device, "", nil); err != nil {
+			return err
+		}
+	}
+	if err := upsertModuleContactBatches(ctx, execer, device, ownerWxID, contacts); err != nil {
+		return err
+	}
+	if snapshot.Complete && ownerWxID != "" {
+		return markModuleContactScopeDeleted(ctx, execer, device, ownerWxID, contacts)
+	}
+	return nil
+}
+
+func (s *Store) RecordModuleContacts(ctx context.Context, snapshot bridge.ModuleContactSnapshotRequest) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if err := recordModuleContacts(ctx, tx, snapshot); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
