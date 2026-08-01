@@ -35,7 +35,7 @@ For `table == "message"`, it reads:
 Then it posts an event to:
 
 ```text
-POST https://47.108.171.42/observatory/webhook/lsposed/message
+POST https://pdwxgateway.xyz/observatory/webhook/lsposed/message
 ```
 
 Text messages are posted as their normalized text. Non-text message rows are
@@ -84,7 +84,7 @@ media_upload_limit_bytes=5242880
 
 Restart WeChat after changing config.
 
-The production URL is fixed to `https://47.108.171.42/observatory`. The module
+The production URL is fixed to `https://pdwxgateway.xyz/observatory`. The module
 ignores legacy `bridge_url` values, derives HTTPS API requests and the WSS
 outbox stream from the compiled URL, validates the system-trusted certificate,
 and keeps HTTP polling as the fallback when WSS is unavailable.
@@ -174,7 +174,7 @@ LIMIT ?
 It uploads ordinary friends plus the special `filehelper` conversation to:
 
 ```text
-POST https://47.108.171.42/observatory/module/contacts/snapshot
+POST https://pdwxgateway.xyz/observatory/module/contacts/snapshot
 ```
 
 with payload:

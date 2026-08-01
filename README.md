@@ -152,7 +152,7 @@ cd android-module
 
 ### 6. 手机模块配置
 
-在 Web 管理台生成 API Key，打开手机上的 **WeChat Observatory** 配置页。服务端已固定为正式环境 `https://47.108.171.42/observatory`，只需填写：
+在 Web 管理台生成 API Key，打开手机上的 **WeChat Observatory** 配置页。服务端已固定为正式环境 `https://pdwxgateway.xyz/observatory`，只需填写：
 
 - Web 管理台生成的 API Key
 

@@ -15,7 +15,7 @@ public final class GatewayEndpointTest {
 
         assertTrue(endpoint.isTls());
         assertEquals(443, endpoint.port());
-        assertEquals("47.108.171.42", endpoint.hostHeader());
+        assertEquals("pdwxgateway.xyz", endpoint.hostHeader());
         assertEquals("/observatory/module/outbox/ws?device=phone-a",
                 endpoint.requestPath("/module/outbox/ws?device=phone-a"));
     }

@@ -113,6 +113,6 @@ android-module/app/build/outputs/apk/debug/
 - API Key 是否存在。
 - API Key 是否被停用。
 - API Key 是否刚被删除后还在手机上继续使用。
-- 手机能否访问固定正式地址 `https://47.108.171.42/observatory`。
+- 手机能否访问固定正式地址 `https://pdwxgateway.xyz/observatory`。
 - LSPosed 作用域是否包含微信。
 - 修改模块配置后是否已经重启微信。
