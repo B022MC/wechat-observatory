@@ -15,7 +15,7 @@ public final class GatewayEndpointTest {
 
         assertTrue(endpoint.isTls());
         assertEquals(443, endpoint.port());
-        assertEquals("pdwxgateway.xyz", endpoint.hostHeader());
+        assertEquals("47.108.232.203", endpoint.hostHeader());
         assertEquals("/observatory/module/outbox/ws?device=phone-a",
                 endpoint.requestPath("/module/outbox/ws?device=phone-a"));
     }
@@ -33,5 +33,16 @@ public final class GatewayEndpointTest {
     @Test(expected = MalformedURLException.class)
     public void rejectsQueryInBaseUrl() throws Exception {
         GatewayEndpoint.parse("https://example.test/observatory?token=bad");
+    }
+
+    @Test
+    public void normalizesTrailingSlash() throws Exception {
+        assertEquals("https://example.test/observatory",
+                GatewayEndpoint.normalizeBaseUrl(" https://example.test/observatory/ "));
+    }
+
+    @Test(expected = MalformedURLException.class)
+    public void rejectsUserInfoInBaseUrl() throws Exception {
+        GatewayEndpoint.parse("https://user:password@example.test/observatory");
     }
 }

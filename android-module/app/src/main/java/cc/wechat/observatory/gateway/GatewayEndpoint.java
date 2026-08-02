@@ -6,7 +6,7 @@ import java.util.Locale;
 
 /** Parses the configured gateway origin once so HTTP and WebSocket share URL rules. */
 public final class GatewayEndpoint {
-    public static final String PRODUCTION_BASE_URL = "https://pdwxgateway.xyz/observatory";
+    public static final String PRODUCTION_BASE_URL = "https://47.108.232.203/observatory";
 
     private final URL baseUrl;
     private final String base;
@@ -36,10 +36,20 @@ public final class GatewayEndpoint {
         if (url.getHost() == null || url.getHost().isEmpty()) {
             throw new MalformedURLException("bridge URL host is empty");
         }
+        if (url.getUserInfo() != null) {
+            throw new MalformedURLException("bridge URL must not contain user info");
+        }
+        if (url.getPort() > 65535) {
+            throw new MalformedURLException("bridge URL port is invalid");
+        }
         if (url.getQuery() != null || url.getRef() != null) {
             throw new MalformedURLException("bridge URL must not contain a query or fragment");
         }
         return new GatewayEndpoint(url);
+    }
+
+    public static String normalizeBaseUrl(String value) throws MalformedURLException {
+        return parse(value).base;
     }
 
     public URL resolve(String path) throws MalformedURLException {

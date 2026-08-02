@@ -152,8 +152,9 @@ cd android-module
 
 ### 6. 手机模块配置
 
-在 Web 管理台生成 API Key，打开手机上的 **WeChat Observatory** 配置页。服务端已固定为正式环境 `https://pdwxgateway.xyz/observatory`，只需填写：
+在 Web 管理台生成 API Key，打开手机上的 **WeChat Observatory** 配置页，填写：
 
+- Observatory 服务地址，默认 `https://47.108.232.203/observatory`
 - Web 管理台生成的 API Key
 
 不要手动填写 `wxid`。模块会在微信进程内自动识别当前登录微信。

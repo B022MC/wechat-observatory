@@ -56,7 +56,7 @@ public final class BridgeConfig {
     static BridgeConfig fromProperties(Properties properties) {
         BridgeConfig config = new BridgeConfig();
         config.enabled = !"0".equals(setting(properties, "enabled", "1"));
-        config.baseUrl = GatewayEndpoint.PRODUCTION_BASE_URL;
+        config.baseUrl = baseUrlSetting(properties);
         config.device = "";
         config.selfWxid = "";
         config.apiKey = setting(properties, "api_key", "");
@@ -314,6 +314,15 @@ public final class BridgeConfig {
         }
     }
 
+    private static String baseUrlSetting(Properties properties) {
+        String value = setting(properties, "bridge_url", GatewayEndpoint.PRODUCTION_BASE_URL);
+        try {
+            return GatewayEndpoint.normalizeBaseUrl(value);
+        } catch (Throwable ignored) {
+            return GatewayEndpoint.PRODUCTION_BASE_URL;
+        }
+    }
+
     private static long longSetting(Properties properties, String name, long fallback) {
         try {
             String value = properties.getProperty(name);
@@ -340,6 +349,7 @@ public final class BridgeConfig {
         StringBuilder out = new StringBuilder();
         for (String key : new String[]{
                 "enabled",
+                "bridge_url",
                 "api_key",
                 "poll_interval_ms",
                 "poll_limit",

@@ -35,7 +35,7 @@ For `table == "message"`, it reads:
 Then it posts an event to:
 
 ```text
-POST https://pdwxgateway.xyz/observatory/webhook/lsposed/message
+POST <bridge_url>/webhook/lsposed/message
 ```
 
 Text messages are posted as their normalized text. Non-text message rows are
@@ -72,6 +72,7 @@ Example:
 
 ```properties
 enabled=1
+bridge_url=https://47.108.232.203/observatory
 api_key=wg_dev_key
 poll_interval_ms=1000
 poll_limit=1
@@ -84,10 +85,11 @@ media_upload_limit_bytes=5242880
 
 Restart WeChat after changing config.
 
-The production URL is fixed to `https://pdwxgateway.xyz/observatory`. The module
-ignores legacy `bridge_url` values, derives HTTPS API requests and the WSS
-outbox stream from the compiled URL, validates the system-trusted certificate,
-and keeps HTTP polling as the fallback when WSS is unavailable.
+The settings screen stores `bridge_url` and defaults it to
+`https://47.108.232.203/observatory`. The module derives API requests and the
+WebSocket outbox stream from that validated base URL. HTTPS uses the platform
+trust store and hostname verification; HTTP remains available only when it is
+explicitly configured. WebSocket failure keeps HTTP polling as the fallback.
 
 `poll_interval_ms` controls how often the module checks the gateway outbox.
 The worker currently sleeps at least 1000ms between polls, so values below
@@ -174,7 +176,7 @@ LIMIT ?
 It uploads ordinary friends plus the special `filehelper` conversation to:
 
 ```text
-POST https://pdwxgateway.xyz/observatory/module/contacts/snapshot
+POST <bridge_url>/module/contacts/snapshot
 ```
 
 with payload:

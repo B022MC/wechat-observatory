@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import cc.wechat.observatory.config.BridgeConfig;
+import cc.wechat.observatory.gateway.GatewayEndpoint;
 
 public final class SettingsActivity extends Activity {
     private static final String DEFAULT_POLL_INTERVAL_MS = "1000";
@@ -33,6 +34,7 @@ public final class SettingsActivity extends Activity {
 
     static {
         DEFAULTS.put("enabled", "1");
+        DEFAULTS.put("bridge_url", GatewayEndpoint.PRODUCTION_BASE_URL);
         DEFAULTS.put("api_key", "");
         DEFAULTS.put("poll_interval_ms", DEFAULT_POLL_INTERVAL_MS);
         DEFAULTS.put("poll_limit", DEFAULT_POLL_LIMIT);
@@ -75,6 +77,7 @@ public final class SettingsActivity extends Activity {
         hint.setPadding(0, 0, 0, dp(14));
         root.addView(hint);
 
+        addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addField(root, "api_key", R.string.label_api_key, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         maskSensitiveFields();
         addField(root, "poll_interval_ms", R.string.label_poll_interval, InputType.TYPE_CLASS_NUMBER);
@@ -141,9 +144,27 @@ public final class SettingsActivity extends Activity {
     }
 
     private void saveValues() {
+        EditText bridgeUrlField = fields.get("bridge_url");
+        String bridgeUrl = bridgeUrlField == null ? "" : bridgeUrlField.getText().toString().trim();
+        if (bridgeUrl.isEmpty()) {
+            bridgeUrl = GatewayEndpoint.PRODUCTION_BASE_URL;
+        }
+        try {
+            bridgeUrl = GatewayEndpoint.normalizeBaseUrl(bridgeUrl);
+        } catch (Throwable ignored) {
+            if (bridgeUrlField != null) {
+                bridgeUrlField.setError(getString(R.string.error_bridge_url_invalid));
+                bridgeUrlField.requestFocus();
+            }
+            Toast.makeText(this, R.string.error_bridge_url_invalid, Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (bridgeUrlField != null) {
+            bridgeUrlField.setText(bridgeUrl);
+        }
+
         SharedPreferences prefs = getSharedPreferences(BridgeConfigProvider.PREFS_NAME, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = prefs.edit();
-        editor.remove("bridge_url");
         for (String key : BridgeConfigProvider.CONFIG_KEYS) {
             if ("enabled".equals(key)) {
                 editor.putString(key, "1");

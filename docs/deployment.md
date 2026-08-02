@@ -50,9 +50,9 @@ curl -fsS http://127.0.0.1:8088/healthz
 https://<server-host>/admin/
 ```
 
-正式版手机模块固定使用 `https://pdwxgateway.xyz/observatory`。生产部署必须
-保证该地址由 Caddy 转发到内部 Observatory；主机上的 8088 只绑定本机，
-不能再作为公网入口。
+手机模块默认使用 `https://47.108.232.203/observatory`，也可在设置页填写
+其他完整的 Observatory 服务地址。生产部署应由 Caddy 将该公开地址转发到
+内部 Observatory；主机上的 8088 只绑定本机，不能再作为公网入口。
 
 ## 更新版本
 
