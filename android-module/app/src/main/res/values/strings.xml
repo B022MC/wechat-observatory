@@ -15,4 +15,6 @@
     <string name="label_contact_include_chatrooms">是否同步群聊 0/1</string>
     <string name="label_media_upload_enabled">是否上传媒体 0/1</string>
     <string name="label_media_upload_limit">媒体上传大小上限字节</string>
+    <string name="label_stale_message_grace">历史消息判定宽限毫秒</string>
+    <string name="label_stale_message_replay_limit">历史消息回灌上限</string>
 </resources>

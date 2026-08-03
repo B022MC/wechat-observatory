@@ -20,6 +20,8 @@ import de.robv.android.xposed.XSharedPreferences;
 
 public final class BridgeConfig {
     public static final int DEFAULT_CONTACT_SYNC_LIMIT = 10000;
+    public static final long DEFAULT_STALE_MESSAGE_GRACE_MS = 15L * 60L * 1000L;
+    public static final int DEFAULT_STALE_MESSAGE_REPLAY_LIMIT = 500;
 
     private static final String CONFIG_PROVIDER_URI = "content://cc.wechat.observatory.config/config";
     private static final String MODULE_PACKAGE = "cc.wechat.observatory";
@@ -41,6 +43,8 @@ public final class BridgeConfig {
     public boolean includeChatrooms;
     public boolean mediaUploadEnabled;
     public long mediaUploadLimitBytes;
+    public long staleMessageGraceMs;
+    public int staleMessageReplayLimit;
     public String signature;
 
     private BridgeConfig() {
@@ -68,6 +72,8 @@ public final class BridgeConfig {
         config.includeChatrooms = booleanSetting(properties, "contact_include_chatrooms", true);
         config.mediaUploadEnabled = booleanSetting(properties, "media_upload_enabled", false);
         config.mediaUploadLimitBytes = longSetting(properties, "media_upload_limit_bytes", 5L * 1024L * 1024L);
+        config.staleMessageGraceMs = nonNegativeLongSetting(properties, "stale_message_grace_ms", DEFAULT_STALE_MESSAGE_GRACE_MS);
+        config.staleMessageReplayLimit = nonNegativeIntSetting(properties, "stale_message_replay_limit", DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
         config.signature = configSignature(properties);
         return config;
     }
@@ -332,6 +338,16 @@ public final class BridgeConfig {
         }
     }
 
+    private static long nonNegativeLongSetting(Properties properties, String name, long fallback) {
+        long value = longSetting(properties, name, fallback);
+        return value >= 0L ? value : fallback;
+    }
+
+    private static int nonNegativeIntSetting(Properties properties, String name, int fallback) {
+        long value = nonNegativeLongSetting(properties, name, fallback);
+        return value <= Integer.MAX_VALUE ? (int) value : fallback;
+    }
+
     private static boolean booleanSetting(Properties properties, String name, boolean fallback) {
         try {
             String value = properties.getProperty(name);
@@ -357,7 +373,9 @@ public final class BridgeConfig {
                 "contact_sync_limit",
                 "contact_include_chatrooms",
                 "media_upload_enabled",
-                "media_upload_limit_bytes"
+                "media_upload_limit_bytes",
+                "stale_message_grace_ms",
+                "stale_message_replay_limit"
         }) {
             out.append(key).append('=').append(setting(properties, key, "")).append('\n');
         }

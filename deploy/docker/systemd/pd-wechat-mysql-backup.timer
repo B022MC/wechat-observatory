@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily PD WeChat MySQL backup
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 Asia/Shanghai
+Persistent=true
+Unit=pd-wechat-mysql-backup.service
+
+[Install]
+WantedBy=timers.target

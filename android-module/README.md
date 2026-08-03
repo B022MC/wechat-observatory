@@ -81,6 +81,8 @@ contact_sync_limit=10000
 contact_include_chatrooms=1
 media_upload_enabled=0
 media_upload_limit_bytes=5242880
+stale_message_grace_ms=900000
+stale_message_replay_limit=500
 ```
 
 Restart WeChat after changing config.
@@ -106,6 +108,14 @@ WeChat worker in that state.
 `contact_sync_interval_ms=0` disables friend sync. The default is 10 minutes.
 `contact_sync_limit` caps one snapshot upload. `contact_include_chatrooms=1`
 includes chatrooms and is the default.
+
+The module treats a message observed through either the WCDB insert hook or
+the fallback poll as historical when its WeChat `createTime` is more than
+`stale_message_grace_ms` old. It reports at most
+`stale_message_replay_limit` such rows during one WeChat process lifetime, then
+skips further stale rows. Newly created messages are never counted against
+that cap. Defaults are 15 minutes and 500 rows; leave these values unchanged
+unless a controlled recovery needs a different bound.
 
 ## Outbox Protocol
 

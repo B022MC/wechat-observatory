@@ -53,6 +53,8 @@ cd android-module
 | `contact_include_chatrooms` | `1` | 是否同步群聊 |
 | `media_upload_enabled` | `0` | 是否上传图片、语音、视频、文件等附件 |
 | `media_upload_limit_bytes` | `5242880` | 单个附件上传上限 |
+| `stale_message_grace_ms` | `900000` | 超过该时间的插入消息视为历史回灌 |
+| `stale_message_replay_limit` | `500` | 单次微信进程最多上报的历史回灌消息数 |
 
 ## 注册流程
 

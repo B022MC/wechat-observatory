@@ -56,11 +56,58 @@ DSNs and must never use the root account. Gateway receives only the additional
 read-only `REPLICATION CLIENT` privilege needed to total MySQL binlog sizes; it
 cannot read the Observatory database. No media data is mounted or stored.
 
-Observatory deletes message history and only successfully sent outbox rows
-after 15 days. Gateway deletes processed command receipts and command logs
-after 30 days. Pending, leased, and failed Observatory outbox rows remain;
-financial, diamond, balance, and game-settlement business ledgers are not
-removed by these jobs.
+Observatory deletes message history and only terminal (`sent` or `cancelled`)
+outbox rows after 15 days. Gateway deletes command receipts, command logs,
+battle account records, admission attempts, and daily house statistics after
+15 days. Pending, leased, and failed Observatory outbox rows remain; Gateway
+credit, balance, diamond, quota, and other non-battle financial records are
+not removed by these jobs.
+
+MySQL keeps binary logs for seven days with transaction compression enabled.
+Binary logging remains enabled for recovery. Every Compose service, including
+one-shot migration jobs and the standalone Caddy project, keeps Docker
+`json-file` logs at `20m` per file with five files retained.
+
+## Daily Database Backups
+
+`backup-mysql.sh` writes one compressed, checksummed consistent dump of both
+application databases. It runs `mysqldump --single-transaction` inside the
+MySQL container, so neither a database password nor a dump credential is
+placed in the host process list or log output. Dumps and `.sha256` files older
+than the configured 15-day window are removed only after a new dump is valid.
+
+Production uses the supplied systemd timer with the stable release symlink:
+
+```bash
+sudo install -m 0644 systemd/pd-wechat-mysql-backup.service /etc/systemd/system/
+sudo install -m 0644 systemd/pd-wechat-mysql-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pd-wechat-mysql-backup.timer
+sudo systemctl start pd-wechat-mysql-backup.service
+systemctl list-timers pd-wechat-mysql-backup.timer
+```
+
+The service stores dumps under `/opt/pd-wechat-runtime/backups/mysql`. Confirm
+the current release symlink points to the deployed release before enabling the
+timer. To verify a dump, run `sha256sum -c <dump>.sha256` and `gzip -t <dump>`.
+
+## Production Retention Rollout
+
+1. Before changing Compose, make and checksum fresh dumps, record the active
+   release, container IDs, rendered Compose configuration, `SHOW VARIABLES`
+   results for binlog settings, and `SHOW BINARY LOGS`.
+2. Render the new Compose configuration and deploy prebuilt application
+   images. Recreate only Observatory and Gateway services first; do not remove
+   `mysql-data`.
+3. During a short maintenance window, recreate MySQL with the same volume so
+   its command-line binlog settings persist. Do not start a second Gateway
+   Plaza owner during this window.
+4. Verify `binlog_expire_logs_seconds=604800`,
+   `binlog_transaction_compression=ON`, health endpoints, `docker inspect`
+   log options, a successful backup checksum, and retention scheduler logs.
+5. Roll back by restoring the prior release and Compose command flags, then
+   recreating only the affected services with the existing MySQL volume. Do
+   not restore data automatically.
 
 Gateway checks combined application database size, MySQL binlog size, node
 disk usage, and node/container memory every five minutes. The defaults alert

@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   caddy:
     image: caddy:2.10-alpine
@@ -20,6 +26,7 @@ services:
       - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
 
 networks:
   runtime:

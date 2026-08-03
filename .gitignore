@@ -11,6 +11,7 @@ data/
 deploy/k3s/config.yaml
 deploy/k3s/secrets.yaml
 deploy/docker/.env
+deploy/docker/backups/
 web/admin/node_modules/
 web/admin/dist/
 web/admin/*.tsbuildinfo

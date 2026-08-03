@@ -29,6 +29,8 @@ public final class SettingsActivity extends Activity {
     private static final String DEFAULT_CONTACT_INCLUDE_CHATROOMS = "1";
     private static final String DEFAULT_MEDIA_UPLOAD_ENABLED = "0";
     private static final String DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES = "5242880";
+    private static final String DEFAULT_STALE_MESSAGE_GRACE_MS = String.valueOf(BridgeConfig.DEFAULT_STALE_MESSAGE_GRACE_MS);
+    private static final String DEFAULT_STALE_MESSAGE_REPLAY_LIMIT = String.valueOf(BridgeConfig.DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
     private static final String[] SENSITIVE_CONFIG_KEYS = new String[]{"api_key"};
     private static final Map<String, String> DEFAULTS = new LinkedHashMap<>();
 
@@ -43,6 +45,8 @@ public final class SettingsActivity extends Activity {
         DEFAULTS.put("contact_include_chatrooms", DEFAULT_CONTACT_INCLUDE_CHATROOMS);
         DEFAULTS.put("media_upload_enabled", DEFAULT_MEDIA_UPLOAD_ENABLED);
         DEFAULTS.put("media_upload_limit_bytes", DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES);
+        DEFAULTS.put("stale_message_grace_ms", DEFAULT_STALE_MESSAGE_GRACE_MS);
+        DEFAULTS.put("stale_message_replay_limit", DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
     }
 
     private final Map<String, EditText> fields = new LinkedHashMap<>();
@@ -87,6 +91,8 @@ public final class SettingsActivity extends Activity {
         addField(root, "contact_include_chatrooms", R.string.label_contact_include_chatrooms, InputType.TYPE_CLASS_NUMBER);
         addField(root, "media_upload_enabled", R.string.label_media_upload_enabled, InputType.TYPE_CLASS_NUMBER);
         addField(root, "media_upload_limit_bytes", R.string.label_media_upload_limit, InputType.TYPE_CLASS_NUMBER);
+        addField(root, "stale_message_grace_ms", R.string.label_stale_message_grace, InputType.TYPE_CLASS_NUMBER);
+        addField(root, "stale_message_replay_limit", R.string.label_stale_message_replay_limit, InputType.TYPE_CLASS_NUMBER);
 
         Button saveButton = new Button(this);
         saveButton.setText(R.string.action_save);

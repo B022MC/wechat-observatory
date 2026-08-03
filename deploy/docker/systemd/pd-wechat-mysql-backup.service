@@ -1,0 +1,11 @@
+[Unit]
+Description=PD WeChat MySQL backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pd-wechat-runtime/current/wechat-observatory/deploy/docker
+Environment=PD_WECHAT_BACKUP_DIR=/opt/pd-wechat-runtime/backups/mysql
+Environment=PD_WECHAT_BACKUP_RETENTION_DAYS=15
+ExecStart=/usr/bin/env bash /opt/pd-wechat-runtime/current/wechat-observatory/deploy/docker/backup-mysql.sh

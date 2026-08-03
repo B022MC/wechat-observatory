@@ -50,6 +50,7 @@ import cc.wechat.observatory.gateway.WebSocketFrame;
 import cc.wechat.observatory.model.MessagePayload;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.wechat.LocalMessageConfirmation;
+import cc.wechat.observatory.wechat.HistoricalMessageReplayGuard;
 import cc.wechat.observatory.wechat.QueueSubmissionRetrier;
 import cc.wechat.observatory.wechat.SendResult;
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -67,6 +68,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final String WECHAT_PACKAGE = "com.tencent.mm";
     private static final AtomicBoolean WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean OUTBOX_WORKER_STARTED = new AtomicBoolean(false);
+    private static final HistoricalMessageReplayGuard HISTORICAL_MESSAGE_REPLAY_GUARD = new HistoricalMessageReplayGuard();
     private static volatile String LAST_READY_STATE = "";
     private static volatile String LAST_CLASSLOADER_STATE = "";
     private static volatile Object LAST_DATABASE;
@@ -76,6 +78,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_MESSAGE_POLL_AT = 0L;
     private static volatile long LAST_MESSAGE_ID = 0L;
     private static volatile boolean MESSAGE_WATERMARK_READY = false;
+    private static volatile boolean STALE_MESSAGE_REPLAY_LIMIT_LOGGED = false;
     private static volatile long LAST_WEBSOCKET_FAIL_LOG_AT = 0L;
     private static volatile String CURRENT_WXID = "";
     private static volatile String CURRENT_NICKNAME = "";
@@ -307,6 +310,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
             BridgeConfig config = BridgeConfig.load(bridgeContext());
             if (!config.enabled || isBlank(config.baseUrl) || isBlank(config.apiKey)) {
+                return;
+            }
+            long normalizedCreateTime = normalizeCreateTime(createTime);
+            if (!allowsHistoricalMessage(config, normalizedCreateTime)) {
                 return;
             }
             if (!bindRuntimeIdentity(config)) {
@@ -914,6 +921,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 int type = intColumn(cursor, 5);
                 String imgPath = hasMediaHint ? stringColumn(cursor, 6) : "";
                 if (!shouldReportMessage(talker, content, type)) {
+                    continue;
+                }
+                if (!allowsHistoricalMessage(config, createTime)) {
                     continue;
                 }
 
@@ -2898,6 +2908,22 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return System.currentTimeMillis() / 1000L;
         }
         return createTime > 10_000_000_000L ? createTime / 1000L : createTime;
+    }
+
+    private static boolean allowsHistoricalMessage(BridgeConfig config, long createTimeSeconds) {
+        if (HISTORICAL_MESSAGE_REPLAY_GUARD.allows(
+                System.currentTimeMillis(),
+                createTimeSeconds,
+                config.staleMessageGraceMs,
+                config.staleMessageReplayLimit)) {
+            return true;
+        }
+        if (!STALE_MESSAGE_REPLAY_LIMIT_LOGGED) {
+            STALE_MESSAGE_REPLAY_LIMIT_LOGGED = true;
+            log("stale message replay limit reached; skipping additional historical inserts limit="
+                    + config.staleMessageReplayLimit);
+        }
+        return false;
     }
 
     private static void log(String message) {

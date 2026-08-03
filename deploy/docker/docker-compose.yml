@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   mysql:
     image: mysql:8.4
@@ -21,6 +27,9 @@ services:
       - --performance-schema=OFF
       - --max-connections=60
       - --table-open-cache=400
+      - --binlog-expire-logs-seconds=604800
+      - --binlog-transaction-compression=ON
+    logging: *default-logging
     volumes:
       - mysql-data:/var/lib/mysql
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
@@ -51,6 +60,7 @@ services:
       BRIDGE_MYSQL_DSN: "${OBS_DB_USER:?set OBS_DB_USER}:${OBS_DB_PASSWORD:?set OBS_DB_PASSWORD}@tcp(mysql:3306)/${OBS_DB_NAME:-wechat_observatory}?charset=utf8mb4&parseTime=True&loc=Asia%2FShanghai&time_zone=%27%2B08%3A00%27"
     entrypoint: ["/usr/local/bin/wechat-observatory-db"]
     command: ["-create-database", "-migrate", "-seed", "-check"]
+    logging: *default-logging
 
   observatory:
     build:
@@ -77,6 +87,7 @@ services:
       BRIDGE_HISTORY_RETENTION_INTERVAL: "${BRIDGE_HISTORY_RETENTION_INTERVAL:-1h}"
       BRIDGE_MODULE_OFFLINE_AFTER: "${BRIDGE_MODULE_OFFLINE_AFTER:-5m}"
       BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL: "${BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL:-30s}"
+    logging: *default-logging
     ports:
       # Caddy reaches Observatory over the runtime network.
       - "127.0.0.1:${BRIDGE_HTTP_PORT:-8088}:8088"
@@ -110,6 +121,7 @@ services:
       PD_GATEWAY_SUPER_PASSWORD: "${PD_GATEWAY_SUPER_PASSWORD:?set PD_GATEWAY_SUPER_PASSWORD}"
       PD_GATEWAY_SUPER_DISPLAY_NAME: "${PD_GATEWAY_SUPER_DISPLAY_NAME:-Super Admin}"
     entrypoint: ["/usr/local/bin/pd-wechat-gateway-db"]
+    logging: *default-logging
 
   gateway:
     build:
@@ -147,7 +159,7 @@ services:
       PD_GATEWAY_BOSS_PUSH_VAPID_PUBLIC: "${PD_GATEWAY_BOSS_PUSH_VAPID_PUBLIC:-}"
       PD_GATEWAY_BOSS_PUSH_VAPID_PRIVATE: "${PD_GATEWAY_BOSS_PUSH_VAPID_PRIVATE:-}"
       PD_GATEWAY_BOSS_PUSH_VAPID_SUBJECT: "${PD_GATEWAY_BOSS_PUSH_VAPID_SUBJECT:-}"
-      PD_GATEWAY_HISTORY_RETENTION_DAYS: "${PD_GATEWAY_HISTORY_RETENTION_DAYS:-30}"
+      PD_GATEWAY_HISTORY_RETENTION_DAYS: "${PD_GATEWAY_HISTORY_RETENTION_DAYS:-15}"
       PD_GATEWAY_HISTORY_RETENTION_INTERVAL: "${PD_GATEWAY_HISTORY_RETENTION_INTERVAL:-1h}"
       PD_GATEWAY_RESOURCE_ALERTS_ENABLED: "${PD_GATEWAY_RESOURCE_ALERTS_ENABLED:-true}"
       PD_GATEWAY_RESOURCE_ALERT_INTERVAL: "${PD_GATEWAY_RESOURCE_ALERT_INTERVAL:-5m}"
@@ -156,6 +168,7 @@ services:
       PD_GATEWAY_BINLOG_ALERT_BYTES: "${PD_GATEWAY_BINLOG_ALERT_BYTES:-4294967296}"
       PD_GATEWAY_DISK_ALERT_PERCENT: "${PD_GATEWAY_DISK_ALERT_PERCENT:-85}"
       PD_GATEWAY_MEMORY_ALERT_PERCENT: "${PD_GATEWAY_MEMORY_ALERT_PERCENT:-85}"
+    logging: *default-logging
     ports:
       - "127.0.0.1:${PD_GATEWAY_HTTP_PORT:-19090}:19090"
     healthcheck:

@@ -58,4 +58,29 @@ public final class BridgeConfigTest {
         assertEquals(10000, BridgeConfig.DEFAULT_CONTACT_SYNC_LIMIT);
         assertEquals(10000, config.contactSyncLimit);
     }
+
+    @Test
+    public void staleMessageReplayDefaultsAreBoundedAndConfigurable() {
+        Properties properties = new Properties();
+        properties.setProperty("stale_message_grace_ms", "300000");
+        properties.setProperty("stale_message_replay_limit", "25");
+
+        BridgeConfig configured = BridgeConfig.fromProperties(properties);
+        BridgeConfig defaults = BridgeConfig.fromProperties(new Properties());
+
+        assertEquals(300000L, configured.staleMessageGraceMs);
+        assertEquals(25, configured.staleMessageReplayLimit);
+        assertEquals(900000L, defaults.staleMessageGraceMs);
+        assertEquals(500, defaults.staleMessageReplayLimit);
+    }
+
+    @Test
+    public void invalidStaleMessageReplayLimitFallsBackToTheDefault() {
+        Properties properties = new Properties();
+        properties.setProperty("stale_message_replay_limit", "2147483648");
+
+        BridgeConfig config = BridgeConfig.fromProperties(properties);
+
+        assertEquals(BridgeConfig.DEFAULT_STALE_MESSAGE_REPLAY_LIMIT, config.staleMessageReplayLimit);
+    }
 }
