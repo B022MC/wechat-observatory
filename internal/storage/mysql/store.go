@@ -92,6 +92,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureMessageEventOwnerColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureMessageEventChatIDIndex(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureMessageEventEventKey(ctx); err != nil {
 		return err
 	}
@@ -121,6 +124,31 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	}
 	if err := s.ensureMessageEventModuleStatusIndexes(ctx); err != nil {
 		return err
+	}
+	return nil
+}
+
+const messageEventChatIDExpression = `CASE
+	WHEN NULLIF(TRIM(room_id), '') IS NOT NULL THEN TRIM(room_id)
+	WHEN direction = 'sent' AND NULLIF(TRIM(to_wxid), '') IS NOT NULL THEN TRIM(to_wxid)
+	WHEN NULLIF(TRIM(from_wxid), '') IS NOT NULL THEN TRIM(from_wxid)
+	ELSE TRIM(COALESCE(to_wxid, ''))
+END`
+
+var messageEventChatIDIndexStatements = []string{
+	`ALTER TABLE bridge_message_events ADD COLUMN chat_id VARCHAR(191) GENERATED ALWAYS AS (` + messageEventChatIDExpression + `) VIRTUAL AFTER sender_wxid`,
+	`CREATE INDEX idx_bridge_message_events_owner_chat_id ON bridge_message_events (device, owner_wxid, chat_id, id)`,
+}
+
+func (s *Store) ensureMessageEventChatIDIndex(ctx context.Context) error {
+	for _, statement := range messageEventChatIDIndexStatements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			lower := strings.ToLower(err.Error())
+			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
+				continue
+			}
+			return err
+		}
 	}
 	return nil
 }
@@ -358,6 +386,7 @@ func Migrations() []string {
 			to_wxid VARCHAR(191) NULL,
 			room_id VARCHAR(191) NULL,
 			sender_wxid VARCHAR(191) NULL,
+			chat_id VARCHAR(191) GENERATED ALWAYS AS (` + messageEventChatIDExpression + `) VIRTUAL,
 			text TEXT NOT NULL,
 			message_type INT NOT NULL,
 			media_kind VARCHAR(32) NULL,
@@ -373,6 +402,7 @@ func Migrations() []string {
 			KEY idx_bridge_message_events_device_direction_created (device, direction, created_at),
 			KEY idx_bridge_message_events_device_direction_provider_created (device, direction, raw_provider, created_at),
 			KEY idx_bridge_message_events_owner_time (device, owner_wxid, id),
+			KEY idx_bridge_message_events_owner_chat_id (device, owner_wxid, chat_id, id),
 			KEY idx_bridge_message_events_chat_record (chat_record_id),
 			KEY idx_bridge_message_events_direction (direction),
 			KEY idx_bridge_message_events_retention (created_at),

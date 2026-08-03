@@ -127,23 +127,9 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 		conditions = append(conditions, "id > ?")
 		args = append(args, filter.AfterID)
 	}
-	chatID := strings.TrimSpace(filter.ChatID)
-	if chatID == "" {
-		chatID = strings.TrimSpace(filter.WxID)
-	}
-	if chatID != "" {
-		chatKind := strings.ToLower(strings.TrimSpace(filter.ChatKind))
-		switch {
-		case chatKind == string(bridge.ChatKindRoom) || strings.Contains(strings.ToLower(chatID), "@chatroom"):
-			conditions = append(conditions, "(room_id = ? OR from_wxid = ? OR to_wxid = ?)")
-			args = append(args, chatID, chatID, chatID)
-		case chatKind == string(bridge.ChatKindDirect):
-			conditions = append(conditions, "((room_id IS NULL OR room_id = '') AND (from_wxid = ? OR to_wxid = ? OR sender_wxid = ?))")
-			args = append(args, chatID, chatID, chatID)
-		default:
-			conditions = append(conditions, "(from_wxid = ? OR to_wxid = ? OR room_id = ? OR sender_wxid = ?)")
-			args = append(args, chatID, chatID, chatID, chatID)
-		}
+	if chatID := strings.TrimSpace(filter.ChatID); chatID != "" {
+		conditions = append(conditions, "chat_id = ?")
+		args = append(args, chatID)
 	} else if wxid := strings.TrimSpace(filter.WxID); wxid != "" {
 		conditions = append(conditions, "(from_wxid = ? OR to_wxid = ? OR room_id = ? OR sender_wxid = ?)")
 		args = append(args, wxid, wxid, wxid, wxid)

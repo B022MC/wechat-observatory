@@ -11,10 +11,11 @@ import (
 )
 
 const (
-	defaultHTTPAddr      = ":8088"
-	DefaultAdminPassword = "change-this-password"
-	currentAdminPassEnv  = "BRIDGE_ADMIN_PASSWORD"
-	deviceAdminPassEnv   = "BRIDGE_DEVICE_ADMIN_PASSWORD"
+	defaultHTTPAddr           = ":8088"
+	defaultOutboxPollInterval = 3 * time.Second
+	DefaultAdminPassword      = "change-this-password"
+	currentAdminPassEnv       = "BRIDGE_ADMIN_PASSWORD"
+	deviceAdminPassEnv        = "BRIDGE_DEVICE_ADMIN_PASSWORD"
 )
 
 type Config struct {
@@ -67,7 +68,7 @@ func LoadFromEnv() (Config, error) {
 		DefaultDevice:       strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_DEVICE")),
 		InstanceID:          instanceID(),
 		SessionTTL:          getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
-		PollInterval:        getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", time.Second),
+		PollInterval:        getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", defaultOutboxPollInterval),
 		ModuleOfflineAfter:  getenvDuration("BRIDGE_MODULE_OFFLINE_AFTER", 5*time.Minute),
 		OfflineOutboxSweep:  getenvDuration("BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL", 30*time.Second),
 		RetentionDays:       getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),

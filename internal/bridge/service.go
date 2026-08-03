@@ -59,7 +59,7 @@ func NewService(cfg Config, opts ...Option) *Service {
 		service.sessionTTL = 15 * time.Second
 	}
 	if service.pollEvery <= 0 {
-		service.pollEvery = time.Second
+		service.pollEvery = 3 * time.Second
 	}
 	if service.offlineAfter <= 0 {
 		service.offlineAfter = 5 * time.Minute

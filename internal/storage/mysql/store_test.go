@@ -93,9 +93,26 @@ func TestMigrationsCoverCoreTables(t *testing.T) {
 		"idx_bridge_message_events_device_id",
 		"idx_bridge_message_events_device_direction_created",
 		"idx_bridge_message_events_device_direction_provider_created",
+		"idx_bridge_message_events_owner_chat_id",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("migration missing index %q", want)
+		}
+	}
+}
+
+func TestMessageEventChatIDIndexMatchesCanonicalConversation(t *testing.T) {
+	joined := strings.Join(messageEventChatIDIndexStatements, "\n")
+	for _, want := range []string{
+		"GENERATED ALWAYS AS",
+		"NULLIF(TRIM(room_id), '')",
+		"direction = 'sent'",
+		"TRIM(to_wxid)",
+		"TRIM(from_wxid)",
+		"(device, owner_wxid, chat_id, id)",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("chat id migration missing %q: %s", want, joined)
 		}
 	}
 }
@@ -463,17 +480,41 @@ func TestListMessagesQuerySupportsChatRooms(t *testing.T) {
 		ChatKind: string(bridge.ChatKindRoom),
 		Limit:    25,
 	})
-	if !strings.Contains(query, "room_id = ? OR from_wxid = ? OR to_wxid = ?") {
-		t.Fatalf("message query does not target chat rooms: %s", query)
+	if !strings.Contains(query, "chat_id = ?") {
+		t.Fatalf("message query does not use indexed chat id: %s", query)
 	}
-	if len(args) != 6 {
+	if strings.Contains(query, "room_id = ? OR from_wxid = ?") {
+		t.Fatalf("message query retains unindexed participant ORs: %s", query)
+	}
+	if len(args) != 4 {
 		t.Fatalf("unexpected args: %#v", args)
 	}
-	if args[1] != "phone-a" || args[2] != "wxid_room@chatroom" || args[3] != "wxid_room@chatroom" || args[4] != "wxid_room@chatroom" {
+	if args[1] != "phone-a" || args[2] != "wxid_room@chatroom" {
 		t.Fatalf("chat room args mismatch: %#v", args)
 	}
-	if args[5] != 25 {
+	if args[3] != 25 {
 		t.Fatalf("limit arg mismatch: %#v", args)
+	}
+}
+
+func TestListMessagesQueryUsesIndexedDirectChatID(t *testing.T) {
+	query, args := listMessagesQuery(bridge.MessageFilter{
+		Device:     "phone-a",
+		OwnerWxID:  "wxid_owner",
+		ChatID:     "wxid_friend",
+		ChatKind:   string(bridge.ChatKindDirect),
+		AfterID:    100,
+		AfterIDSet: true,
+		Limit:      180,
+	})
+	if !strings.Contains(query, "chat_id = ?") || !strings.Contains(query, "ORDER BY id ASC") {
+		t.Fatalf("direct chat query is not indexed/cursor ordered: %s", query)
+	}
+	if strings.Contains(query, "from_wxid = ? OR to_wxid = ?") {
+		t.Fatalf("direct chat query retains participant ORs: %s", query)
+	}
+	if len(args) != 6 || args[0] != bridge.RawProviderModuleAck || args[1] != "phone-a" || args[2] != "wxid_owner" || args[3] != int64(100) || args[4] != "wxid_friend" || args[5] != 180 {
+		t.Fatalf("direct chat args mismatch: %#v", args)
 	}
 }
 

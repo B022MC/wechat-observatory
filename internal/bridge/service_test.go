@@ -24,6 +24,13 @@ import (
 
 const testAPIKey = "wechat-a-key"
 
+func TestNewServiceDefaultsOutboxPollIntervalToThreeSeconds(t *testing.T) {
+	service := NewService(Config{})
+	if got := service.OutboxPollInterval(); got != 3*time.Second {
+		t.Fatalf("outbox poll default = %s, want 3s", got)
+	}
+}
+
 func TestContactQueryAllowsCompleteSnapshotsWithoutRaisingOtherEndpointLimits(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/module-contacts?limit=10000", nil)
 	if got := queryLimit(req, 100); got != 100 {

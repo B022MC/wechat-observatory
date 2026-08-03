@@ -15,6 +15,7 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
 	t.Setenv("BRIDGE_HISTORY_RETENTION_DAYS", "21")
 	t.Setenv("BRIDGE_HISTORY_RETENTION_INTERVAL", "2h")
+	t.Setenv("BRIDGE_OUTBOX_POLL_INTERVAL", "4s")
 	t.Setenv("BRIDGE_MODULE_OFFLINE_AFTER", "7m")
 	t.Setenv("BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL", "45s")
 
@@ -28,11 +29,27 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	if cfg.RetentionDays != 21 || cfg.RetentionPoll != 2*time.Hour {
 		t.Fatalf("unexpected retention config: days=%d interval=%s", cfg.RetentionDays, cfg.RetentionPoll)
 	}
+	if cfg.PollInterval != 4*time.Second {
+		t.Fatalf("unexpected outbox poll interval: %s", cfg.PollInterval)
+	}
 	if cfg.ModuleOfflineAfter != 7*time.Minute || cfg.OfflineOutboxSweep != 45*time.Second {
 		t.Fatalf("unexpected offline config: after=%s sweep=%s", cfg.ModuleOfflineAfter, cfg.OfflineOutboxSweep)
 	}
 	if cfg.DeviceAdminPassword != "device-admin-test" {
 		t.Fatal("device admin password was not loaded")
+	}
+}
+
+func TestLoadFromEnvDefaultsOutboxPollIntervalToThreeSeconds(t *testing.T) {
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
+	t.Setenv("BRIDGE_OUTBOX_POLL_INTERVAL", "")
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PollInterval != 3*time.Second {
+		t.Fatalf("unexpected outbox poll default: %s", cfg.PollInterval)
 	}
 }
 
