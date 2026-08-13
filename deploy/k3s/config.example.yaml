@@ -13,3 +13,5 @@ data:
   BRIDGE_HISTORY_RETENTION_INTERVAL: "1h"
   BRIDGE_MODULE_OFFLINE_AFTER: "5m"
   BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL: "30s"
+  # Enable only after every Gateway control Pod permanently understands v2.
+  BRIDGE_EVENT_IDENTITY_V2_DEVICES: ""

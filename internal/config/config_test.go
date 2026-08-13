@@ -18,6 +18,7 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	t.Setenv("BRIDGE_OUTBOX_POLL_INTERVAL", "4s")
 	t.Setenv("BRIDGE_MODULE_OFFLINE_AFTER", "7m")
 	t.Setenv("BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL", "45s")
+	t.Setenv("BRIDGE_EVENT_IDENTITY_V2_DEVICES", " 61497f;phone-b,61497f ")
 
 	cfg, err := LoadFromEnv()
 	if err != nil {
@@ -37,6 +38,31 @@ func TestLoadFromEnvParsesRuntimeConfig(t *testing.T) {
 	}
 	if cfg.DeviceAdminPassword != "device-admin-test" {
 		t.Fatal("device admin password was not loaded")
+	}
+	if len(cfg.EventIdentityV2) != 2 {
+		t.Fatalf("unexpected v2 identity devices: %+v", cfg.EventIdentityV2)
+	}
+	if _, ok := cfg.EventIdentityV2["61497f"]; !ok {
+		t.Fatal("61497f was not enabled for v2 event identity")
+	}
+}
+
+func TestEventIdentityV2DevicesDefaultOffAndMatchExactly(t *testing.T) {
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
+	t.Setenv("BRIDGE_EVENT_IDENTITY_V2_DEVICES", "")
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.EventIdentityV2) != 0 {
+		t.Fatalf("v2 identity should default off: %+v", cfg.EventIdentityV2)
+	}
+	values := parseStringSet("phone-a Phone-A")
+	if _, ok := values["phone-a"]; !ok {
+		t.Fatal("exact lower-case device was not parsed")
+	}
+	if _, ok := values["PHONE-A"]; ok {
+		t.Fatal("device matching must remain case-sensitive")
 	}
 }
 

@@ -30,6 +30,7 @@ type Config struct {
 	OfflineOutboxSweep  time.Duration
 	RetentionDays       int
 	RetentionPoll       time.Duration
+	EventIdentityV2     map[string]struct{}
 	Devices             map[string]Device
 	APIKeys             map[string]APIKey
 	MySQL               MySQLConfig
@@ -73,6 +74,7 @@ func LoadFromEnv() (Config, error) {
 		OfflineOutboxSweep:  getenvDuration("BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL", 30*time.Second),
 		RetentionDays:       getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),
 		RetentionPoll:       getenvDuration("BRIDGE_HISTORY_RETENTION_INTERVAL", time.Hour),
+		EventIdentityV2:     parseStringSet(os.Getenv("BRIDGE_EVENT_IDENTITY_V2_DEVICES")),
 		Devices:             map[string]Device{},
 		APIKeys:             map[string]APIKey{},
 		MySQL: MySQLConfig{
@@ -110,6 +112,19 @@ func LoadFromEnv() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseStringSet(raw string) map[string]struct{} {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	})
+	values := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			values[value] = struct{}{}
+		}
+	}
+	return values
 }
 
 func (cfg *Config) EnsureRuntimeReady() error {

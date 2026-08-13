@@ -33,14 +33,41 @@ type Service struct {
 
 const maxOutboxPollBatch = 1
 
+// IngestValidationError identifies a module payload that cannot safely cross
+// the ingest boundary. It lets HTTP callers distinguish a non-retryable 400
+// response from a durable-storage failure without inspecting error text.
+type IngestValidationError struct {
+	Field   string
+	Problem string
+}
+
+func (e *IngestValidationError) Error() string {
+	return fmt.Sprintf("%s %s", e.Field, e.Problem)
+}
+
+// IngestPersistenceError identifies a retryable failure to durably record a
+// v2 event. V2 delivery must not continue to SSE until this operation succeeds.
+type IngestPersistenceError struct {
+	Err error
+}
+
+func (e *IngestPersistenceError) Error() string {
+	return fmt.Sprintf("persist inbound event: %v", e.Err)
+}
+
+func (e *IngestPersistenceError) Unwrap() error {
+	return e.Err
+}
+
 type Config struct {
-	DefaultDevice string
-	Devices       map[string]config.Device
-	APIKeys       map[string]config.APIKey
-	InstanceID    string
-	SessionTTL    time.Duration
-	PollInterval  time.Duration
-	OfflineAfter  time.Duration
+	DefaultDevice          string
+	Devices                map[string]config.Device
+	APIKeys                map[string]config.APIKey
+	InstanceID             string
+	SessionTTL             time.Duration
+	PollInterval           time.Duration
+	OfflineAfter           time.Duration
+	EventIdentityV2Devices map[string]struct{}
 }
 
 func NewService(cfg Config, opts ...Option) *Service {
@@ -374,9 +401,7 @@ func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult
 	if event.MessageType == 0 {
 		event.MessageType = 1
 	}
-	if event.CreateTime == 0 {
-		event.CreateTime = time.Now().Unix()
-	}
+	sourceCreateTime := event.CreateTime
 	event = event.Normalize()
 	mediaError := ""
 	if stored, err := s.StoreMediaAttachment(event); err != nil {
@@ -393,20 +418,45 @@ func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult
 	if ownerWxID := s.deviceWxID(ctx, event.Device); ownerWxID != "" {
 		event.OwnerWxID = ownerWxID
 	}
+	// event_key is a server-owned transport identity. Never allow the module to
+	// choose the business idempotency boundary. A v2 device must never fall
+	// back to the legacy key family because that would make a retry eligible
+	// under two durable identities.
+	event.EventKey = ""
+	if _, enabled := s.cfg.EventIdentityV2Devices[event.Device]; enabled {
+		if sourceCreateTime <= 0 {
+			return nil, &IngestValidationError{
+				Field:   "create_time",
+				Problem: "must be positive for v2 event identity",
+			}
+		}
+		event.EventKey = event.CanonicalEventKeyV2()
+	} else {
+		event.EventKey = event.CanonicalEventKey()
+	}
+	if event.CreateTime == 0 {
+		event.CreateTime = time.Now().Unix()
+	}
 
-	result := &IngestResult{Published: true}
+	result := &IngestResult{}
 	if mediaError != "" {
 		result.PersistenceError = "media: " + mediaError
 	}
 	if s.persistence != nil {
 		stored, err := s.persistence.RecordInboundEvent(ctx, event)
 		if err != nil {
+			if IsCanonicalEventKeyV2(event.EventKey) {
+				return nil, &IngestPersistenceError{Err: err}
+			}
+			// Preserve the established legacy contract outside the canary: expose
+			// the persistence error for audit and keep publishing the observation.
 			result.PersistenceError = err.Error()
 		} else {
 			event = stored
 		}
 	}
 	s.hub.Publish(event)
+	result.Published = true
 	return result, nil
 }
 

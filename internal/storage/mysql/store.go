@@ -1292,16 +1292,25 @@ func (s *Store) listOutboxItemsForDevice(ctx context.Context, ids []int64, devic
 	return out, rows.Err()
 }
 
-func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEvent) (bridge.MessageEvent, error) {
-	event = event.Normalize()
-	event.EventKey = event.CanonicalEventKey()
-	result, err := s.db.ExecContext(ctx, `
+const recordMessageEventStatement = `
 		INSERT INTO bridge_message_events (
 			event_key, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
 			to_wxid, room_id, sender_wxid, text, message_type, media_kind,
 			media_mime, media_name, media_url, media_size, raw_provider, create_time
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)`,
+		ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)`
+
+func storedMessageEventKey(event bridge.MessageEvent) string {
+	if key := strings.TrimSpace(event.EventKey); bridge.IsCanonicalEventKeyV2(key) {
+		return key
+	}
+	return event.CanonicalEventKey()
+}
+
+func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEvent) (bridge.MessageEvent, error) {
+	event = event.Normalize()
+	event.EventKey = storedMessageEventKey(event)
+	result, err := s.db.ExecContext(ctx, recordMessageEventStatement,
 		event.EventKey,
 		nullString(event.ID),
 		nullInt64(event.EventID),

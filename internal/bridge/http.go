@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -589,7 +590,12 @@ func (s *HTTPServer) ingestMessageFrom(provider string) http.HandlerFunc {
 		event.RawProvider = provider
 		result, err := s.service.Ingest(r.Context(), event)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "ingest_failed", err.Error())
+			status := http.StatusBadRequest
+			var persistenceError *IngestPersistenceError
+			if errors.As(err, &persistenceError) {
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, "ingest_failed", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})

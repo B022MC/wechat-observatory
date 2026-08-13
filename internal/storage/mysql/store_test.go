@@ -24,6 +24,29 @@ func TestStoreImplementsBridgePersistence(t *testing.T) {
 	var _ bridge.ModuleLivenessChecker = (*Store)(nil)
 }
 
+func TestMessageEventV2StorageKeyAndDuplicateUpsertContract(t *testing.T) {
+	event := bridge.MessageEvent{
+		EventKey: "  evt_v2_" + strings.Repeat("a", 64) + "  ",
+		ID:       "882", EventID: 882, ChatRecordID: 882, Device: "61497f",
+		From: "wxid_self", To: "filehelper", Text: "down 39",
+		Direction: bridge.DirectionSent, MessageType: 1, CreateTime: 1_786_530_000,
+	}
+	wantV2 := strings.TrimSpace(event.EventKey)
+	if got := storedMessageEventKey(event); got != wantV2 {
+		t.Fatalf("stored v2 key = %q, want %q", got, wantV2)
+	}
+
+	event.EventKey = "module-selected-key"
+	if got := storedMessageEventKey(event); got == event.EventKey || !strings.HasPrefix(got, "evt_") {
+		t.Fatalf("non-v2 ingress key was not replaced: %q", got)
+	}
+
+	statement := strings.Join(strings.Fields(recordMessageEventStatement), " ")
+	if !strings.Contains(statement, "ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)") {
+		t.Fatalf("message upsert no longer returns the existing row id: %s", statement)
+	}
+}
+
 func TestContactLimitCanCoverCompleteModuleSnapshot(t *testing.T) {
 	if got := normalizeLimit(10000); got != 500 {
 		t.Fatalf("shared read limit = %d, want 500", got)

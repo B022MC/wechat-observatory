@@ -55,13 +55,14 @@ func main() {
 		opts = append(opts, bridge.WithAdminReader(store))
 	}
 	service := bridge.NewService(bridge.Config{
-		DefaultDevice: cfg.DefaultDevice,
-		Devices:       cfg.Devices,
-		APIKeys:       cfg.APIKeys,
-		InstanceID:    cfg.InstanceID,
-		SessionTTL:    cfg.SessionTTL,
-		PollInterval:  cfg.PollInterval,
-		OfflineAfter:  cfg.ModuleOfflineAfter,
+		DefaultDevice:          cfg.DefaultDevice,
+		Devices:                cfg.Devices,
+		APIKeys:                cfg.APIKeys,
+		InstanceID:             cfg.InstanceID,
+		SessionTTL:             cfg.SessionTTL,
+		PollInterval:           cfg.PollInterval,
+		OfflineAfter:           cfg.ModuleOfflineAfter,
+		EventIdentityV2Devices: cfg.EventIdentityV2,
 	}, opts...)
 
 	httpServer := &http.Server{

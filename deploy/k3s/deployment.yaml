@@ -8,10 +8,9 @@ metadata:
 spec:
   replicas: 2
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+    # Event identity producer configuration is a cluster-wide sticky contract.
+    # Recreate prevents v1 and v2 producer Pods from accepting the same retry.
+    type: Recreate
   selector:
     matchLabels:
       app: wechat-observatory

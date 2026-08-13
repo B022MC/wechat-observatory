@@ -77,6 +77,130 @@ func TestIngestPublishesAndPersistsWithoutBusinessReply(t *testing.T) {
 	}
 }
 
+func TestIngestV2IdentityIsServerOwnedAndStableAcrossRetry(t *testing.T) {
+	persistence := &fakePersistence{}
+	service := newTestService("", WithPersistence(persistence))
+	service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+	event := MessageEvent{
+		APIKey: testAPIKey, EventKey: "evt_v2_" + strings.Repeat("f", 64),
+		ID: "882", EventID: 882, ChatRecordID: 882, Device: "forged-device",
+		From: "wxid_self", To: "filehelper", Text: "涓?9", Direction: DirectionSent,
+		MessageType: 1, CreateTime: 1_786_530_000,
+	}
+	if _, err := service.Ingest(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Ingest(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	differentSourceTime := event
+	differentSourceTime.CreateTime++
+	if _, err := service.Ingest(t.Context(), differentSourceTime); err != nil {
+		t.Fatal(err)
+	}
+	if len(persistence.inboundEvents) != 3 {
+		t.Fatalf("persist calls = %d, want 2 retries plus one distinct source time", len(persistence.inboundEvents))
+	}
+	first, second, later := persistence.inboundEvents[0], persistence.inboundEvents[1], persistence.inboundEvents[2]
+	if !IsCanonicalEventKeyV2(first.EventKey) || first.EventKey != second.EventKey {
+		t.Fatalf("unstable v2 identity: %q %q", first.EventKey, second.EventKey)
+	}
+	if later.EventKey == first.EventKey {
+		t.Fatalf("different source times shared v2 identity: %q", first.EventKey)
+	}
+	if first.EventKey == event.EventKey {
+		t.Fatal("forged ingress event key was trusted")
+	}
+	if first.Device != "phone-a" {
+		t.Fatalf("API key device was not authoritative: %q", first.Device)
+	}
+}
+
+func TestIngestV2RejectsMissingSourceTimeWithoutPersistenceOrPublish(t *testing.T) {
+	for _, createTime := range []int64{0, -1} {
+		t.Run(strconv.FormatInt(createTime, 10), func(t *testing.T) {
+			persistence := &fakePersistence{}
+			service := newTestService("", WithPersistence(persistence))
+			service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+			_, err := service.Ingest(t.Context(), MessageEvent{
+				APIKey: testAPIKey, ID: "882", Device: "phone-a", From: "wxid_friend", To: "wxid_self",
+				Text: "ping", Direction: DirectionRecv, CreateTime: createTime,
+			})
+			var validationError *IngestValidationError
+			if !errors.As(err, &validationError) || validationError.Field != "create_time" {
+				t.Fatalf("non-positive v2 source time error = %v", err)
+			}
+			if len(persistence.inboundEvents) != 0 {
+				t.Fatalf("invalid v2 event reached persistence: %+v", persistence.inboundEvents)
+			}
+			if got := service.Hub().Recent(1); len(got) != 0 {
+				t.Fatalf("invalid v2 event was published: %+v", got)
+			}
+		})
+	}
+
+	persistence := &fakePersistence{}
+	service := newTestService("", WithPersistence(persistence))
+	service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","direction":"recv","from":"wxid_friend","to":"wxid_self","text":"ping","create_time":0}`)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/webhook/lsposed/message", bytes.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing v2 source time status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(persistence.inboundEvents) != 0 {
+		t.Fatalf("HTTP-invalid v2 event reached persistence: %+v", persistence.inboundEvents)
+	}
+}
+
+func TestIngestLegacyPersistenceFailurePreservesExistingPublishContract(t *testing.T) {
+	persistence := &fakePersistence{inboundErr: errors.New("database unavailable")}
+	service := newTestService("", WithPersistence(persistence))
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey: testAPIKey, ID: "101", Device: "phone-a", From: "wxid_friend", To: "wxid_self",
+		Text: "ping", Direction: DirectionRecv, CreateTime: 1_786_530_000,
+	})
+	if err != nil || result == nil || !result.Published || result.PersistenceError != "database unavailable" {
+		t.Fatalf("legacy result=%+v err=%v", result, err)
+	}
+	if got := service.Hub().Recent(1); len(got) != 1 {
+		t.Fatalf("legacy persistence failure should retain publish behavior: %+v", got)
+	}
+
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","direction":"recv","from":"wxid_friend","to":"wxid_self","text":"ping","create_time":1786530000}`)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/webhook/lsposed/message", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"persistence_error":"database unavailable"`) {
+		t.Fatalf("legacy persistence HTTP status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestIngestV2PersistenceFailureDoesNotPublishAndReturnsRetryableHTTPStatus(t *testing.T) {
+	databaseError := errors.New("database unavailable")
+	service := newTestService("", WithPersistence(&fakePersistence{inboundErr: databaseError}))
+	service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey: testAPIKey, ID: "101", Device: "phone-a", From: "wxid_friend", To: "wxid_self",
+		Text: "ping", Direction: DirectionRecv, CreateTime: 1_786_530_000,
+	})
+	var persistenceError *IngestPersistenceError
+	if !errors.As(err, &persistenceError) || !errors.Is(err, databaseError) || result != nil {
+		t.Fatalf("v2 result=%+v err=%v, want persistence failure", result, err)
+	}
+	if got := service.Hub().Recent(1); len(got) != 0 {
+		t.Fatalf("failed v2 persistence published a live event: %+v", got)
+	}
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","direction":"recv","from":"wxid_friend","to":"wxid_self","text":"ping","create_time":1786530000}`)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/webhook/lsposed/message", bytes.NewReader(body)))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("persistence failure status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestAcquireOutboxSessionRejectsConcurrentDeviceSession(t *testing.T) {
 	leaser := &fakeSessionPersistence{leases: map[string]ModuleSessionLease{}}
 	first := newTestService("", WithPersistence(leaser))
@@ -1393,6 +1517,7 @@ type fakePersistence struct {
 	moduleActivities []ModuleActivity
 	contactSnapshots []ModuleContactSnapshotRequest
 	calls            []string
+	inboundErr       error
 }
 
 type fakeSessionPersistence struct {
@@ -1507,7 +1632,7 @@ func (p *fakePersistence) RecordInboundEvent(_ context.Context, event MessageEve
 	defer p.mu.Unlock()
 	p.calls = append(p.calls, "inbound")
 	p.inboundEvents = append(p.inboundEvents, event)
-	return event, nil
+	return event, p.inboundErr
 }
 
 func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEvent) (MessageEvent, error) {
