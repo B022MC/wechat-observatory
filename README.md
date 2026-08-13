@@ -187,7 +187,6 @@ curl -H "X-Bridge-Password: your-admin-password" http://127.0.0.1:8088/api/api-k
 - Hook、自动化发送和异常行为可能带来账号风控风险。
 - 服务端管理台必须放在可信网络后，并设置强管理密码。
 - API Key 等同于手机模块访问凭证，泄露后应立即停用或删除。
-- 开源发布前请检查 `.env`、部署脚本、日志和截图中是否包含真实 IP、密码、手机号、微信号、wxid 或聊天内容。
 
 更多发布前检查见 [docs/security.md](docs/security.md) 和 [docs/open-source-checklist.md](docs/open-source-checklist.md)。
 
