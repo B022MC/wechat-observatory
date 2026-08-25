@@ -491,6 +491,7 @@ func (s *HTTPServer) moduleStatusViews() []ModuleStatusView {
 			Device:         device.Name,
 			DeviceWxID:     device.WxID,
 			DeviceNickname: device.Nickname,
+			WeChatNickname: device.WeChatNickname,
 			Enabled:        true,
 		}
 		if strings.TrimSpace(device.WxID) != "" {

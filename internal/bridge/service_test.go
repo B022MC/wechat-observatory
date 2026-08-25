@@ -750,11 +750,14 @@ func TestRegisterModulePersistsStableIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Device.Name != "phone-a" || result.Device.WxID != "wxid_new_self" {
+	if result.Device.Name != "phone-a" || result.Device.WxID != "wxid_new_self" || result.Device.Nickname != "WeChat Phone" || result.Device.WeChatNickname != "New WeChat" {
 		t.Fatalf("unexpected registration device: %+v", result.Device)
 	}
-	if persistence.deviceName != "phone-a" || persistence.deviceWxID != "wxid_new_self" || persistence.deviceNickname != "WeChat Phone" {
-		t.Fatalf("device identity was not persisted: name=%q wxid=%q nickname=%q", persistence.deviceName, persistence.deviceWxID, persistence.deviceNickname)
+	if device, ok := service.Device("phone-a"); !ok || device.Nickname != "WeChat Phone" || device.WeChatNickname != "New WeChat" {
+		t.Fatalf("registration should keep the device label and track the WeChat nickname: ok=%v device=%+v", ok, device)
+	}
+	if persistence.deviceName != "phone-a" || persistence.deviceWxID != "wxid_new_self" || persistence.deviceNickname != "WeChat Phone" || persistence.wechatNickname != "New WeChat" {
+		t.Fatalf("device identities were not persisted: name=%q wxid=%q device_nickname=%q wechat_nickname=%q", persistence.deviceName, persistence.deviceWxID, persistence.deviceNickname, persistence.wechatNickname)
 	}
 	if len(persistence.moduleActivities) != 1 || persistence.moduleActivities[0].Kind != "register" || persistence.moduleActivities[0].APIKey != "wechat-a-key" {
 		t.Fatalf("module register activity was not recorded: %+v", persistence.moduleActivities)
@@ -1511,6 +1514,7 @@ type fakePersistence struct {
 	deviceName       string
 	deviceWxID       string
 	deviceNickname   string
+	wechatNickname   string
 	deviceByWxID     map[string]config.Device
 	inboundEvents    []MessageEvent
 	outboundEvents   []MessageEvent
@@ -1593,6 +1597,13 @@ func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName str
 	p.deviceName = deviceName
 	p.deviceWxID = wxid
 	p.deviceNickname = nickname
+	return nil
+}
+
+func (p *fakePersistence) UpdateDeviceWeChatIdentity(_ context.Context, _ string, _ string, nickname string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.wechatNickname = nickname
 	return nil
 }
 

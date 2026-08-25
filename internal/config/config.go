@@ -46,10 +46,11 @@ func (cfg MySQLConfig) Enabled() bool {
 }
 
 type Device struct {
-	Name     string
-	WxID     string
-	Nickname string
-	Timeout  time.Duration
+	Name           string
+	WxID           string
+	Nickname       string
+	WeChatNickname string
+	Timeout        time.Duration
 }
 
 type APIKey struct {

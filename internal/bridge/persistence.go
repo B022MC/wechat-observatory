@@ -19,6 +19,14 @@ type Persistence interface {
 	RecordOutboundEvent(ctx context.Context, event MessageEvent) (MessageEvent, error)
 }
 
+// DeviceWeChatIdentityPersistence stores the identity reported by the
+// currently running WeChat module separately from the operator-facing device
+// nickname. Implementations may omit this optional capability for in-memory
+// or legacy persistence adapters.
+type DeviceWeChatIdentityPersistence interface {
+	UpdateDeviceWeChatIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error
+}
+
 // EventTailReader supplies durable SSE replay for any HTTP replica.
 type EventTailReader interface {
 	LatestLiveEventID(ctx context.Context) (int64, error)
@@ -211,6 +219,7 @@ type ModuleStatusView struct {
 	Device             string `json:"device"`
 	DeviceWxID         string `json:"device_wxid,omitempty"`
 	DeviceNickname     string `json:"device_nickname,omitempty"`
+	WeChatNickname     string `json:"wechat_nickname,omitempty"`
 	Enabled            bool   `json:"enabled"`
 	Registered         bool   `json:"-"`
 	RuntimeStatus      string `json:"runtime_status"`

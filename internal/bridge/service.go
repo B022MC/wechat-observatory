@@ -315,6 +315,7 @@ func (s *Service) UpsertDevice(ctx context.Context, req DeviceUpsertRequest) (Mo
 		Device:         device.Name,
 		DeviceWxID:     device.WxID,
 		DeviceNickname: device.Nickname,
+		WeChatNickname: device.WeChatNickname,
 		Enabled:        true,
 	}
 	if strings.TrimSpace(device.WxID) != "" {
@@ -368,10 +369,16 @@ func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequ
 		device.Timeout = 5 * time.Second
 	}
 	device.WxID = req.WxID
-	device.Nickname = firstNonEmpty(device.Nickname, key.Nickname, req.Nickname, device.Name)
+	device.Nickname = firstNonEmpty(device.Nickname, key.Nickname, device.Name)
+	device.WeChatNickname = strings.TrimSpace(req.Nickname)
 	if s.persistence != nil {
 		if err := s.persistence.UpdateDeviceIdentity(ctx, req.Device, device.WxID, device.Nickname); err != nil {
 			return nil, err
+		}
+		if identityPersistence, ok := s.persistence.(DeviceWeChatIdentityPersistence); ok {
+			if err := identityPersistence.UpdateDeviceWeChatIdentity(ctx, req.Device, device.WxID, device.WeChatNickname); err != nil {
+				return nil, err
+			}
 		}
 	}
 	s.recordModuleActivity(ctx, ModuleActivity{
@@ -920,9 +927,10 @@ type ModuleRegistrationResult struct {
 }
 
 type ModuleDeviceView struct {
-	Name     string `json:"name"`
-	WxID     string `json:"wxid,omitempty"`
-	Nickname string `json:"nickname,omitempty"`
+	Name           string `json:"name"`
+	WxID           string `json:"wxid,omitempty"`
+	Nickname       string `json:"nickname,omitempty"`
+	WeChatNickname string `json:"wechat_nickname,omitempty"`
 }
 
 func apiKeyDeviceName(key config.APIKey) string {
@@ -934,8 +942,9 @@ func apiKeyDeviceName(key config.APIKey) string {
 
 func moduleDeviceView(device config.Device) ModuleDeviceView {
 	return ModuleDeviceView{
-		Name:     device.Name,
-		WxID:     device.WxID,
-		Nickname: device.Nickname,
+		Name:           device.Name,
+		WxID:           device.WxID,
+		Nickname:       device.Nickname,
+		WeChatNickname: device.WeChatNickname,
 	}
 }

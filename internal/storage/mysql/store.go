@@ -110,6 +110,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureAPIKeyEnabledColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureDeviceWeChatNicknameColumn(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureAPIKeyCredentialColumns(ctx); err != nil {
 		return err
 	}
@@ -126,6 +129,14 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) ensureDeviceWeChatNicknameColumn(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE bridge_devices ADD COLUMN wechat_nickname VARCHAR(255) NULL AFTER nickname`)
+	if err == nil || strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return nil
+	}
+	return err
 }
 
 const messageEventChatIDExpression = `CASE
@@ -368,6 +379,7 @@ func Migrations() []string {
 			name VARCHAR(128) NOT NULL PRIMARY KEY,
 			wxid VARCHAR(191) NOT NULL,
 			nickname VARCHAR(255) NOT NULL,
+			wechat_nickname VARCHAR(255) NULL,
 			timeout_ms BIGINT NOT NULL DEFAULT 5000,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -607,13 +619,32 @@ func (s *Store) UpdateDeviceIdentity(ctx context.Context, deviceName string, wxi
 	deviceName = strings.TrimSpace(deviceName)
 	nickname = firstNonEmpty(strings.TrimSpace(nickname), deviceName)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO bridge_devices (name, wxid, nickname, timeout_ms)
-		VALUES (?, ?, ?, 5000)
+		INSERT INTO bridge_devices (name, wxid, nickname, wechat_nickname, timeout_ms)
+		VALUES (?, ?, ?, NULL, 5000)
 		ON DUPLICATE KEY UPDATE
 			wxid = VALUES(wxid)`,
 		deviceName,
 		strings.TrimSpace(wxid),
 		nickname,
+	)
+	return err
+}
+
+func (s *Store) UpdateDeviceWeChatIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error {
+	deviceName = strings.TrimSpace(deviceName)
+	if deviceName == "" {
+		return errors.New("device name is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO bridge_devices (name, wxid, nickname, wechat_nickname, timeout_ms)
+		VALUES (?, ?, ?, ?, 5000)
+		ON DUPLICATE KEY UPDATE
+			wxid = VALUES(wxid),
+			wechat_nickname = VALUES(wechat_nickname)`,
+		deviceName,
+		strings.TrimSpace(wxid),
+		deviceName,
+		strings.TrimSpace(nickname),
 	)
 	return err
 }
@@ -652,17 +683,19 @@ func scanAPIKey(row interface{ Scan(...any) error }) (config.APIKey, bool, error
 
 func (s *Store) LookupDevice(ctx context.Context, name string) (config.Device, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT name, wxid, nickname, timeout_ms
+		SELECT name, wxid, nickname, wechat_nickname, timeout_ms
 		FROM bridge_devices
 		WHERE name = ?`, strings.TrimSpace(name))
 	var device config.Device
+	var wechatNickname sql.NullString
 	var timeoutMS int64
-	if err := row.Scan(&device.Name, &device.WxID, &device.Nickname, &timeoutMS); err != nil {
+	if err := row.Scan(&device.Name, &device.WxID, &device.Nickname, &wechatNickname, &timeoutMS); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return config.Device{}, false, nil
 		}
 		return config.Device{}, false, err
 	}
+	device.WeChatNickname = wechatNickname.String
 	device.Timeout = time.Duration(timeoutMS) * time.Millisecond
 	return device, true, nil
 }
@@ -765,7 +798,7 @@ func (s *Store) LookupDeviceByWxID(ctx context.Context, wxid string) (config.Dev
 		return config.Device{}, false, nil
 	}
 	row := s.db.QueryRowContext(ctx, `
-		SELECT d.name, d.wxid, d.nickname, d.timeout_ms
+		SELECT d.name, d.wxid, d.nickname, d.wechat_nickname, d.timeout_ms
 		FROM bridge_devices d
 		WHERE d.wxid = ?
 		ORDER BY
@@ -787,13 +820,15 @@ func (s *Store) LookupDeviceByWxID(ctx context.Context, wxid string) (config.Dev
 		LIMIT 1`,
 		wxid)
 	var device config.Device
+	var wechatNickname sql.NullString
 	var timeoutMS int64
-	if err := row.Scan(&device.Name, &device.WxID, &device.Nickname, &timeoutMS); err != nil {
+	if err := row.Scan(&device.Name, &device.WxID, &device.Nickname, &wechatNickname, &timeoutMS); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return config.Device{}, false, nil
 		}
 		return config.Device{}, false, err
 	}
+	device.WeChatNickname = wechatNickname.String
 	device.Timeout = time.Duration(timeoutMS) * time.Millisecond
 	return device, true, nil
 }
@@ -1456,18 +1491,23 @@ func (s *Store) SetAPIKeyEnabled(ctx context.Context, code string, enabled bool)
 
 func upsertDevice(ctx context.Context, exec sqlExecutor, device config.Device) error {
 	_, err := exec.ExecContext(ctx, `
-		INSERT INTO bridge_devices (name, wxid, nickname, timeout_ms)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO bridge_devices (name, wxid, nickname, wechat_nickname, timeout_ms)
+		VALUES (?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 			wxid = CASE
 				WHEN VALUES(wxid) <> '' THEN VALUES(wxid)
 				ELSE wxid
 			END,
 			nickname = VALUES(nickname),
+			wechat_nickname = CASE
+				WHEN VALUES(wechat_nickname) IS NOT NULL AND VALUES(wechat_nickname) <> '' THEN VALUES(wechat_nickname)
+				ELSE wechat_nickname
+			END,
 			timeout_ms = VALUES(timeout_ms)`,
 		strings.TrimSpace(device.Name),
 		strings.TrimSpace(device.WxID),
 		strings.TrimSpace(device.Nickname),
+		strings.TrimSpace(device.WeChatNickname),
 		device.Timeout.Milliseconds(),
 	)
 	return err
@@ -1498,7 +1538,7 @@ func (s *Store) loadAPIKeys(ctx context.Context, out map[string]config.APIKey) e
 
 func (s *Store) loadDevices(ctx context.Context, out map[string]config.Device) error {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT name, wxid, nickname, timeout_ms
+		SELECT name, wxid, nickname, wechat_nickname, timeout_ms
 		FROM bridge_devices`)
 	if err != nil {
 		return err
@@ -1506,10 +1546,12 @@ func (s *Store) loadDevices(ctx context.Context, out map[string]config.Device) e
 	defer rows.Close()
 	for rows.Next() {
 		var device config.Device
+		var wechatNickname sql.NullString
 		var timeoutMS int64
-		if err := rows.Scan(&device.Name, &device.WxID, &device.Nickname, &timeoutMS); err != nil {
+		if err := rows.Scan(&device.Name, &device.WxID, &device.Nickname, &wechatNickname, &timeoutMS); err != nil {
 			return err
 		}
+		device.WeChatNickname = wechatNickname.String
 		device.Timeout = time.Duration(timeoutMS) * time.Millisecond
 		out[device.Name] = device
 	}

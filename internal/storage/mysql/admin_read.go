@@ -268,7 +268,7 @@ func scanMessageEvent(row rowScanner) (bridge.MessageEvent, error) {
 }
 
 const listModuleStatusesStatement = `
-		SELECT ak.device, d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), ak.enabled, d.updated_at,
+		SELECT ak.device, d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), d.wechat_nickname, ak.enabled, d.updated_at,
 			rt.last_register_at,
 			rt.last_poll_at,
 			rt.last_ack_at,
@@ -364,7 +364,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 	out := []bridge.ModuleStatusView{}
 	for rows.Next() {
 		var item bridge.ModuleStatusView
-		var deviceWxID, deviceNickname sql.NullString
+		var deviceWxID, deviceNickname, wechatNickname sql.NullString
 		var enabled bool
 		var runtimeError, runtimeAPIKey, activeAPIKey sql.NullString
 		var deviceUpdatedAt sql.NullTime
@@ -378,6 +378,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			&item.Device,
 			&deviceWxID,
 			&deviceNickname,
+			&wechatNickname,
 			&enabled,
 			&deviceUpdatedAt,
 			&lastRegisterAt,
@@ -404,6 +405,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		}
 		item.DeviceWxID = deviceWxID.String
 		item.DeviceNickname = deviceNickname.String
+		item.WeChatNickname = wechatNickname.String
 		item.Enabled = enabled
 		item.Registered = item.Enabled &&
 			strings.TrimSpace(item.DeviceWxID) != "" &&
