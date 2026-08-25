@@ -659,6 +659,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (isBlank(wxid)) {
             wxid = CURRENT_WXID;
         }
+        if (isBlank(nickname) && !isBlank(wxid)) {
+            nickname = readSingleString(db,
+                    "SELECT nickname FROM rcontact WHERE username = ? LIMIT 1",
+                    new String[]{wxid});
+        }
         if (isBlank(nickname)) {
             nickname = CURRENT_NICKNAME;
         }
@@ -724,6 +729,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
         } catch (Throwable ignored) {
             // WeChat database schemas vary between versions; try the next candidate.
+        } finally {
+            closeQuietly(cursor);
+        }
+        return "";
+    }
+
+    private static String readSingleString(Object db, String sql, String[] args) {
+        Object cursor = null;
+        try {
+            cursor = rawQuery(db, sql, args == null ? new String[]{} : args);
+            if (cursor == null) {
+                return "";
+            }
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return stringColumn(cursor, 0);
+            }
+        } catch (Throwable ignored) {
+            // WeChat database schemas vary between versions; keep the wxid fallback.
         } finally {
             closeQuietly(cursor);
         }
