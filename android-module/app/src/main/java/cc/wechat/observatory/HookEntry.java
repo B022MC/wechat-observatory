@@ -422,7 +422,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         continue;
                     }
                     if (!isWeChatReadyForSend(classLoader)) {
-                        log("WeChat send stack not ready; skip outbox websocket");
+                        log("WeChat send stack not ready; skip outbox delivery");
+                    } else if (!config.outboxWebSocketEnabled) {
+                        // Polling keeps each request bound to the latest wxid.
+                        pollOutbox(config, classLoader);
                     } else if (!runOutboxWebSocket(config, classLoader)) {
                         pollOutbox(config, classLoader);
                     }
@@ -649,9 +652,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static boolean bindRuntimeIdentity(BridgeConfig config) {
         String wxid = "";
         String nickname = "";
-        Object db = LAST_DATABASE;
+        // WeChat can keep the module process alive while replacing its account
+        // database. Always rescan the active database set before using the
+        // cached handle, otherwise a switched account can inherit the old wxid.
+        Object db = findContactDatabaseOnMainThread(config);
         if (db == null) {
-            db = findContactDatabaseOnMainThread(config);
+            db = LAST_DATABASE;
+        } else if (LAST_DATABASE != db) {
+            log("runtime database changed path=" + databasePath(db));
+            LAST_DATABASE = db;
         }
         WeChatIdentity identity = readWeChatIdentity(db);
         wxid = identity.wxid;
@@ -708,7 +717,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 }
                 continue;
             }
-            if (looksLikeWxid(value)) {
+            if (looksLikeAccountId(value)) {
                 wxid = value;
                 break;
             }
@@ -1540,6 +1549,43 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 || normalized.contains("_");
     }
 
+    /**
+     * Identity check for the logged-in account row.
+     *
+     * <p>WeChat 8.0.7x stores the current account identifier in
+     * {@code userinfo.id=2} as the account's WeChat ID (alias), for example
+     * {@code xiaodao390696}, when the account signs in with a WeChat ID and
+     * password instead of a wxid-style login. Such values do not satisfy
+     * {@link #looksLikeWxid(String)}, but they are the only stable account
+     * identity present in the database, so device registration must accept
+     * them. The stricter {@code looksLikeWxid} check stays in place for
+     * chatroom sender parsing, where accepting arbitrary text would corrupt
+     * message normalization.
+     */
+    private static boolean looksLikeAccountId(String value) {
+        if (looksLikeWxid(value)) {
+            return true;
+        }
+        if (isBlank(value)) {
+            return false;
+        }
+        String normalized = value.trim();
+        if (normalized.length() < 3 || normalized.length() > 64) {
+            return false;
+        }
+        for (int i = 0; i < normalized.length(); i++) {
+            char c = normalized.charAt(i);
+            boolean allowed = (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '_' || c == '-' || c == '.';
+            if (!allowed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static JSONArray readContacts(Object db, BridgeConfig config) throws Exception {
         int limit = ContactSnapshotPlan.outputLimit(config.contactSyncLimit);
         Object cursor = rawQuery(db, ContactSnapshotPlan.CONTACT_QUERY, new String[0]);
@@ -1708,17 +1754,34 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (verboseScanLog) {
                 log("contact database scan active db count=" + databases.length);
             }
+            Object identityDatabase = null;
+            Object contactDatabase = null;
             for (Object db : databases) {
                 if (db == null) {
                     continue;
                 }
                 try {
+                    WeChatIdentity identity = readWeChatIdentity(db);
+                    if (!isBlank(identity.wxid)) {
+                        if (!isBlank(CURRENT_WXID) && !CURRENT_WXID.equals(identity.wxid)) {
+                            LAST_DATABASE = db;
+                            log("selected switched WeChat identity wxid=" + identity.wxid
+                                    + " path=" + databasePath(db));
+                            return db;
+                        }
+                        if (identityDatabase == null) {
+                            identityDatabase = db;
+                        }
+                    }
                     JSONArray contacts = readContacts(db, config);
                     if (contacts.length() > 0) {
-                        LAST_DATABASE = db;
-                        log("captured WeChat database from active set path=" + databasePath(db)
-                                + " contacts=" + contacts.length());
-                        return db;
+                        if (contactDatabase == null) {
+                            contactDatabase = db;
+                            if (verboseScanLog) {
+                                log("found contact database candidate path=" + databasePath(db)
+                                        + " contacts=" + contacts.length());
+                            }
+                        }
                     }
                     if (verboseScanLog) {
                         log("contact database candidate empty path=" + databasePath(db));
@@ -1729,6 +1792,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 + " error=" + shortError(ignored));
                     }
                 }
+            }
+            if (identityDatabase != null) {
+                LAST_DATABASE = identityDatabase;
+                return identityDatabase;
+            }
+            if (contactDatabase != null) {
+                LAST_DATABASE = contactDatabase;
+                log("captured WeChat database from active set path=" + databasePath(contactDatabase));
+                return contactDatabase;
             }
         } catch (Throwable t) {
             log("contact database scan failed: " + shortError(t));
@@ -1962,7 +2034,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
             while (true) {
                 if (configChanged(config)) {
-                    log("outbox websocket config changed; reconnect");
+                    log("outbox websocket config or WeChat identity changed; reconnect");
                     return;
                 }
                 WebSocketFrame frame = readWebSocketFrame(input);
@@ -2005,7 +2077,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean configChanged(BridgeConfig config) {
         BridgeConfig latest = BridgeConfig.load(bridgeContext());
-        return !String.valueOf(config.signature).equals(String.valueOf(latest.signature));
+        if (!String.valueOf(config.signature).equals(String.valueOf(latest.signature))) {
+            return true;
+        }
+        // A WeChat account switch updates CURRENT_WXID without changing module config.
+        // Close the old stream so the outer worker can register and reconnect with the
+        // new account identity instead of continuing to lease the old session.
+        return !isBlank(CURRENT_WXID)
+                && !isBlank(config.selfWxid)
+                && !CURRENT_WXID.equals(config.selfWxid);
     }
 
     private static JSONArray handleOutboxItems(JSONArray items, ClassLoader classLoader) throws Exception {
