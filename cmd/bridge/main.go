@@ -55,22 +55,32 @@ func main() {
 		opts = append(opts, bridge.WithAdminReader(store))
 	}
 	service := bridge.NewService(bridge.Config{
-		DefaultDevice: cfg.DefaultDevice,
-		Devices:       cfg.Devices,
-		APIKeys:       cfg.APIKeys,
-		InstanceID:    cfg.InstanceID,
-		SessionTTL:    cfg.SessionTTL,
-		PollInterval:  cfg.PollInterval,
+		DefaultDevice:          cfg.DefaultDevice,
+		Devices:                cfg.Devices,
+		APIKeys:                cfg.APIKeys,
+		InstanceID:             cfg.InstanceID,
+		SessionTTL:             cfg.SessionTTL,
+		PollInterval:           cfg.PollInterval,
+		OfflineAfter:           cfg.ModuleOfflineAfter,
+		EventIdentityV2Devices: cfg.EventIdentityV2,
 	}, opts...)
 
 	httpServer := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           bridge.NewHTTPServer(service, cfg.AdminPassword).Handler(),
+		Addr: cfg.HTTPAddr,
+		Handler: bridge.NewHTTPServer(
+			service,
+			cfg.AdminPassword,
+			bridge.WithDeviceAdminPassword(cfg.DeviceAdminPassword),
+		).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if store != nil {
+		go startHistoryRetention(ctx, store, cfg.RetentionDays, cfg.RetentionPoll)
+		go startOfflineOutboxCancellation(ctx, store, cfg.ModuleOfflineAfter, cfg.OfflineOutboxSweep)
+	}
 
 	errs := make(chan error, 1)
 	go func() {
@@ -89,6 +99,66 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+}
+
+type historyRetentionStore interface {
+	PurgeExpiredHistory(context.Context, int) (mysqlstore.RetentionCleanup, error)
+}
+
+type offlineOutboxStore interface {
+	CancelOfflineOutbox(context.Context, time.Duration) (int64, error)
+}
+
+func startHistoryRetention(ctx context.Context, store historyRetentionStore, retentionDays int, interval time.Duration) {
+	if store == nil || retentionDays <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		result, err := store.PurgeExpiredHistory(cleanupCtx, retentionDays)
+		cancel()
+		if err != nil {
+			log.Printf("retained history cleanup failed: %v", err)
+		} else if result.MessageEvents > 0 || result.TerminalOutbox > 0 {
+			log.Printf("retained history cleanup complete: messages=%d terminal_outbox=%d", result.MessageEvents, result.TerminalOutbox)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func startOfflineOutboxCancellation(ctx context.Context, store offlineOutboxStore, offlineAfter time.Duration, interval time.Duration) {
+	if store == nil || offlineAfter <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		cleanupCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		cancelled, err := store.CancelOfflineOutbox(cleanupCtx, offlineAfter)
+		cancel()
+		if err != nil {
+			log.Printf("offline outbox cancellation failed: %v", err)
+		} else if cancelled > 0 {
+			log.Printf("offline outbox cancellation complete: cancelled=%d", cancelled)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func initializeMySQL(cfg config.Config) (*mysqlstore.Store, error) {

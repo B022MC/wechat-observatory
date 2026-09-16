@@ -39,11 +39,18 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+
 import cc.wechat.observatory.config.BridgeConfig;
+import cc.wechat.observatory.gateway.GatewayEndpoint;
 import cc.wechat.observatory.gateway.WebSocketFrame;
 import cc.wechat.observatory.model.MessagePayload;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.wechat.LocalMessageConfirmation;
+import cc.wechat.observatory.wechat.HistoricalMessageReplayGuard;
 import cc.wechat.observatory.wechat.QueueSubmissionRetrier;
 import cc.wechat.observatory.wechat.SendResult;
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -61,6 +68,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final String WECHAT_PACKAGE = "com.tencent.mm";
     private static final AtomicBoolean WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean OUTBOX_WORKER_STARTED = new AtomicBoolean(false);
+    private static final HistoricalMessageReplayGuard HISTORICAL_MESSAGE_REPLAY_GUARD = new HistoricalMessageReplayGuard();
     private static volatile String LAST_READY_STATE = "";
     private static volatile String LAST_CLASSLOADER_STATE = "";
     private static volatile Object LAST_DATABASE;
@@ -70,6 +78,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_MESSAGE_POLL_AT = 0L;
     private static volatile long LAST_MESSAGE_ID = 0L;
     private static volatile boolean MESSAGE_WATERMARK_READY = false;
+    private static volatile boolean STALE_MESSAGE_REPLAY_LIMIT_LOGGED = false;
     private static volatile long LAST_WEBSOCKET_FAIL_LOG_AT = 0L;
     private static volatile String CURRENT_WXID = "";
     private static volatile String CURRENT_NICKNAME = "";
@@ -303,6 +312,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (!config.enabled || isBlank(config.baseUrl) || isBlank(config.apiKey)) {
                 return;
             }
+            long normalizedCreateTime = normalizeCreateTime(createTime);
+            if (!allowsHistoricalMessage(config, normalizedCreateTime)) {
+                return;
+            }
             if (!bindRuntimeIdentity(config)) {
                 return;
             }
@@ -409,7 +422,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         continue;
                     }
                     if (!isWeChatReadyForSend(classLoader)) {
-                        log("WeChat send stack not ready; skip outbox websocket");
+                        log("WeChat send stack not ready; skip outbox delivery");
+                    } else if (!config.outboxWebSocketEnabled) {
+                        // Polling keeps each request bound to the latest wxid.
+                        pollOutbox(config, classLoader);
                     } else if (!runOutboxWebSocket(config, classLoader)) {
                         pollOutbox(config, classLoader);
                     }
@@ -636,15 +652,26 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static boolean bindRuntimeIdentity(BridgeConfig config) {
         String wxid = "";
         String nickname = "";
-        Object db = LAST_DATABASE;
+        // WeChat can keep the module process alive while replacing its account
+        // database. Always rescan the active database set before using the
+        // cached handle, otherwise a switched account can inherit the old wxid.
+        Object db = findContactDatabaseOnMainThread(config);
         if (db == null) {
-            db = findContactDatabaseOnMainThread(config);
+            db = LAST_DATABASE;
+        } else if (LAST_DATABASE != db) {
+            log("runtime database changed path=" + databasePath(db));
+            LAST_DATABASE = db;
         }
         WeChatIdentity identity = readWeChatIdentity(db);
         wxid = identity.wxid;
         nickname = identity.nickname;
         if (isBlank(wxid)) {
             wxid = CURRENT_WXID;
+        }
+        if (isBlank(nickname) && !isBlank(wxid)) {
+            nickname = readSingleString(db,
+                    "SELECT nickname FROM rcontact WHERE username = ? LIMIT 1",
+                    new String[]{wxid});
         }
         if (isBlank(nickname)) {
             nickname = CURRENT_NICKNAME;
@@ -690,7 +717,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 }
                 continue;
             }
-            if (looksLikeWxid(value)) {
+            if (looksLikeAccountId(value)) {
                 wxid = value;
                 break;
             }
@@ -711,6 +738,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
         } catch (Throwable ignored) {
             // WeChat database schemas vary between versions; try the next candidate.
+        } finally {
+            closeQuietly(cursor);
+        }
+        return "";
+    }
+
+    private static String readSingleString(Object db, String sql, String[] args) {
+        Object cursor = null;
+        try {
+            cursor = rawQuery(db, sql, args == null ? new String[]{} : args);
+            if (cursor == null) {
+                return "";
+            }
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return stringColumn(cursor, 0);
+            }
+        } catch (Throwable ignored) {
+            // WeChat database schemas vary between versions; keep the wxid fallback.
         } finally {
             closeQuietly(cursor);
         }
@@ -908,6 +954,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 int type = intColumn(cursor, 5);
                 String imgPath = hasMediaHint ? stringColumn(cursor, 6) : "";
                 if (!shouldReportMessage(talker, content, type)) {
+                    continue;
+                }
+                if (!allowsHistoricalMessage(config, createTime)) {
                     continue;
                 }
 
@@ -1500,13 +1549,46 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 || normalized.contains("_");
     }
 
+    /**
+     * Identity check for the logged-in account row.
+     *
+     * <p>WeChat 8.0.7x stores the current account identifier in
+     * {@code userinfo.id=2} as the account's WeChat ID (alias), for example
+     * {@code xiaodao390696}, when the account signs in with a WeChat ID and
+     * password instead of a wxid-style login. Such values do not satisfy
+     * {@link #looksLikeWxid(String)}, but they are the only stable account
+     * identity present in the database, so device registration must accept
+     * them. The stricter {@code looksLikeWxid} check stays in place for
+     * chatroom sender parsing, where accepting arbitrary text would corrupt
+     * message normalization.
+     */
+    private static boolean looksLikeAccountId(String value) {
+        if (looksLikeWxid(value)) {
+            return true;
+        }
+        if (isBlank(value)) {
+            return false;
+        }
+        String normalized = value.trim();
+        if (normalized.length() < 3 || normalized.length() > 64) {
+            return false;
+        }
+        for (int i = 0; i < normalized.length(); i++) {
+            char c = normalized.charAt(i);
+            boolean allowed = (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '_' || c == '-' || c == '.';
+            if (!allowed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static JSONArray readContacts(Object db, BridgeConfig config) throws Exception {
-        int limit = config.contactSyncLimit <= 0 ? 1000 : Math.min(config.contactSyncLimit, 10000);
-        Object cursor = rawQuery(db, ""
-                + "SELECT username,nickname,conRemark,alias,type,verifyFlag "
-                + "FROM rcontact "
-                + "WHERE username IS NOT NULL AND username <> '' "
-                + "LIMIT ?", new String[]{String.valueOf(limit)});
+        int limit = ContactSnapshotPlan.outputLimit(config.contactSyncLimit);
+        Object cursor = rawQuery(db, ContactSnapshotPlan.CONTACT_QUERY, new String[0]);
         JSONArray out = new JSONArray();
         Set<String> seen = new HashSet<>();
         if (cursor == null) {
@@ -1514,7 +1596,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
         try {
             Method moveToNext = findNoArgMethod(cursor.getClass(), "moveToNext");
-            while (Boolean.TRUE.equals(moveToNext.invoke(cursor))) {
+            while (out.length() < limit && Boolean.TRUE.equals(moveToNext.invoke(cursor))) {
                 String wxid = stringColumn(cursor, 0);
                 int type = intColumn(cursor, 4);
                 boolean chatroom = wxid.toLowerCase(Locale.US).endsWith("@chatroom");
@@ -1672,17 +1754,34 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (verboseScanLog) {
                 log("contact database scan active db count=" + databases.length);
             }
+            Object identityDatabase = null;
+            Object contactDatabase = null;
             for (Object db : databases) {
                 if (db == null) {
                     continue;
                 }
                 try {
+                    WeChatIdentity identity = readWeChatIdentity(db);
+                    if (!isBlank(identity.wxid)) {
+                        if (!isBlank(CURRENT_WXID) && !CURRENT_WXID.equals(identity.wxid)) {
+                            LAST_DATABASE = db;
+                            log("selected switched WeChat identity wxid=" + identity.wxid
+                                    + " path=" + databasePath(db));
+                            return db;
+                        }
+                        if (identityDatabase == null) {
+                            identityDatabase = db;
+                        }
+                    }
                     JSONArray contacts = readContacts(db, config);
                     if (contacts.length() > 0) {
-                        LAST_DATABASE = db;
-                        log("captured WeChat database from active set path=" + databasePath(db)
-                                + " contacts=" + contacts.length());
-                        return db;
+                        if (contactDatabase == null) {
+                            contactDatabase = db;
+                            if (verboseScanLog) {
+                                log("found contact database candidate path=" + databasePath(db)
+                                        + " contacts=" + contacts.length());
+                            }
+                        }
                     }
                     if (verboseScanLog) {
                         log("contact database candidate empty path=" + databasePath(db));
@@ -1693,6 +1792,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 + " error=" + shortError(ignored));
                     }
                 }
+            }
+            if (identityDatabase != null) {
+                LAST_DATABASE = identityDatabase;
+                return identityDatabase;
+            }
+            if (contactDatabase != null) {
+                LAST_DATABASE = contactDatabase;
+                log("captured WeChat database from active set path=" + databasePath(contactDatabase));
+                return contactDatabase;
             }
         } catch (Throwable t) {
             log("contact database scan failed: " + shortError(t));
@@ -1884,7 +1992,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static boolean runOutboxWebSocket(BridgeConfig config, ClassLoader classLoader) {
-        if (!supportsPlainHttp(config)) {
+        if (!supportsWebSocket(config)) {
             return false;
         }
         try {
@@ -1896,23 +2004,18 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void websocketLoop(BridgeConfig config, ClassLoader classLoader) throws Exception {
-        URL base = new URL(trimRight(config.baseUrl, "/"));
-        int port = base.getPort() > 0 ? base.getPort() : 80;
-        String host = base.getHost();
-        String hostHeader = base.getPort() > 0 ? host + ":" + port : host;
-        String path = trimRight(base.getPath(), "/") + "/module/outbox/ws"
+        GatewayEndpoint endpoint = GatewayEndpoint.parse(config.baseUrl);
+        String host = endpoint.host();
+        String hostHeader = endpoint.hostHeader();
+        String path = endpoint.requestPath("/module/outbox/ws")
                 + "?api_key=" + urlEncode(config.apiKey)
                 + "&device=" + urlEncode(config.device)
                 + "&wxid=" + urlEncode(config.selfWxid);
-        if (path.startsWith("//")) {
-            path = path.substring(1);
-        }
         byte[] nonce = new byte[16];
         new SecureRandom().nextBytes(nonce);
         String key = Base64.encodeToString(nonce, Base64.NO_WRAP);
 
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 5000);
+        try (Socket socket = openGatewaySocket(host, endpoint.port(), endpoint.isTls())) {
             socket.setSoTimeout(30000);
             InputStream input = socket.getInputStream();
             OutputStream output = socket.getOutputStream();
@@ -1931,7 +2034,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
             while (true) {
                 if (configChanged(config)) {
-                    log("outbox websocket config changed; reconnect");
+                    log("outbox websocket config or WeChat identity changed; reconnect");
                     return;
                 }
                 WebSocketFrame frame = readWebSocketFrame(input);
@@ -1974,7 +2077,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean configChanged(BridgeConfig config) {
         BridgeConfig latest = BridgeConfig.load(bridgeContext());
-        return !String.valueOf(config.signature).equals(String.valueOf(latest.signature));
+        if (!String.valueOf(config.signature).equals(String.valueOf(latest.signature))) {
+            return true;
+        }
+        // A WeChat account switch updates CURRENT_WXID without changing module config.
+        // Close the old stream so the outer worker can register and reconnect with the
+        // new account identity instead of continuing to lease the old session.
+        return !isBlank(CURRENT_WXID)
+                && !isBlank(config.selfWxid)
+                && !CURRENT_WXID.equals(config.selfWxid);
     }
 
     private static JSONArray handleOutboxItems(JSONArray items, ClassLoader classLoader) throws Exception {
@@ -2137,8 +2248,39 @@ public final class HookEntry implements IXposedHookLoadPackage {
         output.flush();
     }
 
-    private static boolean supportsPlainHttp(BridgeConfig config) {
-        return config.baseUrl != null && config.baseUrl.trim().toLowerCase(Locale.US).startsWith("http://");
+    private static boolean supportsWebSocket(BridgeConfig config) {
+        try {
+            GatewayEndpoint.parse(config.baseUrl);
+            return true;
+        } catch (Throwable t) {
+            logWebSocketFailure("outbox websocket URL unavailable: " + shortError(t));
+            return false;
+        }
+    }
+
+    private static Socket openGatewaySocket(String host, int port, boolean tls) throws Exception {
+        Socket plain = new Socket();
+        try {
+            plain.connect(new InetSocketAddress(host, port), 5000);
+            plain.setSoTimeout(5000);
+            if (!tls) {
+                return plain;
+            }
+
+            SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+            SSLSocket secure = (SSLSocket) factory.createSocket(plain, host, port, true);
+            secure.startHandshake();
+            if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, secure.getSession())) {
+                throw new SSLHandshakeException("TLS hostname verification failed for " + host);
+            }
+            return secure;
+        } catch (Throwable t) {
+            try {
+                plain.close();
+            } catch (IOException ignored) {
+            }
+            throw t;
+        }
     }
 
     private static String urlEncode(String value) {
@@ -2700,7 +2842,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String postJson(BridgeConfig config, String path, String bodyJson) throws Exception {
-        if (config.baseUrl != null && config.baseUrl.trim().toLowerCase(Locale.US).startsWith("http://")) {
+        GatewayEndpoint endpoint = GatewayEndpoint.parse(config.baseUrl);
+        if (!endpoint.isTls()) {
             return postJsonSocket(config, path, bodyJson);
         }
         try {
@@ -2713,14 +2856,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String postJsonSocket(BridgeConfig config, String path, String bodyJson) throws Exception {
-        URL url = new URL(trimRight(config.baseUrl, "/") + path);
+        GatewayEndpoint endpoint = GatewayEndpoint.parse(config.baseUrl);
+        URL url = endpoint.resolve(path);
         String requestPath = url.getFile();
         if (isBlank(requestPath)) {
             requestPath = "/";
         }
-        int port = url.getPort() > 0 ? url.getPort() : 80;
-        String host = url.getHost();
-        String hostHeader = url.getPort() > 0 ? host + ":" + port : host;
+        int port = endpoint.port();
+        String host = endpoint.host();
+        String hostHeader = endpoint.hostHeader();
         byte[] body = bodyJson.getBytes(StandardCharsets.UTF_8);
         log("postJsonSocket path=" + path + " host=" + hostHeader + " bodyBytes=" + body.length);
 
@@ -2814,7 +2958,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String postJsonOnce(BridgeConfig config, String path, String bodyJson) throws Exception {
-        URL url = new URL(trimRight(config.baseUrl, "/") + path);
+        URL url = GatewayEndpoint.parse(config.baseUrl).resolve(path);
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
         connection.setConnectTimeout(5000);
         connection.setReadTimeout(5000);
@@ -2868,6 +3012,22 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return System.currentTimeMillis() / 1000L;
         }
         return createTime > 10_000_000_000L ? createTime / 1000L : createTime;
+    }
+
+    private static boolean allowsHistoricalMessage(BridgeConfig config, long createTimeSeconds) {
+        if (HISTORICAL_MESSAGE_REPLAY_GUARD.allows(
+                System.currentTimeMillis(),
+                createTimeSeconds,
+                config.staleMessageGraceMs,
+                config.staleMessageReplayLimit)) {
+            return true;
+        }
+        if (!STALE_MESSAGE_REPLAY_LIMIT_LOGGED) {
+            STALE_MESSAGE_REPLAY_LIMIT_LOGGED = true;
+            log("stale message replay limit reached; skipping additional historical inserts limit="
+                    + config.staleMessageReplayLimit);
+        }
+        return false;
     }
 
     private static void log(String message) {

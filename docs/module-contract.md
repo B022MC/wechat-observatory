@@ -217,6 +217,19 @@ Request:
 }
 ```
 
+Response:
+
+```json
+{
+  "ok": true,
+  "outbox_id": 123
+}
+```
+
+`outbox_id` identifies the queued delivery task. It is not a WeChat
+`chat_record_id`; the latter is known only after the module sends the message
+and WeChat reports the sent event or ACK.
+
 Rules:
 
 - `owner_wxid` is required for admin sends.

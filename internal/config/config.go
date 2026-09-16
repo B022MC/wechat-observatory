@@ -11,21 +11,29 @@ import (
 )
 
 const (
-	defaultHTTPAddr      = ":8088"
-	DefaultAdminPassword = "change-this-password"
-	currentAdminPassEnv  = "BRIDGE_ADMIN_PASSWORD"
+	defaultHTTPAddr           = ":8088"
+	defaultOutboxPollInterval = 3 * time.Second
+	DefaultAdminPassword      = "change-this-password"
+	currentAdminPassEnv       = "BRIDGE_ADMIN_PASSWORD"
+	deviceAdminPassEnv        = "BRIDGE_DEVICE_ADMIN_PASSWORD"
 )
 
 type Config struct {
-	HTTPAddr      string
-	AdminPassword string
-	DefaultDevice string
-	InstanceID    string
-	SessionTTL    time.Duration
-	PollInterval  time.Duration
-	Devices       map[string]Device
-	APIKeys       map[string]APIKey
-	MySQL         MySQLConfig
+	HTTPAddr            string
+	AdminPassword       string
+	DeviceAdminPassword string
+	DefaultDevice       string
+	InstanceID          string
+	SessionTTL          time.Duration
+	PollInterval        time.Duration
+	ModuleOfflineAfter  time.Duration
+	OfflineOutboxSweep  time.Duration
+	RetentionDays       int
+	RetentionPoll       time.Duration
+	EventIdentityV2     map[string]struct{}
+	Devices             map[string]Device
+	APIKeys             map[string]APIKey
+	MySQL               MySQLConfig
 }
 
 type MySQLConfig struct {
@@ -38,29 +46,38 @@ func (cfg MySQLConfig) Enabled() bool {
 }
 
 type Device struct {
-	Name     string
-	WxID     string
-	Nickname string
-	Timeout  time.Duration
+	Name           string
+	WxID           string
+	Nickname       string
+	WeChatNickname string
+	Timeout        time.Duration
 }
 
 type APIKey struct {
-	Code     string `json:"-"`
-	Device   string `json:"device,omitempty"`
-	Nickname string `json:"nickname,omitempty"`
-	Disabled bool   `json:"disabled,omitempty"`
+	Code         string `json:"-"`
+	CredentialID string `json:"-"`
+	AuthVersion  int64  `json:"-"`
+	Device       string `json:"device,omitempty"`
+	Nickname     string `json:"nickname,omitempty"`
+	Disabled     bool   `json:"disabled,omitempty"`
 }
 
 func LoadFromEnv() (Config, error) {
 	cfg := Config{
-		HTTPAddr:      getenv("BRIDGE_HTTP_ADDR", defaultHTTPAddr),
-		AdminPassword: adminPasswordFromEnv(),
-		DefaultDevice: strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_DEVICE")),
-		InstanceID:    instanceID(),
-		SessionTTL:    getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
-		PollInterval:  getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", time.Second),
-		Devices:       map[string]Device{},
-		APIKeys:       map[string]APIKey{},
+		HTTPAddr:            getenv("BRIDGE_HTTP_ADDR", defaultHTTPAddr),
+		AdminPassword:       adminPasswordFromEnv(),
+		DeviceAdminPassword: strings.TrimSpace(os.Getenv(deviceAdminPassEnv)),
+		DefaultDevice:       strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_DEVICE")),
+		InstanceID:          instanceID(),
+		SessionTTL:          getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
+		PollInterval:        getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", defaultOutboxPollInterval),
+		ModuleOfflineAfter:  getenvDuration("BRIDGE_MODULE_OFFLINE_AFTER", 5*time.Minute),
+		OfflineOutboxSweep:  getenvDuration("BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL", 30*time.Second),
+		RetentionDays:       getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),
+		RetentionPoll:       getenvDuration("BRIDGE_HISTORY_RETENTION_INTERVAL", time.Hour),
+		EventIdentityV2:     parseStringSet(os.Getenv("BRIDGE_EVENT_IDENTITY_V2_DEVICES")),
+		Devices:             map[string]Device{},
+		APIKeys:             map[string]APIKey{},
 		MySQL: MySQLConfig{
 			DSN: strings.TrimSpace(os.Getenv("BRIDGE_MYSQL_DSN")),
 		},
@@ -68,6 +85,9 @@ func LoadFromEnv() (Config, error) {
 
 	if err := validateListenAddr("BRIDGE_HTTP_ADDR", cfg.HTTPAddr); err != nil {
 		return Config{}, err
+	}
+	if cfg.DeviceAdminPassword != "" && cfg.DeviceAdminPassword == cfg.AdminPassword {
+		return Config{}, errors.New("BRIDGE_DEVICE_ADMIN_PASSWORD must differ from BRIDGE_ADMIN_PASSWORD")
 	}
 
 	autoMigrate, err := getenvBool("BRIDGE_MYSQL_AUTO_MIGRATE", false)
@@ -93,6 +113,19 @@ func LoadFromEnv() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseStringSet(raw string) map[string]struct{} {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	})
+	values := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			values[value] = struct{}{}
+		}
+	}
+	return values
 }
 
 func (cfg *Config) EnsureRuntimeReady() error {
@@ -144,6 +177,18 @@ func getenvDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func getenvPositiveInt(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
 	if err != nil || value <= 0 {
 		return fallback
 	}

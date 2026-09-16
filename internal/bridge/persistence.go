@@ -8,7 +8,10 @@ import (
 	"wechat-observatory/internal/config"
 )
 
-var ErrModuleSessionActive = errors.New("module device session is active")
+var (
+	ErrModuleOffline       = errors.New("module device is offline")
+	ErrModuleSessionActive = errors.New("module device session is active")
+)
 
 type Persistence interface {
 	UpdateDeviceIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error
@@ -16,10 +19,18 @@ type Persistence interface {
 	RecordOutboundEvent(ctx context.Context, event MessageEvent) (MessageEvent, error)
 }
 
+// DeviceWeChatIdentityPersistence stores the identity reported by the
+// currently running WeChat module separately from the operator-facing device
+// nickname. Implementations may omit this optional capability for in-memory
+// or legacy persistence adapters.
+type DeviceWeChatIdentityPersistence interface {
+	UpdateDeviceWeChatIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error
+}
+
 // EventTailReader supplies durable SSE replay for any HTTP replica.
 type EventTailReader interface {
 	LatestLiveEventID(ctx context.Context) (int64, error)
-	ListLiveEventsAfter(ctx context.Context, afterID int64, limit int) ([]MessageEvent, error)
+	ListLiveEventsAfter(ctx context.Context, afterID int64, device string, limit int) ([]MessageEvent, error)
 }
 
 type DeviceLocator interface {
@@ -31,6 +42,12 @@ type DeviceLocator interface {
 type ModuleConfigReader interface {
 	LookupAPIKey(ctx context.Context, code string) (config.APIKey, bool, error)
 	LookupDevice(ctx context.Context, name string) (config.Device, bool, error)
+}
+
+// APIKeyCredentialReader resolves the opaque reference returned to trusted
+// service clients after a plaintext API Key login check.
+type APIKeyCredentialReader interface {
+	LookupAPIKeyByCredentialRef(ctx context.Context, credentialRef string) (config.APIKey, bool, error)
 }
 
 type ModuleSessionLease struct {
@@ -59,6 +76,12 @@ type ModuleActivityRecorder interface {
 	RecordModuleActivity(ctx context.Context, activity ModuleActivity) error
 }
 
+// ModuleLivenessChecker is the durable enqueue-admission boundary. The
+// persistent runtime clock, not an in-process WebSocket map, owns online state.
+type ModuleLivenessChecker interface {
+	ModuleOnline(ctx context.Context, device string, ownerWxID string, offlineAfter time.Duration) (bool, error)
+}
+
 type ModuleContactStore interface {
 	RecordModuleContacts(ctx context.Context, snapshot ModuleContactSnapshotRequest) error
 }
@@ -78,11 +101,27 @@ type AdminReader interface {
 	ListModuleContacts(ctx context.Context, filter ModuleContactFilter) ([]ModuleContactView, error)
 }
 
+type StorageMetricsReader interface {
+	DatabaseSizeBytes(ctx context.Context) (int64, error)
+}
+
 type APIKeyUpsertRequest struct {
 	Code     string `json:"code,omitempty"`
 	APIKey   string `json:"api_key,omitempty"`
 	Device   string `json:"device,omitempty"`
 	Nickname string `json:"nickname,omitempty"`
+}
+
+type APIKeyIntrospectionRequest struct {
+	APIKey        string `json:"api_key,omitempty"`
+	CredentialRef string `json:"credential_ref,omitempty"`
+}
+
+type APIKeyIntrospection struct {
+	Active        bool   `json:"active"`
+	CredentialRef string `json:"credential_ref,omitempty"`
+	AuthVersion   int64  `json:"auth_version,omitempty"`
+	Device        string `json:"device,omitempty"`
 }
 
 type DeviceUpsertRequest struct {
@@ -102,6 +141,7 @@ type APIKeyView struct {
 
 type StoredEventView struct {
 	ID           int64  `json:"id"`
+	SequenceID   int64  `json:"sequence_id"`
 	EventKey     string `json:"event_key,omitempty"`
 	SourceID     string `json:"source_id,omitempty"`
 	EventID      int64  `json:"event_id,omitempty"`
@@ -128,12 +168,14 @@ type StoredEventView struct {
 }
 
 type MessageFilter struct {
-	Device    string
-	WxID      string
-	OwnerWxID string
-	ChatID    string
-	ChatKind  string
-	Limit     int
+	Device     string
+	WxID       string
+	OwnerWxID  string
+	ChatID     string
+	ChatKind   string
+	AfterID    int64
+	AfterIDSet bool
+	Limit      int
 }
 
 type ModuleActivity struct {
@@ -151,6 +193,7 @@ type ModuleActivity struct {
 type ModuleContactFilter struct {
 	Device         string
 	OwnerWxID      string
+	WxID           string
 	Query          string
 	IncludeDeleted bool
 	Limit          int
@@ -176,6 +219,7 @@ type ModuleStatusView struct {
 	Device             string `json:"device"`
 	DeviceWxID         string `json:"device_wxid,omitempty"`
 	DeviceNickname     string `json:"device_nickname,omitempty"`
+	WeChatNickname     string `json:"wechat_nickname,omitempty"`
 	Enabled            bool   `json:"enabled"`
 	Registered         bool   `json:"-"`
 	RuntimeStatus      string `json:"runtime_status"`
@@ -202,11 +246,17 @@ type ModuleStatusView struct {
 }
 
 func (v *ModuleStatusView) NormalizeRuntimeStatus() {
+	v.NormalizeRuntimeStatusAt(time.Time{}, 0)
+}
+
+func (v *ModuleStatusView) NormalizeRuntimeStatusAt(now time.Time, offlineAfter time.Duration) {
 	switch {
 	case !v.Enabled:
 		v.RuntimeStatus = "disabled"
 	case !v.Registered:
 		v.RuntimeStatus = "unregistered"
+	case v.runtimeActivityIsStale(now, offlineAfter):
+		v.RuntimeStatus = "offline"
 	case v.LeasedOutbox > 0:
 		v.RuntimeStatus = "sending"
 	case v.PendingOutbox > 0:
@@ -214,6 +264,20 @@ func (v *ModuleStatusView) NormalizeRuntimeStatus() {
 	default:
 		v.RuntimeStatus = "ready"
 	}
+}
+
+func (v ModuleStatusView) runtimeActivityIsStale(now time.Time, offlineAfter time.Duration) bool {
+	if now.IsZero() || offlineAfter <= 0 {
+		return false
+	}
+	latest := time.Time{}
+	for _, value := range []string{v.RuntimeUpdatedAt, v.LastRegisterAt, v.LastPollAt, v.LastAckAt} {
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err == nil && parsed.After(latest) {
+			latest = parsed
+		}
+	}
+	return !latest.IsZero() && latest.Before(now.Add(-offlineAfter))
 }
 
 type Option func(*Service)

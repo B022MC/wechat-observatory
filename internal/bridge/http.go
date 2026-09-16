@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -11,19 +12,35 @@ import (
 )
 
 type HTTPServer struct {
-	service   *Service
-	adminPass string
+	service         *Service
+	adminPass       string
+	deviceAdminPass string
 }
 
-func NewHTTPServer(service *Service, adminPassword string) *HTTPServer {
-	return &HTTPServer{
+type HTTPServerOption func(*HTTPServer)
+
+func WithDeviceAdminPassword(password string) HTTPServerOption {
+	return func(server *HTTPServer) {
+		server.deviceAdminPass = strings.TrimSpace(password)
+	}
+}
+
+func NewHTTPServer(service *Service, adminPassword string, options ...HTTPServerOption) *HTTPServer {
+	server := &HTTPServer{
 		service:   service,
 		adminPass: adminPassword,
 	}
+	for _, option := range options {
+		if option != nil {
+			option(server)
+		}
+	}
+	return server
 }
 
 func (s *HTTPServer) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/devices", s.requireAdmin(s.devices))
 	mux.HandleFunc("POST /api/devices", s.requireAdmin(s.upsertDevice))
@@ -31,6 +48,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /api/api-keys", s.requireAdmin(s.upsertAPIKey))
 	mux.HandleFunc("POST /api/api-keys/", s.requireAdmin(s.updateAPIKeyState))
 	mux.HandleFunc("DELETE /api/api-keys/", s.requireAdmin(s.deleteAPIKey))
+	mux.HandleFunc("POST /internal/api-key/introspect", s.requireAdmin(s.introspectAPIKey))
 	mux.HandleFunc("GET /api/events", s.requireAdmin(s.events))
 	mux.HandleFunc("GET /api/stored-events", s.requireAdmin(s.storedEvents))
 	mux.HandleFunc("GET /api/messages", s.requireAdmin(s.messages))
@@ -40,6 +58,19 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /api/send/text", s.requireAdmin(s.sendText))
 	mux.HandleFunc("GET /admin", s.adminPage)
 	mux.HandleFunc("GET /admin/", s.adminPage)
+	mux.HandleFunc("GET /device", s.devicePage)
+	mux.HandleFunc("GET /device/", s.devicePage)
+	mux.HandleFunc("GET /device-assets/", s.deviceAssets)
+	mux.HandleFunc("GET /device-manifest.webmanifest", s.devicePWAAsset)
+	mux.HandleFunc("GET /device-sw.js", s.devicePWAAsset)
+	mux.HandleFunc("GET /device-offline.html", s.devicePWAAsset)
+	mux.HandleFunc("GET /device-icons/", s.devicePWAAsset)
+	mux.HandleFunc("GET /api/device-admin/modules", s.requireDeviceAdmin(s.deviceAdminModules))
+	mux.HandleFunc("GET /api/device-admin/api-keys", s.requireDeviceAdmin(s.deviceAdminAPIKeys))
+	mux.HandleFunc("POST /api/device-admin/api-keys", s.requireDeviceAdmin(s.deviceAdminUpsertAPIKey))
+	mux.HandleFunc("POST /api/device-admin/api-keys/", s.requireDeviceAdmin(s.deviceAdminUpdateAPIKeyState))
+	mux.HandleFunc("DELETE /api/device-admin/api-keys/", s.requireDeviceAdmin(s.deviceAdminDeleteAPIKey))
+	mux.HandleFunc("POST /api/device-admin/devices", s.requireDeviceAdmin(s.deviceAdminUpsertDevice))
 	mux.HandleFunc("POST /module/register", s.registerModule)
 	mux.HandleFunc("POST /module/contacts/snapshot", s.recordContacts)
 	mux.HandleFunc("POST /module/outbox/poll", s.pollOutbox)
@@ -50,10 +81,37 @@ func (s *HTTPServer) Handler() http.Handler {
 	return mux
 }
 
-func (s *HTTPServer) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true,
-	})
+func (s *HTTPServer) introspectAPIKey(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var req APIKeyIntrospectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "invalid introspection request")
+		return
+	}
+	result, err := s.service.IntrospectAPIKey(r.Context(), req)
+	if err != nil {
+		if strings.Contains(err.Error(), "exactly one") {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "introspection_failed", "credential authority is unavailable")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *HTTPServer) health(w http.ResponseWriter, r *http.Request) {
+	payload := map[string]any{"ok": true}
+	if reader, ok := s.service.AdminReader().(StorageMetricsReader); ok {
+		if databaseBytes, err := reader.DatabaseSizeBytes(r.Context()); err != nil {
+			payload["metrics_error"] = err.Error()
+		} else {
+			payload["database_bytes"] = databaseBytes
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *HTTPServer) devices(w http.ResponseWriter, r *http.Request) {
@@ -174,7 +232,11 @@ func (s *HTTPServer) updateAPIKeyState(w http.ResponseWriter, r *http.Request) {
 }
 
 func parseAPIKeyActionPath(path string) (string, string, bool) {
-	suffix := strings.Trim(strings.TrimPrefix(path, "/api/api-keys/"), "/")
+	return parseAPIKeyActionPathWithPrefix(path, "/api/api-keys/")
+}
+
+func parseAPIKeyActionPathWithPrefix(path, prefix string) (string, string, bool) {
+	suffix := strings.Trim(strings.TrimPrefix(path, prefix), "/")
 	parts := strings.Split(suffix, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || suffix == path {
 		return "", "", false
@@ -223,13 +285,20 @@ func (s *HTTPServer) messages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"messages": []StoredEventView{}})
 		return
 	}
+	afterID, err := nonNegativeInt64Query(r, "after_id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_after_id", err.Error())
+		return
+	}
 	filter := MessageFilter{
-		Device:    strings.TrimSpace(r.URL.Query().Get("device")),
-		WxID:      strings.TrimSpace(r.URL.Query().Get("wxid")),
-		OwnerWxID: strings.TrimSpace(r.URL.Query().Get("owner_wxid")),
-		ChatID:    strings.TrimSpace(r.URL.Query().Get("chat_id")),
-		ChatKind:  strings.TrimSpace(r.URL.Query().Get("chat_kind")),
-		Limit:     queryLimit(r, 100),
+		Device:     strings.TrimSpace(r.URL.Query().Get("device")),
+		WxID:       strings.TrimSpace(r.URL.Query().Get("wxid")),
+		OwnerWxID:  strings.TrimSpace(r.URL.Query().Get("owner_wxid")),
+		ChatID:     strings.TrimSpace(r.URL.Query().Get("chat_id")),
+		ChatKind:   strings.TrimSpace(r.URL.Query().Get("chat_kind")),
+		AfterID:    afterID,
+		AfterIDSet: strings.TrimSpace(r.URL.Query().Get("after_id")) != "",
+		Limit:      queryLimit(r, 100),
 	}
 	if filter.OwnerWxID == "" && filter.Device != "" {
 		filter.OwnerWxID = s.service.deviceWxID(r.Context(), filter.Device)
@@ -309,9 +378,10 @@ func (s *HTTPServer) liveDurableEvents(w http.ResponseWriter, r *http.Request, f
 	defer poll.Stop()
 	defer ping.Stop()
 
+	device := strings.TrimSpace(r.URL.Query().Get("device"))
 	drain := func() bool {
 		for {
-			events, err := tailer.ListLiveEventsAfter(r.Context(), cursor, 100)
+			events, err := tailer.ListLiveEventsAfter(r.Context(), cursor, device, 100)
 			if err != nil {
 				writeSSE(w, "error", map[string]any{"code": "event_tail_failed", "message": err.Error()})
 				flusher.Flush()
@@ -368,17 +438,12 @@ func liveEventCursor(r *http.Request) (int64, bool, error) {
 }
 
 func (s *HTTPServer) moduleStatuses(w http.ResponseWriter, r *http.Request) {
-	reader := s.service.AdminReader()
-	if reader != nil {
-		statuses, err := reader.ListModuleStatuses(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "admin_read_failed", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"modules": statuses})
+	statuses, err := s.loadModuleStatuses(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "admin_read_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"modules": s.moduleStatusViews()})
+	writeJSON(w, http.StatusOK, map[string]any{"modules": statuses})
 }
 
 func (s *HTTPServer) moduleContacts(w http.ResponseWriter, r *http.Request) {
@@ -390,9 +455,10 @@ func (s *HTTPServer) moduleContacts(w http.ResponseWriter, r *http.Request) {
 	filter := ModuleContactFilter{
 		Device:         strings.TrimSpace(r.URL.Query().Get("device")),
 		OwnerWxID:      strings.TrimSpace(r.URL.Query().Get("owner_wxid")),
+		WxID:           strings.TrimSpace(r.URL.Query().Get("wxid")),
 		Query:          strings.TrimSpace(r.URL.Query().Get("q")),
 		IncludeDeleted: parseBoolQuery(r.URL.Query().Get("include_deleted")),
-		Limit:          queryLimit(r, 100),
+		Limit:          queryLimitUpTo(r, 100, 10000),
 	}
 	contacts, err := reader.ListModuleContacts(r.Context(), filter)
 	if err != nil {
@@ -400,6 +466,18 @@ func (s *HTTPServer) moduleContacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"contacts": contacts})
+}
+
+func nonNegativeInt64Query(r *http.Request, name string) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(name))
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	return value, nil
 }
 
 func (s *HTTPServer) moduleStatusViews() []ModuleStatusView {
@@ -413,6 +491,7 @@ func (s *HTTPServer) moduleStatusViews() []ModuleStatusView {
 			Device:         device.Name,
 			DeviceWxID:     device.WxID,
 			DeviceNickname: device.Nickname,
+			WeChatNickname: device.WeChatNickname,
 			Enabled:        true,
 		}
 		if strings.TrimSpace(device.WxID) != "" {
@@ -434,12 +513,12 @@ func (s *HTTPServer) sendText(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "owner_wxid_required", "owner_wxid is required for admin sends")
 		return
 	}
-	recordID, err := s.service.SendText(r.Context(), req)
+	outboxID, err := s.service.SendText(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "send_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "chat_record_id": recordID})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "outbox_id": outboxID})
 }
 
 func (s *HTTPServer) registerModule(w http.ResponseWriter, r *http.Request) {
@@ -512,7 +591,12 @@ func (s *HTTPServer) ingestMessageFrom(provider string) http.HandlerFunc {
 		event.RawProvider = provider
 		result, err := s.service.Ingest(r.Context(), event)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "ingest_failed", err.Error())
+			status := http.StatusBadRequest
+			var persistenceError *IngestPersistenceError
+			if errors.As(err, &persistenceError) {
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, "ingest_failed", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
@@ -534,9 +618,13 @@ func (s *HTTPServer) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func queryLimit(r *http.Request, fallback int) int {
+	return queryLimitUpTo(r, fallback, 500)
+}
+
+func queryLimitUpTo(r *http.Request, fallback, maximum int) int {
 	limit := fallback
 	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 500 {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= maximum {
 			limit = parsed
 		}
 	}

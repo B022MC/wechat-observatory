@@ -13,11 +13,16 @@ import java.util.Locale;
 import java.util.Properties;
 import java.util.Map;
 
+import cc.wechat.observatory.gateway.GatewayEndpoint;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.util.Strings;
 import de.robv.android.xposed.XSharedPreferences;
 
 public final class BridgeConfig {
+    public static final int DEFAULT_CONTACT_SYNC_LIMIT = 10000;
+    public static final long DEFAULT_STALE_MESSAGE_GRACE_MS = 15L * 60L * 1000L;
+    public static final int DEFAULT_STALE_MESSAGE_REPLAY_LIMIT = 500;
+
     private static final String CONFIG_PROVIDER_URI = "content://cc.wechat.observatory.config/config";
     private static final String MODULE_PACKAGE = "cc.wechat.observatory";
     private static final String PREFS_NAME = "bridge_config";
@@ -33,11 +38,14 @@ public final class BridgeConfig {
     public String nickname;
     public long pollIntervalMs;
     public int pollLimit;
+    public boolean outboxWebSocketEnabled;
     public long contactSyncIntervalMs;
     public int contactSyncLimit;
     public boolean includeChatrooms;
     public boolean mediaUploadEnabled;
     public long mediaUploadLimitBytes;
+    public long staleMessageGraceMs;
+    public int staleMessageReplayLimit;
     public String signature;
 
     private BridgeConfig() {
@@ -45,22 +53,32 @@ public final class BridgeConfig {
 
     public static BridgeConfig load(Context context) {
         Properties properties = readProperties(context);
+        BridgeConfig config = fromProperties(properties);
+        logConfigOnce(config, properties);
+        return config;
+    }
+
+    static BridgeConfig fromProperties(Properties properties) {
         BridgeConfig config = new BridgeConfig();
         config.enabled = !"0".equals(setting(properties, "enabled", "1"));
-        config.baseUrl = setting(properties, "bridge_url", "");
+        config.baseUrl = baseUrlSetting(properties);
         config.device = "";
         config.selfWxid = "";
         config.apiKey = setting(properties, "api_key", "");
         config.nickname = "";
         config.pollIntervalMs = longSetting(properties, "poll_interval_ms", 1000L);
         config.pollLimit = (int) longSetting(properties, "poll_limit", 20L);
+        // HTTP polling re-reads the current wxid on every cycle and is more
+        // tolerant of WeChat replacing its account database while running.
+        config.outboxWebSocketEnabled = booleanSetting(properties, "outbox_websocket_enabled", false);
         config.contactSyncIntervalMs = longSetting(properties, "contact_sync_interval_ms", 600000L);
-        config.contactSyncLimit = (int) longSetting(properties, "contact_sync_limit", 1000L);
+        config.contactSyncLimit = (int) longSetting(properties, "contact_sync_limit", DEFAULT_CONTACT_SYNC_LIMIT);
         config.includeChatrooms = booleanSetting(properties, "contact_include_chatrooms", true);
-        config.mediaUploadEnabled = booleanSetting(properties, "media_upload_enabled", true);
+        config.mediaUploadEnabled = booleanSetting(properties, "media_upload_enabled", false);
         config.mediaUploadLimitBytes = longSetting(properties, "media_upload_limit_bytes", 5L * 1024L * 1024L);
+        config.staleMessageGraceMs = nonNegativeLongSetting(properties, "stale_message_grace_ms", DEFAULT_STALE_MESSAGE_GRACE_MS);
+        config.staleMessageReplayLimit = nonNegativeIntSetting(properties, "stale_message_replay_limit", DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
         config.signature = configSignature(properties);
-        logConfigOnce(config, properties);
         return config;
     }
 
@@ -285,6 +303,7 @@ public final class BridgeConfig {
                 + " selfWxid=" + (Strings.isBlank(config.selfWxid) ? "<empty>" : config.selfWxid)
                 + " apiKey=" + (Strings.isBlank(config.apiKey) ? "<empty>" : "<set>")
                 + " pollIntervalMs=" + config.pollIntervalMs
+                + " outboxWebSocketEnabled=" + config.outboxWebSocketEnabled
                 + " includeChatrooms=" + config.includeChatrooms);
     }
 
@@ -306,6 +325,15 @@ public final class BridgeConfig {
         }
     }
 
+    private static String baseUrlSetting(Properties properties) {
+        String value = setting(properties, "bridge_url", GatewayEndpoint.PRODUCTION_BASE_URL);
+        try {
+            return GatewayEndpoint.normalizeBaseUrl(value);
+        } catch (Throwable ignored) {
+            return GatewayEndpoint.PRODUCTION_BASE_URL;
+        }
+    }
+
     private static long longSetting(Properties properties, String name, long fallback) {
         try {
             String value = properties.getProperty(name);
@@ -313,6 +341,16 @@ public final class BridgeConfig {
         } catch (Throwable t) {
             return fallback;
         }
+    }
+
+    private static long nonNegativeLongSetting(Properties properties, String name, long fallback) {
+        long value = longSetting(properties, name, fallback);
+        return value >= 0L ? value : fallback;
+    }
+
+    private static int nonNegativeIntSetting(Properties properties, String name, int fallback) {
+        long value = nonNegativeLongSetting(properties, name, fallback);
+        return value <= Integer.MAX_VALUE ? (int) value : fallback;
     }
 
     private static boolean booleanSetting(Properties properties, String name, boolean fallback) {
@@ -336,11 +374,14 @@ public final class BridgeConfig {
                 "api_key",
                 "poll_interval_ms",
                 "poll_limit",
+                "outbox_websocket_enabled",
                 "contact_sync_interval_ms",
                 "contact_sync_limit",
                 "contact_include_chatrooms",
                 "media_upload_enabled",
-                "media_upload_limit_bytes"
+                "media_upload_limit_bytes",
+                "stale_message_grace_ms",
+                "stale_message_replay_limit"
         }) {
             out.append(key).append('=').append(setting(properties, key, "")).append('\n');
         }

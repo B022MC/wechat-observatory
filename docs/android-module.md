@@ -28,31 +28,35 @@ cd android-module
 
 打开手机上的 **WeChat Observatory**，填写：
 
-- 服务端地址：例如 `http://192.168.1.10:8088`
+- Observatory 服务地址：默认 `https://47.108.232.203/observatory`
 - API Key：从 Web 管理台生成
 - 轮询间隔：默认 `1000`
+- 出站 WebSocket：默认关闭；频繁切换微信账号时保持 `0`
 - 通讯录同步间隔：默认 `600000`
 - 是否包含群聊：默认 `1`
-- 是否上传媒体：默认 `1`
+- 是否上传媒体：默认 `0`
 
 模块不会要求用户填写 `wxid`。切换微信账号后，模块会重新识别当前账号并用同一个 API Key 更新服务端绑定。
 
-保存配置后需要重启微信。
+服务地址支持完整的 HTTP 或 HTTPS 地址并保留 `/observatory` 等路径前缀；不能包含用户名、密码、查询参数或锚点。API Key 始终以掩码显示，界面不提供明文查看入口；可以直接覆盖输入新值，保存不会清除未修改的已有值。保存配置后需要重启微信。
 
 ## 配置项
 
 | Key | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `1` | 是否启用模块逻辑 |
-| `bridge_url` | `http://192.168.1.10:8088` | 服务端地址 |
+| `bridge_url` | `https://47.108.232.203/observatory` | Observatory 服务地址；缺失或无效时使用默认值 |
 | `api_key` | 空 | Web 管理台生成的 API Key |
 | `poll_interval_ms` | `1000` | HTTP 轮询出站消息间隔 |
 | `poll_limit` | `1` | 每次最多拉取条数，服务端当前只租约一条 |
+| `outbox_websocket_enabled` | `0` | 是否启用出站 WebSocket；频繁切号建议保持 `0` |
 | `contact_sync_interval_ms` | `600000` | 通讯录同步间隔，`0` 表示关闭 |
-| `contact_sync_limit` | `1000` | 一次同步联系人数量上限 |
+| `contact_sync_limit` | `10000` | 一次同步联系人数量上限 |
 | `contact_include_chatrooms` | `1` | 是否同步群聊 |
-| `media_upload_enabled` | `1` | 是否上传图片、语音、视频、文件等附件 |
+| `media_upload_enabled` | `0` | 是否上传图片、语音、视频、文件等附件 |
 | `media_upload_limit_bytes` | `5242880` | 单个附件上传上限 |
+| `stale_message_grace_ms` | `900000` | 超过该时间的插入消息视为历史回灌 |
+| `stale_message_replay_limit` | `500` | 单次微信进程最多上报的历史回灌消息数 |
 
 ## 注册流程
 
@@ -69,11 +73,11 @@ POST /module/register
 ## 发送流程
 
 1. 管理台调用 `POST /api/send/text` 创建出站任务。
-2. 服务端通过 WebSocket 唤醒模块。
+2. 模块默认通过 HTTP 轮询获取任务；启用 WebSocket 时由服务端实时唤醒连接。
 3. 模块在微信进程里执行发送。
-4. 模块通过 WebSocket 或 HTTP ACK 回报结果。
+4. 模块通过 HTTP 或 WebSocket ACK 回报结果。
 
-WebSocket 不可用时，模块会退回 HTTP 轮询。
+默认使用 HTTP 轮询，每次请求重新绑定当前 wxid；将 `outbox_websocket_enabled` 设为 `1` 后才启用 WebSocket，连接失败时仍会退回 HTTP 轮询。
 
 ## 联系人和媒体
 

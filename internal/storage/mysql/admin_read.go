@@ -69,15 +69,22 @@ func (s *Store) LatestLiveEventID(ctx context.Context) (int64, error) {
 	return id, err
 }
 
-func (s *Store) ListLiveEventsAfter(ctx context.Context, afterID int64, limit int) ([]bridge.MessageEvent, error) {
+func (s *Store) ListLiveEventsAfter(ctx context.Context, afterID int64, device string, limit int) ([]bridge.MessageEvent, error) {
+	conditions := []string{"id > ?"}
+	args := []any{afterID}
+	if device = strings.TrimSpace(device); device != "" {
+		conditions = append(conditions, "device = ?")
+		args = append(args, device)
+	}
+	args = append(args, normalizeLimit(limit))
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid,
 			direction, from_wxid, to_wxid, room_id, sender_wxid, text, message_type,
 			media_kind, media_mime, media_name, media_url, media_size, raw_provider, create_time
 		FROM bridge_message_events
-		WHERE id > ?
+		WHERE `+strings.Join(conditions, " AND ")+`
 		ORDER BY id ASC
-		LIMIT ?`, afterID, normalizeLimit(limit))
+		LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -116,26 +123,20 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 		conditions = append(conditions, "owner_wxid = ?")
 		args = append(args, ownerWxID)
 	}
-	chatID := strings.TrimSpace(filter.ChatID)
-	if chatID == "" {
-		chatID = strings.TrimSpace(filter.WxID)
+	if filter.AfterIDSet {
+		conditions = append(conditions, "id > ?")
+		args = append(args, filter.AfterID)
 	}
-	if chatID != "" {
-		chatKind := strings.ToLower(strings.TrimSpace(filter.ChatKind))
-		switch {
-		case chatKind == string(bridge.ChatKindRoom) || strings.Contains(strings.ToLower(chatID), "@chatroom"):
-			conditions = append(conditions, "(room_id = ? OR from_wxid = ? OR to_wxid = ?)")
-			args = append(args, chatID, chatID, chatID)
-		case chatKind == string(bridge.ChatKindDirect):
-			conditions = append(conditions, "((room_id IS NULL OR room_id = '') AND (from_wxid = ? OR to_wxid = ? OR sender_wxid = ?))")
-			args = append(args, chatID, chatID, chatID)
-		default:
-			conditions = append(conditions, "(from_wxid = ? OR to_wxid = ? OR room_id = ? OR sender_wxid = ?)")
-			args = append(args, chatID, chatID, chatID, chatID)
-		}
+	if chatID := strings.TrimSpace(filter.ChatID); chatID != "" {
+		conditions = append(conditions, "chat_id = ?")
+		args = append(args, chatID)
 	} else if wxid := strings.TrimSpace(filter.WxID); wxid != "" {
 		conditions = append(conditions, "(from_wxid = ? OR to_wxid = ? OR room_id = ? OR sender_wxid = ?)")
 		args = append(args, wxid, wxid, wxid, wxid)
+	}
+	order := "DESC"
+	if filter.AfterIDSet {
+		order = "ASC"
 	}
 	args = append(args, normalizeLimit(filter.Limit))
 	return `
@@ -144,7 +145,7 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 			media_mime, media_name, media_url, media_size, raw_provider, create_time, created_at
 		FROM bridge_message_events
 		WHERE ` + strings.Join(conditions, " AND ") + `
-		ORDER BY id DESC
+		ORDER BY id ` + order + `
 		LIMIT ?`, args
 }
 
@@ -205,6 +206,7 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 		}.Normalize()
 		item.ChatID = event.ChatID()
 		item.ChatKind = string(event.Kind())
+		item.SequenceID = item.ID
 		item.CreatedAt = formatTime(createdAt)
 		out = append(out, item)
 	}
@@ -265,9 +267,8 @@ func scanMessageEvent(row rowScanner) (bridge.MessageEvent, error) {
 	return event.Normalize(), nil
 }
 
-func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusView, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT ak.device, d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), ak.enabled, d.updated_at,
+const listModuleStatusesStatement = `
+		SELECT ak.device, d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), d.wechat_nickname, ak.enabled, d.updated_at,
 			rt.last_register_at,
 			rt.last_poll_at,
 			rt.last_ack_at,
@@ -286,10 +287,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			obs.last_outbox_id,
 			last_ob.status,
 			last_ob.last_error,
-			last_ob.updated_at,
-			ev.last_event_at,
-			ev.last_inbound_at,
-			ev.last_outbound_ack_at
+			last_ob.updated_at
 		FROM bridge_api_keys ak
 		LEFT JOIN bridge_devices d
 			ON d.name = ak.device
@@ -308,16 +306,56 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		) obs ON obs.device = ak.device AND obs.owner_wxid = d.wxid
 		LEFT JOIN bridge_module_outbox last_ob
 			ON last_ob.id = obs.last_outbox_id
-		LEFT JOIN (
-			SELECT device,
-				MAX(created_at) AS last_event_at,
-				MAX(CASE WHEN direction = 'recv' THEN created_at ELSE NULL END) AS last_inbound_at,
-				MAX(CASE WHEN direction = 'sent' AND raw_provider = ? THEN created_at ELSE NULL END) AS last_outbound_ack_at
-			FROM bridge_message_events
-			GROUP BY device
-		) ev ON ev.device = ak.device
 		WHERE ak.device IS NOT NULL AND ak.device <> ''
-		ORDER BY ak.device ASC`, bridge.RawProviderModuleAck)
+		ORDER BY ak.device ASC`
+
+const latestModuleEventTimesStatement = `
+	SELECT
+		(
+			SELECT latest_event.created_at
+			FROM bridge_message_events latest_event
+			WHERE latest_event.device = ?
+			ORDER BY latest_event.create_time DESC
+			LIMIT 1
+		),
+		(
+			SELECT inbound.created_at
+			FROM bridge_message_events inbound
+			WHERE inbound.device = ? AND inbound.direction = 'recv'
+			ORDER BY inbound.created_at DESC
+			LIMIT 1
+		),
+		(
+			SELECT outbound.created_at
+			FROM bridge_message_events outbound
+			WHERE outbound.device = ?
+				AND outbound.direction = 'sent'
+				AND outbound.raw_provider = ?
+			ORDER BY outbound.created_at DESC
+			LIMIT 1
+		)`
+
+type moduleEventTimes struct {
+	lastEventAt       sql.NullTime
+	lastInboundAt     sql.NullTime
+	lastOutboundAckAt sql.NullTime
+}
+
+func (s *Store) latestModuleEventTimes(ctx context.Context, device string) (moduleEventTimes, error) {
+	var times moduleEventTimes
+	err := s.db.QueryRowContext(
+		ctx,
+		latestModuleEventTimesStatement,
+		device,
+		device,
+		device,
+		bridge.RawProviderModuleAck,
+	).Scan(&times.lastEventAt, &times.lastInboundAt, &times.lastOutboundAckAt)
+	return times, err
+}
+
+func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusView, error) {
+	rows, err := s.db.QueryContext(ctx, listModuleStatusesStatement)
 	if err != nil {
 		return nil, err
 	}
@@ -326,12 +364,12 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 	out := []bridge.ModuleStatusView{}
 	for rows.Next() {
 		var item bridge.ModuleStatusView
-		var deviceWxID, deviceNickname sql.NullString
+		var deviceWxID, deviceNickname, wechatNickname sql.NullString
 		var enabled bool
 		var runtimeError, runtimeAPIKey, activeAPIKey sql.NullString
 		var deviceUpdatedAt sql.NullTime
 		var lastRegisterAt, lastPollAt, lastAckAt, runtimeUpdatedAt sql.NullTime
-		var lastOutboxUpdated, lastEventAt, lastInboundAt, lastOutboundAckAt sql.NullTime
+		var lastOutboxUpdated sql.NullTime
 		var lastPollLimit, lastPollItemCount, lastAckSentCount, lastAckFailedCount sql.NullInt64
 		var pending, leased, sent, failed int64
 		var lastOutboxID sql.NullInt64
@@ -340,6 +378,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			&item.Device,
 			&deviceWxID,
 			&deviceNickname,
+			&wechatNickname,
 			&enabled,
 			&deviceUpdatedAt,
 			&lastRegisterAt,
@@ -361,14 +400,12 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			&lastOutboxStatus,
 			&lastOutboxError,
 			&lastOutboxUpdated,
-			&lastEventAt,
-			&lastInboundAt,
-			&lastOutboundAckAt,
 		); err != nil {
 			return nil, err
 		}
 		item.DeviceWxID = deviceWxID.String
 		item.DeviceNickname = deviceNickname.String
+		item.WeChatNickname = wechatNickname.String
 		item.Enabled = enabled
 		item.Registered = item.Enabled &&
 			strings.TrimSpace(item.DeviceWxID) != "" &&
@@ -390,9 +427,6 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		item.LastOutboxStatus = lastOutboxStatus.String
 		item.LastOutboxError = lastOutboxError.String
 		item.LastOutboxUpdated = formatNullTime(lastOutboxUpdated)
-		item.LastEventAt = formatNullTime(lastEventAt)
-		item.LastInboundAt = formatNullTime(lastInboundAt)
-		item.LastOutboundAckAt = formatNullTime(lastOutboundAckAt)
 		item.RuntimeUpdatedAt = formatNullTime(runtimeUpdatedAt)
 		item.DeviceUpdatedAt = formatNullTime(deviceUpdatedAt)
 		if item.LastOutboxError == "" {
@@ -401,39 +435,33 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		item.NormalizeRuntimeStatus()
 		out = append(out, item)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	timesByDevice := make(map[string]moduleEventTimes, len(out))
+	for index := range out {
+		times, ok := timesByDevice[out[index].Device]
+		if !ok {
+			times, err = s.latestModuleEventTimes(ctx, out[index].Device)
+			if err != nil {
+				return nil, err
+			}
+			timesByDevice[out[index].Device] = times
+		}
+		out[index].LastEventAt = formatNullTime(times.lastEventAt)
+		out[index].LastInboundAt = formatNullTime(times.lastInboundAt)
+		out[index].LastOutboundAckAt = formatNullTime(times.lastOutboundAckAt)
+	}
+	return out, nil
 }
 
 func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleContactFilter) ([]bridge.ModuleContactView, error) {
-	limit := normalizeLimit(filter.Limit)
-	conditions := []string{"1=1"}
-	args := []any{}
-	if device := strings.TrimSpace(filter.Device); device != "" {
-		conditions = append(conditions, "device = ?")
-		args = append(args, device)
-	}
-	if ownerWxID := strings.TrimSpace(filter.OwnerWxID); ownerWxID != "" {
-		conditions = append(conditions, "owner_wxid = ?")
-		args = append(args, ownerWxID)
-	}
-	if !filter.IncludeDeleted {
-		conditions = append(conditions, "is_deleted = FALSE")
-	}
-	if query := strings.TrimSpace(filter.Query); query != "" {
-		like := "%" + query + "%"
-		conditions = append(conditions, "(wxid LIKE ? OR nickname LIKE ? OR remark LIKE ? OR contact_alias LIKE ?)")
-		args = append(args, like, like, like, like)
-	}
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, device, owner_wxid, wxid, nickname, remark, contact_alias,
-			contact_type, verify_flag, is_chatroom, is_deleted, last_seen_at, updated_at
-		FROM bridge_module_contacts
-		WHERE `+strings.Join(conditions, " AND ")+`
-		ORDER BY is_deleted ASC,
-			COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), wxid) ASC,
-			id ASC
-		LIMIT ?`, args...)
+	query, args := listModuleContactsQuery(filter)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -473,12 +501,52 @@ func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleCont
 	return out, rows.Err()
 }
 
+func listModuleContactsQuery(filter bridge.ModuleContactFilter) (string, []any) {
+	limit := normalizeLimitUpTo(filter.Limit, 10000)
+	conditions := []string{"1=1"}
+	args := []any{}
+	if device := strings.TrimSpace(filter.Device); device != "" {
+		conditions = append(conditions, "device = ?")
+		args = append(args, device)
+	}
+	if ownerWxID := strings.TrimSpace(filter.OwnerWxID); ownerWxID != "" {
+		conditions = append(conditions, "owner_wxid = ?")
+		args = append(args, ownerWxID)
+	}
+	if wxid := strings.TrimSpace(filter.WxID); wxid != "" {
+		conditions = append(conditions, "wxid = ?")
+		args = append(args, wxid)
+	}
+	if !filter.IncludeDeleted {
+		conditions = append(conditions, "is_deleted = FALSE")
+	}
+	if query := strings.TrimSpace(filter.Query); query != "" {
+		like := "%" + query + "%"
+		conditions = append(conditions, "(wxid LIKE ? OR nickname LIKE ? OR remark LIKE ? OR contact_alias LIKE ?)")
+		args = append(args, like, like, like, like)
+	}
+	args = append(args, limit)
+	return `
+		SELECT id, device, owner_wxid, wxid, nickname, remark, contact_alias,
+			contact_type, verify_flag, is_chatroom, is_deleted, last_seen_at, updated_at
+		FROM bridge_module_contacts
+		WHERE ` + strings.Join(conditions, " AND ") + `
+		ORDER BY is_deleted ASC,
+			COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), wxid) ASC,
+			id ASC
+		LIMIT ?`, args
+}
+
 func normalizeLimit(limit int) int {
+	return normalizeLimitUpTo(limit, 500)
+}
+
+func normalizeLimitUpTo(limit, maximum int) int {
 	if limit <= 0 {
 		return 50
 	}
-	if limit > 500 {
-		return 500
+	if limit > maximum {
+		return maximum
 	}
 	return limit
 }

@@ -10,7 +10,7 @@ import (
 )
 
 func EnsureDatabase(ctx context.Context, dsn string) error {
-	cfg, err := mysqldriver.ParseDSN(strings.TrimSpace(dsn))
+	cfg, err := parseMySQLConfig(dsn)
 	if err != nil {
 		return err
 	}
@@ -19,10 +19,11 @@ func EnsureDatabase(ctx context.Context, dsn string) error {
 		return fmt.Errorf("mysql dsn must include a database name")
 	}
 	cfg.DBName = ""
-	db, err := sql.Open(driverName, cfg.FormatDSN())
+	connector, err := mysqldriver.NewConnector(cfg)
 	if err != nil {
 		return err
 	}
+	db := sql.OpenDB(connector)
 	defer db.Close()
 	if err := db.PingContext(ctx); err != nil {
 		return err

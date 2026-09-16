@@ -1,5 +1,6 @@
 ﻿import React from "react";
 import { createRoot } from "react-dom/client";
+import { formatBeijingClock, formatBeijingDateTime, formatBeijingTimeAgo } from "@/time";
 import {
   Activity,
   CheckCircle2,
@@ -36,6 +37,7 @@ import {
   getModules,
   openLiveEvents,
   parseLiveMessageEvent,
+  publicPath,
   setApiKeyEnabled,
   sendText,
   updateDevice
@@ -63,6 +65,7 @@ import "./index.css";
 const PASSWORD_KEY = "wgc_admin_password";
 const THEME_KEY = "wgc_admin_theme";
 const RAW_PROVIDER_MODULE_ACK = "module_ack";
+const CONTACT_SNAPSHOT_LIMIT = 10000;
 
 type ContactFilter = "all" | "direct" | "room" | "messages";
 type ThemeMode = "light" | "dark";
@@ -109,6 +112,9 @@ function App() {
   const selectedOwnerWxid = moduleOwnerWxid(selectedModule);
   const selectedScopeKey = `${selectedDevice}:${selectedOwnerWxid}`;
   const selectedScopeRef = React.useRef(selectedScopeKey);
+  const messageListRef = React.useRef<HTMLDivElement>(null);
+  const loadedMessageChatRef = React.useRef("");
+  const pendingBottomScrollChatRef = React.useRef("");
 
   React.useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -172,6 +178,7 @@ function App() {
   const pendingCount = selectedModule?.pending_outbox ?? 0;
   const failedCount = selectedModule?.failed_outbox ?? 0;
   const sentCount = selectedModule?.sent_outbox ?? 0;
+  const selectedModuleOffline = selectedModule?.runtime_status === "offline";
   const messageListActive = contactFilter === "messages";
   const contactQuery = messageListActive ? "" : query;
   const contactIncludeDeleted = messageListActive ? true : includeDeleted;
@@ -221,7 +228,7 @@ function App() {
         ownerWxid,
         query: contactQuery,
         includeDeleted: contactIncludeDeleted,
-        limit: 600
+        limit: CONTACT_SNAPSHOT_LIMIT
       });
       if (!scopeMatches(device, ownerWxid)) {
         return [] as ModuleContact[];
@@ -240,6 +247,7 @@ function App() {
   const refreshMessages = React.useCallback(
     async (device: string, wxid: string, ownerWxid = selectedOwnerWxid) => {
       if (!adminPassword || !device || !wxid) {
+        loadedMessageChatRef.current = "";
         setMessages([]);
         return [] as StoredMessage[];
       }
@@ -257,6 +265,7 @@ function App() {
         return [] as StoredMessage[];
       }
       const nextMessages = (payload.messages || []).slice().reverse();
+      loadedMessageChatRef.current = wxid;
       setMessages(nextMessages);
       return nextMessages;
     },
@@ -310,7 +319,7 @@ function App() {
       if (device && wxid) {
         await refreshMessages(device, wxid, ownerWxid);
       }
-      setNotice(`已刷新 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`);
+      setNotice(`已刷新 ${formatBeijingClock()}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "请求失败");
     } finally {
@@ -319,6 +328,8 @@ function App() {
   }, [adminPassword, refreshApiKeys, refreshContacts, refreshMessages, refreshModules, refreshRecentMessages, selectedDevice, selectedWxid]);
 
   React.useEffect(() => {
+    loadedMessageChatRef.current = "";
+    pendingBottomScrollChatRef.current = "";
     setContacts([]);
     setMessages([]);
     setRecentMessages([]);
@@ -360,6 +371,21 @@ function App() {
     });
   }, [refreshMessages, selectedDevice, selectedOwnerWxid, selectedWxid]);
 
+  React.useLayoutEffect(() => {
+    const messageList = messageListRef.current;
+    if (
+      !messageList ||
+      !selectedWxid ||
+      messages.length === 0 ||
+      loadedMessageChatRef.current !== selectedWxid ||
+      pendingBottomScrollChatRef.current !== selectedWxid
+    ) {
+      return;
+    }
+    messageList.scrollTop = messageList.scrollHeight;
+    pendingBottomScrollChatRef.current = "";
+  }, [messages, selectedWxid]);
+
   React.useEffect(() => {
     if (!selectedDevice) {
       setRecentMessages([]);
@@ -399,7 +425,7 @@ function App() {
         void refreshRecentMessages(selectedDevice, selectedOwnerWxid).catch(() => undefined);
         if (selectedWxid && liveEventTouchesChat(payload, selectedWxid)) {
           void refreshMessages(selectedDevice, selectedWxid, selectedOwnerWxid).catch(() => undefined);
-          setNotice(`实时消息 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`);
+          setNotice(`实时消息 ${formatBeijingClock()}`);
         }
       } catch {
         // Keep the stream open if one event cannot be parsed.
@@ -422,20 +448,46 @@ function App() {
     setMessages([]);
     setRecentMessages([]);
     setSelectedWxid("");
+    loadedMessageChatRef.current = "";
+    pendingBottomScrollChatRef.current = "";
+  };
+
+  const selectChat = (wxid: string) => {
+    pendingBottomScrollChatRef.current = wxid;
+    setSelectedWxid(wxid);
+    if (selectedWxid === wxid && loadedMessageChatRef.current === wxid) {
+      window.requestAnimationFrame(() => {
+        const messageList = messageListRef.current;
+        if (messageList && pendingBottomScrollChatRef.current === wxid) {
+          messageList.scrollTop = messageList.scrollHeight;
+          pendingBottomScrollChatRef.current = "";
+        }
+      });
+    }
+  };
+
+  const cancelPendingBottomScroll = () => {
+    if (pendingBottomScrollChatRef.current === selectedWxid) {
+      pendingBottomScrollChatRef.current = "";
+    }
   };
 
   const selectContact = (contact: ModuleContact) => {
-    setSelectedWxid(contact.wxid);
+    selectChat(contact.wxid);
   };
 
   const selectRecentMessage = (message: StoredMessage) => {
     const chatId = messageChatId(message);
     if (chatId) {
-      setSelectedWxid(chatId);
+      selectChat(chatId);
     }
   };
 
   const openSendDialog = (contact?: ModuleContact) => {
+	if (selectedModuleOffline) {
+	  setNotice("当前微信离线，不能创建发送任务");
+	  return;
+	}
     if (contact) {
       setSelectedWxid(contact.wxid);
     }
@@ -444,7 +496,10 @@ function App() {
   };
 
   const submitSend = async () => {
-    if (!selectedDevice || !selectedWxid || !draft.trim()) return;
+    if (!selectedDevice || !selectedWxid || !draft.trim() || selectedModuleOffline) {
+	  if (selectedModuleOffline) setNotice("当前微信离线，不能创建发送任务");
+	  return;
+	}
     setSending(true);
     setNotice("正在加入发送队列");
     try {
@@ -604,7 +659,7 @@ function App() {
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-[1600px] gap-4 p-3 lg:p-4">
+      <main className="mx-auto grid w-full min-w-0 max-w-[1600px] gap-4 p-3 lg:p-4">
         <aside className="grid h-fit gap-4 lg:grid-cols-2">
           <Card>
             <CardHeader>
@@ -660,9 +715,9 @@ function App() {
                 实时流和轮询刷新
               </label>
               <div className="grid grid-cols-3 gap-2">
-                <SignalPill label="注册" value={formatTimeAgo(selectedModule?.last_register_at)} />
-                <SignalPill label="拉取" value={formatTimeAgo(selectedModule?.last_poll_at)} />
-                <SignalPill label="回执" value={formatTimeAgo(selectedModule?.last_ack_at)} />
+                <SignalPill label="注册" value={formatBeijingTimeAgo(selectedModule?.last_register_at)} />
+                <SignalPill label="拉取" value={formatBeijingTimeAgo(selectedModule?.last_poll_at)} />
+                <SignalPill label="回执" value={formatBeijingTimeAgo(selectedModule?.last_ack_at)} />
               </div>
             </CardContent>
           </Card>
@@ -750,7 +805,7 @@ function App() {
                           >
                             <div className="flex min-w-0 items-center justify-between gap-2">
                               <div className="min-w-0 truncate text-sm font-medium">{messageContactName(item, contact)}</div>
-                              <span className="shrink-0 text-[11px] text-muted-foreground">{formatTimeAgo(item.created_at)}</span>
+                              <span className="shrink-0 text-[11px] text-muted-foreground">{formatBeijingTimeAgo(item.created_at)}</span>
                             </div>
                             <div className="mt-1 truncate text-xs text-muted-foreground">
                               {messagePreview(item, contactByWxid, selectedModule)}
@@ -795,7 +850,7 @@ function App() {
                           </Badge>
                         </div>
                         <div className="mt-3 text-xs text-muted-foreground">
-                          <span className="truncate">上报：{formatTimeAgo(item.last_seen_at || item.updated_at)}</span>
+                          <span className="truncate">上报：{formatBeijingTimeAgo(item.last_seen_at || item.updated_at)}</span>
                         </div>
                       </button>
                     ))
@@ -827,7 +882,7 @@ function App() {
                     <RefreshCw className="h-4 w-4" />
                     刷新消息
                   </Button>
-                  <Button onClick={() => openSendDialog()} disabled={!selectedDevice || !selectedWxid || !adminPassword}>
+                  <Button onClick={() => openSendDialog()} disabled={!selectedDevice || !selectedWxid || !adminPassword || selectedModuleOffline}>
                     <Send className="h-4 w-4" />
                     发消息
                   </Button>
@@ -838,11 +893,18 @@ function App() {
                   <div className="grid gap-2 text-xs text-muted-foreground md:grid-cols-3">
                     <span className="truncate">好友：{selectedContact ? contactName(selectedContact) : "-"}</span>
                     <span className="truncate">会话类型：{selectedContact ? contactKindText(selectedContact) : "-"}</span>
-                    <span className="truncate">最近上报：{formatDate(selectedContact?.last_seen_at || selectedContact?.updated_at)}</span>
+                    <span className="truncate">最近上报：{formatBeijingDateTime(selectedContact?.last_seen_at || selectedContact?.updated_at)}</span>
                   </div>
                 </div>
 
-                <div className="grid h-[calc(100vh-492px)] min-h-[440px] content-start gap-3 overflow-y-auto overflow-x-hidden rounded-lg border bg-card p-3">
+                <div
+                  ref={messageListRef}
+                  onPointerDown={cancelPendingBottomScroll}
+                  onScroll={cancelPendingBottomScroll}
+                  onTouchStart={cancelPendingBottomScroll}
+                  onWheel={cancelPendingBottomScroll}
+                  className="grid h-[calc(100vh-492px)] min-h-[440px] content-start gap-3 overflow-y-auto overflow-x-hidden rounded-lg border bg-card p-3"
+                >
                   {!selectedWxid ? (
                     <EmptyState icon={<MessageCircle className="h-5 w-5" />} text="请从好友列表选择一个对象" />
                   ) : messages.length === 0 ? (
@@ -867,13 +929,13 @@ function App() {
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
                     placeholder="输入要发送到微信的文本"
-                    disabled={!selectedWxid || sending}
+                    disabled={!selectedWxid || sending || selectedModuleOffline}
                   />
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="text-xs text-muted-foreground">
-                      {pendingCount > 0 ? `待发送 ${pendingCount} 条` : failedCount > 0 ? `失败 ${failedCount} 条` : "发送队列空闲"}
+                      {selectedModuleOffline ? "当前微信离线，发送任务已清空" : pendingCount > 0 ? `待发送 ${pendingCount} 条` : failedCount > 0 ? `失败 ${failedCount} 条` : "发送队列空闲"}
                     </span>
-                    <Button onClick={() => void submitSend()} disabled={sending || !adminPassword || !selectedDevice || !selectedWxid || !draft.trim()}>
+                    <Button onClick={() => void submitSend()} disabled={sending || selectedModuleOffline || !adminPassword || !selectedDevice || !selectedWxid || !draft.trim()}>
                       <Send className="h-4 w-4" />
                       {sending ? "发送中" : "加入队列"}
                     </Button>
@@ -1008,7 +1070,7 @@ function App() {
                           </TableCell>
                           <TableCell className="text-xs">{item.device || "自动生成"}</TableCell>
                           <TableCell className="text-xs">{item.nickname || "-"}</TableCell>
-                          <TableCell className="text-xs">{formatTimeAgo(item.updated_at || item.created_at)}</TableCell>
+                          <TableCell className="text-xs">{formatBeijingTimeAgo(item.updated_at || item.created_at)}</TableCell>
                         </TableRow>
                       ))
                     )}
@@ -1065,8 +1127,8 @@ function App() {
                             </div>
                           </TableCell>
                           <TableCell className="text-xs">
-                            <div>拉取：{formatDate(item.last_poll_at)}</div>
-                            <div className="text-muted-foreground">回执：{formatDate(item.last_ack_at || item.last_outbound_ack_at)}</div>
+                            <div>拉取：{formatBeijingDateTime(item.last_poll_at)}</div>
+                            <div className="text-muted-foreground">回执：{formatBeijingDateTime(item.last_ack_at || item.last_outbound_ack_at)}</div>
                           </TableCell>
                         </TableRow>
                       ))
@@ -1098,6 +1160,7 @@ function App() {
                 onChange={(event) => setDraft(event.target.value)}
                 placeholder="输入要发送到微信的文本"
                 autoFocus
+                disabled={selectedModuleOffline}
               />
             </div>
           </div>
@@ -1105,7 +1168,7 @@ function App() {
             <Button type="button" variant="outline" onClick={() => setSendOpen(false)}>
               取消
             </Button>
-            <Button type="button" onClick={() => void submitSend()} disabled={sending || !draft.trim()}>
+            <Button type="button" onClick={() => void submitSend()} disabled={sending || selectedModuleOffline || !draft.trim()}>
               <Send className="h-4 w-4" />
               {sending ? "发送中" : "加入队列"}
             </Button>
@@ -1144,7 +1207,7 @@ function MessageBubble({
           <span className="font-medium">{senderName}</span>
           {message.raw_provider ? <span>{providerText(message.raw_provider)}</span> : null}
           {message.message_type ? <span>{messageTypeText(message.message_type)}</span> : null}
-          <span>{formatDate(message.created_at)}</span>
+          <span>{formatBeijingDateTime(message.created_at)}</span>
         </div>
         {message.text ? <div className="whitespace-pre-wrap break-words text-sm leading-6">{message.text}</div> : null}
         {hasAttachment ? <MessageAttachment message={message} adminPassword={adminPassword} outgoing={outgoing} /> : null}
@@ -1260,6 +1323,9 @@ function StatusBadge({ status }: { status?: string }) {
   }
   if (status === "failed" || status === "unregistered") {
     return <Badge variant="destructive">{statusText(status)}</Badge>;
+  }
+  if (status === "offline") {
+	return <Badge variant="destructive"><WifiOff className="mr-1 h-3.5 w-3.5" />离线</Badge>;
   }
   if (status === "disabled") {
     return <Badge variant="secondary">{statusText(status)}</Badge>;
@@ -1411,6 +1477,8 @@ function statusText(status?: string) {
       return "发送中";
     case "failed":
       return "失败";
+	case "offline":
+	  return "离线";
     case "disabled":
       return "已停用";
     case "unregistered":
@@ -1479,7 +1547,7 @@ function mediaKindFromType(type?: number) {
 }
 
 function mediaURL(path: string, password: string) {
-  const url = new URL(path, window.location.origin);
+  const url = new URL(path.startsWith("/") ? publicPath(path) : path, window.location.origin);
   if (password) {
     url.searchParams.set("password", password);
   }
@@ -1523,24 +1591,6 @@ function chatKindForContact(wxid: string, contact?: ModuleContact) {
     return "room";
   }
   return "direct";
-}
-
-function formatDate(value?: string) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString("zh-CN", { hour12: false });
-}
-
-function formatTimeAgo(value?: string) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  const diff = Date.now() - date.getTime();
-  if (diff < 60_000) return "刚刚";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
-  return date.toLocaleDateString("zh-CN");
 }
 
 createRoot(document.getElementById("root")!).render(

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -22,6 +23,28 @@ import (
 )
 
 const testAPIKey = "wechat-a-key"
+
+func TestNewServiceDefaultsOutboxPollIntervalToThreeSeconds(t *testing.T) {
+	service := NewService(Config{})
+	if got := service.OutboxPollInterval(); got != 3*time.Second {
+		t.Fatalf("outbox poll default = %s, want 3s", got)
+	}
+}
+
+func TestContactQueryAllowsCompleteSnapshotsWithoutRaisingOtherEndpointLimits(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/module-contacts?limit=10000", nil)
+	if got := queryLimit(req, 100); got != 100 {
+		t.Fatalf("default endpoint limit = %d, want fallback 100", got)
+	}
+	if got := queryLimitUpTo(req, 100, 10000); got != 10000 {
+		t.Fatalf("contact endpoint limit = %d, want 10000", got)
+	}
+
+	overLimit := httptest.NewRequest(http.MethodGet, "/api/module-contacts?limit=10001", nil)
+	if got := queryLimitUpTo(overLimit, 100, 10000); got != 100 {
+		t.Fatalf("over-limit contact query = %d, want fallback 100", got)
+	}
+}
 
 func TestIngestPublishesAndPersistsWithoutBusinessReply(t *testing.T) {
 	outbox := &fakeOutbox{}
@@ -51,6 +74,130 @@ func TestIngestPublishesAndPersistsWithoutBusinessReply(t *testing.T) {
 	}
 	if got := service.Hub().Recent(1); len(got) != 1 || got[0].Text != "ping" || got[0].ChatID() != "wxid_friend" {
 		t.Fatalf("unexpected hub event: %+v", got)
+	}
+}
+
+func TestIngestV2IdentityIsServerOwnedAndStableAcrossRetry(t *testing.T) {
+	persistence := &fakePersistence{}
+	service := newTestService("", WithPersistence(persistence))
+	service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+	event := MessageEvent{
+		APIKey: testAPIKey, EventKey: "evt_v2_" + strings.Repeat("f", 64),
+		ID: "882", EventID: 882, ChatRecordID: 882, Device: "forged-device",
+		From: "wxid_self", To: "filehelper", Text: "涓?9", Direction: DirectionSent,
+		MessageType: 1, CreateTime: 1_786_530_000,
+	}
+	if _, err := service.Ingest(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Ingest(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	differentSourceTime := event
+	differentSourceTime.CreateTime++
+	if _, err := service.Ingest(t.Context(), differentSourceTime); err != nil {
+		t.Fatal(err)
+	}
+	if len(persistence.inboundEvents) != 3 {
+		t.Fatalf("persist calls = %d, want 2 retries plus one distinct source time", len(persistence.inboundEvents))
+	}
+	first, second, later := persistence.inboundEvents[0], persistence.inboundEvents[1], persistence.inboundEvents[2]
+	if !IsCanonicalEventKeyV2(first.EventKey) || first.EventKey != second.EventKey {
+		t.Fatalf("unstable v2 identity: %q %q", first.EventKey, second.EventKey)
+	}
+	if later.EventKey == first.EventKey {
+		t.Fatalf("different source times shared v2 identity: %q", first.EventKey)
+	}
+	if first.EventKey == event.EventKey {
+		t.Fatal("forged ingress event key was trusted")
+	}
+	if first.Device != "phone-a" {
+		t.Fatalf("API key device was not authoritative: %q", first.Device)
+	}
+}
+
+func TestIngestV2RejectsMissingSourceTimeWithoutPersistenceOrPublish(t *testing.T) {
+	for _, createTime := range []int64{0, -1} {
+		t.Run(strconv.FormatInt(createTime, 10), func(t *testing.T) {
+			persistence := &fakePersistence{}
+			service := newTestService("", WithPersistence(persistence))
+			service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+			_, err := service.Ingest(t.Context(), MessageEvent{
+				APIKey: testAPIKey, ID: "882", Device: "phone-a", From: "wxid_friend", To: "wxid_self",
+				Text: "ping", Direction: DirectionRecv, CreateTime: createTime,
+			})
+			var validationError *IngestValidationError
+			if !errors.As(err, &validationError) || validationError.Field != "create_time" {
+				t.Fatalf("non-positive v2 source time error = %v", err)
+			}
+			if len(persistence.inboundEvents) != 0 {
+				t.Fatalf("invalid v2 event reached persistence: %+v", persistence.inboundEvents)
+			}
+			if got := service.Hub().Recent(1); len(got) != 0 {
+				t.Fatalf("invalid v2 event was published: %+v", got)
+			}
+		})
+	}
+
+	persistence := &fakePersistence{}
+	service := newTestService("", WithPersistence(persistence))
+	service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","direction":"recv","from":"wxid_friend","to":"wxid_self","text":"ping","create_time":0}`)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/webhook/lsposed/message", bytes.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing v2 source time status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(persistence.inboundEvents) != 0 {
+		t.Fatalf("HTTP-invalid v2 event reached persistence: %+v", persistence.inboundEvents)
+	}
+}
+
+func TestIngestLegacyPersistenceFailurePreservesExistingPublishContract(t *testing.T) {
+	persistence := &fakePersistence{inboundErr: errors.New("database unavailable")}
+	service := newTestService("", WithPersistence(persistence))
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey: testAPIKey, ID: "101", Device: "phone-a", From: "wxid_friend", To: "wxid_self",
+		Text: "ping", Direction: DirectionRecv, CreateTime: 1_786_530_000,
+	})
+	if err != nil || result == nil || !result.Published || result.PersistenceError != "database unavailable" {
+		t.Fatalf("legacy result=%+v err=%v", result, err)
+	}
+	if got := service.Hub().Recent(1); len(got) != 1 {
+		t.Fatalf("legacy persistence failure should retain publish behavior: %+v", got)
+	}
+
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","direction":"recv","from":"wxid_friend","to":"wxid_self","text":"ping","create_time":1786530000}`)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/webhook/lsposed/message", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"persistence_error":"database unavailable"`) {
+		t.Fatalf("legacy persistence HTTP status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestIngestV2PersistenceFailureDoesNotPublishAndReturnsRetryableHTTPStatus(t *testing.T) {
+	databaseError := errors.New("database unavailable")
+	service := newTestService("", WithPersistence(&fakePersistence{inboundErr: databaseError}))
+	service.cfg.EventIdentityV2Devices = map[string]struct{}{"phone-a": {}}
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey: testAPIKey, ID: "101", Device: "phone-a", From: "wxid_friend", To: "wxid_self",
+		Text: "ping", Direction: DirectionRecv, CreateTime: 1_786_530_000,
+	})
+	var persistenceError *IngestPersistenceError
+	if !errors.As(err, &persistenceError) || !errors.Is(err, databaseError) || result != nil {
+		t.Fatalf("v2 result=%+v err=%v, want persistence failure", result, err)
+	}
+	if got := service.Hub().Recent(1); len(got) != 0 {
+		t.Fatalf("failed v2 persistence published a live event: %+v", got)
+	}
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","direction":"recv","from":"wxid_friend","to":"wxid_self","text":"ping","create_time":1786530000}`)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/webhook/lsposed/message", bytes.NewReader(body)))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("persistence failure status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -118,13 +265,16 @@ func TestLiveEventsReplaysDurableCursor(t *testing.T) {
 			To:        "wxid_self",
 			Text:      "replayed",
 			Direction: DirectionRecv,
+		}, {
+			Sequence: 5, EventKey: "evt_5", ID: "source-5", Device: "phone-b",
+			From: "wxid_other", To: "wxid_self", Text: "other device", Direction: DirectionRecv,
 		}},
 	}
 	service := newTestService("", WithAdminReader(tailer))
 	server := NewHTTPServer(service, "admin").Handler()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, "/api/live/events", nil).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodGet, "/api/live/events?device=phone-a", nil).WithContext(ctx)
 	req.Header.Set("X-Bridge-Password", "admin")
 	req.Header.Set("Last-Event-ID", "3")
 	rec := newSSERecorder()
@@ -141,6 +291,9 @@ func TestLiveEventsReplaysDurableCursor(t *testing.T) {
 			t.Fatalf("durable event was not replayed: %s", rec.String())
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+	if strings.Contains(rec.String(), "other device") {
+		t.Fatalf("durable stream leaked another device event: %s", rec.String())
 	}
 	cancel()
 	select {
@@ -236,6 +389,41 @@ func TestMediaRouteIsAbsentWhenMediaStorageIsDisabled(t *testing.T) {
 	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected disabled media route to be absent, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminRedirectsStayRelativeForReverseProxyMounts(t *testing.T) {
+	server := NewHTTPServer(newTestService(""), "admin").Handler()
+	for _, path := range []string{"/", "/admin"} {
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusPermanentRedirect || recorder.Header().Get("Location") != "admin/" {
+			t.Fatalf("redirect %s = %d location=%q", path, recorder.Code, recorder.Header().Get("Location"))
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown route should remain 404, got %d", recorder.Code)
+	}
+}
+
+func TestHealthIncludesDatabaseSizeWithoutMakingMetricsAReadinessDependency(t *testing.T) {
+	reader := &fakeMetricsAdminReader{fakeAdminReader: &fakeAdminReader{}, databaseBytes: 123456}
+	server := NewHTTPServer(newTestService("", WithAdminReader(reader)), "admin").Handler()
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"database_bytes":123456`) {
+		t.Fatalf("health response=%d %s", recorder.Code, recorder.Body.String())
+	}
+
+	reader.metricsErr = errors.New("metrics unavailable")
+	recorder = httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"metrics_error":"metrics unavailable"`) {
+		t.Fatalf("metrics failure should not fail health: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -356,6 +544,16 @@ func TestAdminSendTextRequiresCurrentOwnerWxID(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
 	}
+	var sendPayload struct {
+		OK       bool  `json:"ok"`
+		OutboxID int64 `json:"outbox_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sendPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !sendPayload.OK || sendPayload.OutboxID != 1 || bytes.Contains(rec.Body.Bytes(), []byte("chat_record_id")) {
+		t.Fatalf("send response must expose only the queue id: %s", rec.Body.String())
+	}
 	items := pollOutbox(t, service, "phone-a", 10)
 	if len(items) != 1 || items[0].OwnerWxID != "wxid_self" || items[0].WxID != "wxid_friend" || items[0].Text != "manual reply" {
 		t.Fatalf("unexpected outbox items: %+v", items)
@@ -377,6 +575,36 @@ func TestAdminSendTextRequiresCurrentOwnerWxID(t *testing.T) {
 	server.ServeHTTP(missingOwnerRec, missingOwnerReq)
 	if missingOwnerRec.Code != http.StatusBadRequest {
 		t.Fatalf("missing owner should be rejected, got status %d body=%s", missingOwnerRec.Code, missingOwnerRec.Body.String())
+	}
+}
+
+func TestSendTextRejectsOfflinePersistentModuleBeforeEnqueue(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	persistence := &fakeLivenessPersistence{fakePersistence: &fakePersistence{}, online: false}
+	service := newTestService("", WithPersistence(persistence), WithOutbox(outbox))
+
+	_, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", OwnerWxID: "wxid_self", WxIDs: []string{"wxid_friend"}, Text: "must not queue",
+	})
+	if !errors.Is(err, ErrModuleOffline) {
+		t.Fatalf("offline send error=%v", err)
+	}
+	if len(snapshotMemoryOutbox(outbox)) != 0 {
+		t.Fatalf("offline send created outbox rows: %+v", snapshotMemoryOutbox(outbox))
+	}
+	if persistence.device != "phone-a" || persistence.ownerWxID != "wxid_self" || persistence.offlineAfter != 5*time.Minute {
+		t.Fatalf("liveness request=%+v", persistence)
+	}
+
+	persistence.online = true
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", OwnerWxID: "wxid_self", WxIDs: []string{"wxid_friend"}, Text: "queue when online",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 1 || items[0].Status != "pending" || items[0].Text != "queue when online" {
+		t.Fatalf("online send outbox=%+v", items)
 	}
 }
 
@@ -522,11 +750,14 @@ func TestRegisterModulePersistsStableIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Device.Name != "phone-a" || result.Device.WxID != "wxid_new_self" {
+	if result.Device.Name != "phone-a" || result.Device.WxID != "wxid_new_self" || result.Device.Nickname != "WeChat Phone" || result.Device.WeChatNickname != "New WeChat" {
 		t.Fatalf("unexpected registration device: %+v", result.Device)
 	}
-	if persistence.deviceName != "phone-a" || persistence.deviceWxID != "wxid_new_self" || persistence.deviceNickname != "WeChat Phone" {
-		t.Fatalf("device identity was not persisted: name=%q wxid=%q nickname=%q", persistence.deviceName, persistence.deviceWxID, persistence.deviceNickname)
+	if device, ok := service.Device("phone-a"); !ok || device.Nickname != "WeChat Phone" || device.WeChatNickname != "New WeChat" {
+		t.Fatalf("registration should keep the device label and track the WeChat nickname: ok=%v device=%+v", ok, device)
+	}
+	if persistence.deviceName != "phone-a" || persistence.deviceWxID != "wxid_new_self" || persistence.deviceNickname != "WeChat Phone" || persistence.wechatNickname != "New WeChat" {
+		t.Fatalf("device identities were not persisted: name=%q wxid=%q device_nickname=%q wechat_nickname=%q", persistence.deviceName, persistence.deviceWxID, persistence.deviceNickname, persistence.wechatNickname)
 	}
 	if len(persistence.moduleActivities) != 1 || persistence.moduleActivities[0].Kind != "register" || persistence.moduleActivities[0].APIKey != "wechat-a-key" {
 		t.Fatalf("module register activity was not recorded: %+v", persistence.moduleActivities)
@@ -645,6 +876,99 @@ func TestAPIKeyDisableStopsAndEnableRestoresModuleAuth(t *testing.T) {
 	}
 }
 
+func TestAPIKeyIntrospectionUsesOpaqueReferenceAndTracksAuthorityVersion(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(`{"api_key":"wechat-a-key"}`))
+	loginReq.Header.Set("X-Bridge-Password", "admin")
+	loginRec := httptest.NewRecorder()
+	server.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("unexpected introspection status=%d body=%s", loginRec.Code, loginRec.Body.String())
+	}
+	var login APIKeyIntrospection
+	if err := json.Unmarshal(loginRec.Body.Bytes(), &login); err != nil {
+		t.Fatal(err)
+	}
+	if !login.Active || login.CredentialRef == "" || login.AuthVersion != 1 || login.Device != "phone-a" {
+		t.Fatalf("unexpected introspection result: %+v", login)
+	}
+	for _, private := range []string{"wechat-a-key", "wxid_self", "WeChat Phone"} {
+		if strings.Contains(loginRec.Body.String(), private) {
+			t.Fatalf("introspection leaked %q: %s", private, loginRec.Body.String())
+		}
+	}
+	if loginRec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("introspection must be no-store: %v", loginRec.Header())
+	}
+
+	refBody := fmt.Sprintf(`{"credential_ref":%q}`, login.CredentialRef)
+	refReq := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(refBody))
+	refReq.Header.Set("X-Bridge-Password", "admin")
+	refRec := httptest.NewRecorder()
+	server.ServeHTTP(refRec, refReq)
+	if refRec.Code != http.StatusOK || !strings.Contains(refRec.Body.String(), `"active":true`) {
+		t.Fatalf("reference revalidation failed: %d %s", refRec.Code, refRec.Body.String())
+	}
+
+	if _, err := service.SetAPIKeyEnabled(t.Context(), "wechat-a-key", false); err != nil {
+		t.Fatal(err)
+	}
+	disabledReq := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(refBody))
+	disabledReq.Header.Set("X-Bridge-Password", "admin")
+	disabledRec := httptest.NewRecorder()
+	server.ServeHTTP(disabledRec, disabledReq)
+	if disabledRec.Code != http.StatusOK || disabledRec.Body.String() != "{\"active\":false}\n" {
+		t.Fatalf("disabled reference should be generically inactive: %d %s", disabledRec.Code, disabledRec.Body.String())
+	}
+
+	if _, err := service.SetAPIKeyEnabled(t.Context(), "wechat-a-key", true); err != nil {
+		t.Fatal(err)
+	}
+	reenabled, err := service.IntrospectAPIKey(t.Context(), APIKeyIntrospectionRequest{APIKey: "wechat-a-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reenabled.Active || reenabled.CredentialRef != login.CredentialRef || reenabled.AuthVersion <= login.AuthVersion {
+		t.Fatalf("reenabled authority should keep ref and advance version: before=%+v after=%+v", login, reenabled)
+	}
+}
+
+func TestAPIKeyIntrospectionFailsClosed(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	for _, body := range []string{
+		`{"api_key":"unknown"}`,
+		`{"api_key":"wechat-b-key"}`,
+		`{"credential_ref":"ak_unknown"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(body))
+		req.Header.Set("X-Bridge-Password", "admin")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.String() != "{\"active\":false}\n" {
+			t.Fatalf("inactive introspection body=%s status=%d response=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	badShape := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(`{"api_key":"wechat-a-key","credential_ref":"ak_conflict"}`))
+	badShape.Header.Set("X-Bridge-Password", "admin")
+	badShapeRec := httptest.NewRecorder()
+	server.ServeHTTP(badShapeRec, badShape)
+	if badShapeRec.Code != http.StatusBadRequest {
+		t.Fatalf("ambiguous introspection request should fail: %d %s", badShapeRec.Code, badShapeRec.Body.String())
+	}
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/internal/api-key/introspect", strings.NewReader(`{"api_key":"wechat-a-key"}`))
+	unauthorizedRec := httptest.NewRecorder()
+	server.ServeHTTP(unauthorizedRec, unauthorized)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("introspection should require admin auth: %d %s", unauthorizedRec.Code, unauthorizedRec.Body.String())
+	}
+}
+
 func TestAdminReadEndpointsUsePersistentReader(t *testing.T) {
 	reader := &fakeAdminReader{
 		keys: []APIKeyView{
@@ -672,9 +996,9 @@ func TestAdminReadEndpointsUsePersistentReader(t *testing.T) {
 	}{
 		{path: "/api/api-keys?limit=1", want: `"api_keys"`},
 		{path: "/api/stored-events?limit=1", want: `"events"`},
-		{path: "/api/messages?device=phone-a&wxid=wxid_friend&limit=1", want: `"messages"`},
+		{path: "/api/messages?device=phone-a&wxid=wxid_friend&after_id=8&limit=1", want: `"messages"`},
 		{path: "/api/modules/status", want: `"modules"`},
-		{path: "/api/module-contacts?device=phone-a&q=Friend&limit=1", want: `"contacts"`},
+		{path: "/api/module-contacts?device=phone-a&wxid=wxid_friend&q=Friend&limit=1", want: `"contacts"`},
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
@@ -687,6 +1011,20 @@ func TestAdminReadEndpointsUsePersistentReader(t *testing.T) {
 	}
 	if got := strings.Join(reader.calls, ","); !strings.Contains(got, "keys:1") || !strings.Contains(got, "events:1") || !strings.Contains(got, "messages:phone-a:wxid_friend:1") || !strings.Contains(got, "modules") || !strings.Contains(got, "contacts:phone-a:Friend:1") {
 		t.Fatalf("persistent reader was not used as expected: %+v", reader.calls)
+	}
+	if !reader.lastMessageFilter.AfterIDSet || reader.lastMessageFilter.AfterID != 8 {
+		t.Fatalf("message cursor filter was not forwarded: %+v", reader.lastMessageFilter)
+	}
+	if reader.lastContactFilter.WxID != "wxid_friend" {
+		t.Fatalf("exact contact filter was not forwarded: %+v", reader.lastContactFilter)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/messages?after_id=-1", nil)
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("negative after_id status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -774,6 +1112,47 @@ func TestModuleStatusEndpointFallsBackToRuntimeSnapshot(t *testing.T) {
 	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"device":"phone-a"`) || !strings.Contains(rec.Body.String(), `"runtime_status":"ready"`) {
 		t.Fatalf("unexpected status response %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestModuleStatusOfflinePrecedesOutboxCountsAtFiveMinutes(t *testing.T) {
+	now := time.Date(2026, time.July, 28, 3, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		status ModuleStatusView
+		want   string
+	}{
+		{name: "disabled wins", status: ModuleStatusView{Enabled: false, Registered: true, RuntimeUpdatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), PendingOutbox: 2}, want: "disabled"},
+		{name: "unregistered wins", status: ModuleStatusView{Enabled: true, Registered: false, RuntimeUpdatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), PendingOutbox: 2}, want: "unregistered"},
+		{name: "exact cutoff is online pending", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-5 * time.Minute).Format(time.RFC3339Nano), PendingOutbox: 2}, want: "pending"},
+		{name: "older than cutoff is offline", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-5*time.Minute - time.Nanosecond).Format(time.RFC3339Nano), PendingOutbox: 2, LeasedOutbox: 1}, want: "offline"},
+		{name: "fresh lease is sending", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), LeasedOutbox: 1}, want: "sending"},
+		{name: "fresh ready", status: ModuleStatusView{Enabled: true, Registered: true, RuntimeUpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}, want: "ready"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.status.NormalizeRuntimeStatusAt(now, 5*time.Minute)
+			if test.status.RuntimeStatus != test.want {
+				t.Fatalf("runtime status=%q want=%q", test.status.RuntimeStatus, test.want)
+			}
+		})
+	}
+}
+
+func TestModuleStatusEndpointProjectsOfflineFromPersistentActivity(t *testing.T) {
+	reader := &fakeAdminReader{modules: []ModuleStatusView{{
+		Device: "phone-a", Enabled: true, Registered: true,
+		RuntimeUpdatedAt: time.Now().Add(-6 * time.Minute).UTC().Format(time.RFC3339Nano),
+		PendingOutbox:    2,
+	}}}
+	service := newTestService("", WithAdminReader(reader))
+	server := NewHTTPServer(service, "admin").Handler()
+	req := httptest.NewRequest(http.MethodGet, "/api/modules/status", nil)
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"runtime_status":"offline"`) {
+		t.Fatalf("offline module status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -910,6 +1289,140 @@ func TestModuleOutboxWebSocketPushAndAck(t *testing.T) {
 	}
 }
 
+func TestModuleOutboxWebSocketProbesBeforeLeasing(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox))
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	conn := dialTestWebSocket(t, server.URL, "/module/outbox/ws?api_key=wechat-a-key&device=phone-a&wxid=wxid_self")
+	defer conn.close()
+	if ready := readTestWSMessage(t, conn); ready.Type != "ready" || !ready.OK {
+		t.Fatalf("unexpected ready message: %+v", ready)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "probe before lease",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	payload, op, err := conn.readFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != wsOpPing {
+		t.Fatalf("first delivery frame opcode = %d, want ping", op)
+	}
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 1 || items[0].Status != "pending" || items[0].AttemptCount != 0 {
+		t.Fatalf("outbox leased before liveness proof: %+v", items)
+	}
+	if !conn.writeControl(wsOpPong, payload) {
+		t.Fatal("failed to answer delivery probe")
+	}
+	outboxMsg := readTestWSMessageOfType(t, conn, "outbox")
+	if len(outboxMsg.Items) != 1 || outboxMsg.Items[0].Status != "leased" || outboxMsg.Items[0].AttemptCount != 1 {
+		t.Fatalf("unexpected outbox after liveness proof: %+v", outboxMsg)
+	}
+}
+
+func TestModuleOutboxWebSocketProbeTimeoutLeavesItemPending(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox))
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	conn := dialTestWebSocket(t, server.URL, "/module/outbox/ws?api_key=wechat-a-key&device=phone-a&wxid=wxid_self")
+	defer conn.close()
+	if ready := readTestWSMessage(t, conn); ready.Type != "ready" || !ready.OK {
+		t.Fatalf("unexpected ready message: %+v", ready)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "keep pending on stale socket",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, op, err := conn.readFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != wsOpPing {
+		t.Fatalf("first delivery frame opcode = %d, want ping", op)
+	}
+	started := time.Now()
+	if _, _, err := conn.readFrame(); err == nil {
+		t.Fatal("stale websocket remained open after probe timeout")
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("stale websocket close took %s", elapsed)
+	}
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 1 || items[0].Status != "pending" || items[0].AttemptCount != 0 {
+		t.Fatalf("probe timeout leased pending outbox: %+v", items)
+	}
+}
+
+func TestModuleOutboxWebSocketKeepsSecondItemPendingUntilAck(t *testing.T) {
+	outbox := NewMemoryOutbox()
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox))
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	conn := dialTestWebSocket(t, server.URL, "/module/outbox/ws?api_key=wechat-a-key&device=phone-a&wxid=wxid_self")
+	defer conn.close()
+	if ready := readTestWSMessage(t, conn); ready.Type != "ready" || !ready.OK {
+		t.Fatalf("unexpected ready message: %+v", ready)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "first single-flight reply",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := readTestWSMessageOfType(t, conn, "outbox")
+	if len(first.Items) != 1 || first.Items[0].Text != "first single-flight reply" {
+		t.Fatalf("unexpected first outbox message: %+v", first)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a", WxIDs: []string{"wxid_friend"}, Text: "second single-flight reply",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	items := snapshotMemoryOutbox(outbox)
+	if len(items) != 2 || items[0].Status != "leased" || items[1].Status != "pending" || items[1].AttemptCount != 0 {
+		t.Fatalf("second outbox item leased before first ACK: %+v", items)
+	}
+
+	ack := ModuleAckRequest{Items: []ModuleAckItem{{ID: first.Items[0].ID, Status: "sent", ChatRecordID: 9201}}}
+	if !conn.writeJSON(outboxWSMessage{Type: "ack", Ack: &ack}) {
+		t.Fatal("failed to write first ACK")
+	}
+	ackMsg := readTestWSMessageOfType(t, conn, "ack")
+	if !ackMsg.OK || len(ackMsg.Items) != 1 || ackMsg.Items[0].Status != "sent" {
+		t.Fatalf("unexpected first ACK response: %+v", ackMsg)
+	}
+	second := readTestWSMessageOfType(t, conn, "outbox")
+	if len(second.Items) != 1 || second.Items[0].Text != "second single-flight reply" || second.Items[0].AttemptCount != 1 {
+		t.Fatalf("unexpected second outbox message: %+v", second)
+	}
+}
+
+func snapshotMemoryOutbox(outbox *MemoryOutbox) []ModuleOutboxItem {
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	items := make([]ModuleOutboxItem, 0, len(outbox.items))
+	for _, item := range outbox.items {
+		items = append(items, item.ModuleOutboxItem)
+	}
+	return items
+}
+
 func TestModuleOutboxPollIsSerializedForWeChatSender(t *testing.T) {
 	service := newTestService("")
 	for _, text := range []string{"first queued reply", "second queued reply"} {
@@ -1001,12 +1514,14 @@ type fakePersistence struct {
 	deviceName       string
 	deviceWxID       string
 	deviceNickname   string
+	wechatNickname   string
 	deviceByWxID     map[string]config.Device
 	inboundEvents    []MessageEvent
 	outboundEvents   []MessageEvent
 	moduleActivities []ModuleActivity
 	contactSnapshots []ModuleContactSnapshotRequest
 	calls            []string
+	inboundErr       error
 }
 
 type fakeSessionPersistence struct {
@@ -1015,10 +1530,26 @@ type fakeSessionPersistence struct {
 	leases map[string]ModuleSessionLease
 }
 
+type fakeLivenessPersistence struct {
+	*fakePersistence
+	online       bool
+	err          error
+	device       string
+	ownerWxID    string
+	offlineAfter time.Duration
+}
+
 type fakeDynamicConfigPersistence struct {
 	*fakePersistence
 	keys    map[string]config.APIKey
 	devices map[string]config.Device
+}
+
+func (p *fakeLivenessPersistence) ModuleOnline(_ context.Context, device string, ownerWxID string, offlineAfter time.Duration) (bool, error) {
+	p.device = device
+	p.ownerWxID = ownerWxID
+	p.offlineAfter = offlineAfter
+	return p.online, p.err
 }
 
 func (p *fakeDynamicConfigPersistence) LookupAPIKey(_ context.Context, code string) (config.APIKey, bool, error) {
@@ -1069,6 +1600,13 @@ func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName str
 	return nil
 }
 
+func (p *fakePersistence) UpdateDeviceWeChatIdentity(_ context.Context, _ string, _ string, nickname string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.wechatNickname = nickname
+	return nil
+}
+
 func (p *fakePersistence) LookupDeviceByWxID(_ context.Context, wxid string) (config.Device, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1105,7 +1643,7 @@ func (p *fakePersistence) RecordInboundEvent(_ context.Context, event MessageEve
 	defer p.mu.Unlock()
 	p.calls = append(p.calls, "inbound")
 	p.inboundEvents = append(p.inboundEvents, event)
-	return event, nil
+	return event, p.inboundErr
 }
 
 func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEvent) (MessageEvent, error) {
@@ -1181,12 +1719,24 @@ func (r *sseRecorder) String() string {
 }
 
 type fakeAdminReader struct {
-	keys     []APIKeyView
-	events   []StoredEventView
-	messages []StoredEventView
-	modules  []ModuleStatusView
-	contacts []ModuleContactView
-	calls    []string
+	keys              []APIKeyView
+	events            []StoredEventView
+	messages          []StoredEventView
+	modules           []ModuleStatusView
+	contacts          []ModuleContactView
+	calls             []string
+	lastMessageFilter MessageFilter
+	lastContactFilter ModuleContactFilter
+}
+
+type fakeMetricsAdminReader struct {
+	*fakeAdminReader
+	databaseBytes int64
+	metricsErr    error
+}
+
+func (r *fakeMetricsAdminReader) DatabaseSizeBytes(context.Context) (int64, error) {
+	return r.databaseBytes, r.metricsErr
 }
 
 type fakeEventTailReader struct {
@@ -1199,10 +1749,10 @@ func (r *fakeEventTailReader) LatestLiveEventID(context.Context) (int64, error) 
 	return r.latest, nil
 }
 
-func (r *fakeEventTailReader) ListLiveEventsAfter(_ context.Context, afterID int64, _ int) ([]MessageEvent, error) {
+func (r *fakeEventTailReader) ListLiveEventsAfter(_ context.Context, afterID int64, device string, _ int) ([]MessageEvent, error) {
 	out := make([]MessageEvent, 0, len(r.events))
 	for _, event := range r.events {
-		if event.Sequence > afterID {
+		if event.Sequence > afterID && (device == "" || event.Device == device) {
 			out = append(out, event)
 		}
 	}
@@ -1220,6 +1770,7 @@ func (r *fakeAdminReader) ListStoredEvents(_ context.Context, limit int) ([]Stor
 }
 
 func (r *fakeAdminReader) ListMessages(_ context.Context, filter MessageFilter) ([]StoredEventView, error) {
+	r.lastMessageFilter = filter
 	r.calls = append(r.calls, "messages:"+filter.Device+":"+filter.WxID+":"+strconv.Itoa(filter.Limit))
 	return r.messages, nil
 }
@@ -1230,6 +1781,7 @@ func (r *fakeAdminReader) ListModuleStatuses(_ context.Context) ([]ModuleStatusV
 }
 
 func (r *fakeAdminReader) ListModuleContacts(_ context.Context, filter ModuleContactFilter) ([]ModuleContactView, error) {
+	r.lastContactFilter = filter
 	r.calls = append(r.calls, "contacts:"+filter.Device+":"+filter.Query+":"+strconv.Itoa(filter.Limit))
 	return r.contacts, nil
 }

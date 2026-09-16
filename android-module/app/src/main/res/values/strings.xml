@@ -1,17 +1,21 @@
 ﻿<resources>
     <string name="app_name">WeChat Observatory</string>
     <string name="settings_title">微信网关模块设置</string>
-    <string name="settings_hint">只填写服务端地址和 Web 端生成的 API Key；wxid 由模块在微信内自动识别。</string>
+    <string name="settings_hint">填写 Observatory 服务地址和 Web 端生成的 API Key；wxid 由模块在微信内自动识别。</string>
     <string name="settings_restart_hint">保存后配置会自动同步到微信进程；设备名和显示名只能在 Web 管理台设置。</string>
     <string name="settings_saved">已保存配置，请重启微信生效</string>
     <string name="action_save">保存配置</string>
-    <string name="label_bridge_url">服务端地址</string>
+    <string name="label_bridge_url">Observatory 服务地址</string>
     <string name="label_api_key">API Key</string>
+    <string name="error_bridge_url_invalid">请输入完整的 HTTP 或 HTTPS 服务地址，不能包含查询参数或锚点</string>
     <string name="label_poll_interval">出站轮询间隔毫秒</string>
     <string name="label_poll_limit">单次拉取数量</string>
+    <string name="label_outbox_websocket_enabled">是否启用出站 WebSocket 0/1（频繁切号建议 0）</string>
     <string name="label_contact_sync_interval">通讯录同步间隔毫秒</string>
     <string name="label_contact_sync_limit">通讯录同步上限</string>
     <string name="label_contact_include_chatrooms">是否同步群聊 0/1</string>
     <string name="label_media_upload_enabled">是否上传媒体 0/1</string>
     <string name="label_media_upload_limit">媒体上传大小上限字节</string>
+    <string name="label_stale_message_grace">历史消息判定宽限毫秒</string>
+    <string name="label_stale_message_replay_limit">历史消息回灌上限</string>
 </resources>

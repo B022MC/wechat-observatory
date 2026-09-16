@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.text.InputType;
+import android.text.method.PasswordTransformationMethod;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -17,28 +18,37 @@ import android.widget.Toast;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+import cc.wechat.observatory.config.BridgeConfig;
+import cc.wechat.observatory.gateway.GatewayEndpoint;
+
 public final class SettingsActivity extends Activity {
-    private static final String DEFAULT_BRIDGE_URL = "http://192.168.1.10:8088";
     private static final String DEFAULT_POLL_INTERVAL_MS = "1000";
     private static final String DEFAULT_POLL_LIMIT = "1";
+    private static final String DEFAULT_OUTBOX_WEBSOCKET_ENABLED = "0";
     private static final String DEFAULT_CONTACT_SYNC_INTERVAL_MS = "600000";
-    private static final String DEFAULT_CONTACT_SYNC_LIMIT = "1000";
+    private static final String DEFAULT_CONTACT_SYNC_LIMIT = String.valueOf(BridgeConfig.DEFAULT_CONTACT_SYNC_LIMIT);
     private static final String DEFAULT_CONTACT_INCLUDE_CHATROOMS = "1";
-    private static final String DEFAULT_MEDIA_UPLOAD_ENABLED = "1";
+    private static final String DEFAULT_MEDIA_UPLOAD_ENABLED = "0";
     private static final String DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES = "5242880";
+    private static final String DEFAULT_STALE_MESSAGE_GRACE_MS = String.valueOf(BridgeConfig.DEFAULT_STALE_MESSAGE_GRACE_MS);
+    private static final String DEFAULT_STALE_MESSAGE_REPLAY_LIMIT = String.valueOf(BridgeConfig.DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
+    private static final String[] SENSITIVE_CONFIG_KEYS = new String[]{"bridge_url", "api_key"};
     private static final Map<String, String> DEFAULTS = new LinkedHashMap<>();
 
     static {
         DEFAULTS.put("enabled", "1");
-        DEFAULTS.put("bridge_url", DEFAULT_BRIDGE_URL);
+        DEFAULTS.put("bridge_url", GatewayEndpoint.PRODUCTION_BASE_URL);
         DEFAULTS.put("api_key", "");
         DEFAULTS.put("poll_interval_ms", DEFAULT_POLL_INTERVAL_MS);
         DEFAULTS.put("poll_limit", DEFAULT_POLL_LIMIT);
+        DEFAULTS.put("outbox_websocket_enabled", DEFAULT_OUTBOX_WEBSOCKET_ENABLED);
         DEFAULTS.put("contact_sync_interval_ms", DEFAULT_CONTACT_SYNC_INTERVAL_MS);
         DEFAULTS.put("contact_sync_limit", DEFAULT_CONTACT_SYNC_LIMIT);
         DEFAULTS.put("contact_include_chatrooms", DEFAULT_CONTACT_INCLUDE_CHATROOMS);
         DEFAULTS.put("media_upload_enabled", DEFAULT_MEDIA_UPLOAD_ENABLED);
         DEFAULTS.put("media_upload_limit_bytes", DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES);
+        DEFAULTS.put("stale_message_grace_ms", DEFAULT_STALE_MESSAGE_GRACE_MS);
+        DEFAULTS.put("stale_message_replay_limit", DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
     }
 
     private final Map<String, EditText> fields = new LinkedHashMap<>();
@@ -73,15 +83,19 @@ public final class SettingsActivity extends Activity {
         hint.setPadding(0, 0, 0, dp(14));
         root.addView(hint);
 
-        addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         addField(root, "api_key", R.string.label_api_key, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        maskSensitiveFields();
         addField(root, "poll_interval_ms", R.string.label_poll_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "poll_limit", R.string.label_poll_limit, InputType.TYPE_CLASS_NUMBER);
+        addField(root, "outbox_websocket_enabled", R.string.label_outbox_websocket_enabled, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_sync_interval_ms", R.string.label_contact_sync_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_sync_limit", R.string.label_contact_sync_limit, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_include_chatrooms", R.string.label_contact_include_chatrooms, InputType.TYPE_CLASS_NUMBER);
         addField(root, "media_upload_enabled", R.string.label_media_upload_enabled, InputType.TYPE_CLASS_NUMBER);
         addField(root, "media_upload_limit_bytes", R.string.label_media_upload_limit, InputType.TYPE_CLASS_NUMBER);
+        addField(root, "stale_message_grace_ms", R.string.label_stale_message_grace, InputType.TYPE_CLASS_NUMBER);
+        addField(root, "stale_message_replay_limit", R.string.label_stale_message_replay_limit, InputType.TYPE_CLASS_NUMBER);
 
         Button saveButton = new Button(this);
         saveButton.setText(R.string.action_save);
@@ -120,6 +134,15 @@ public final class SettingsActivity extends Activity {
         fields.put(key, editText);
     }
 
+    private void maskSensitiveFields() {
+        for (String key : SENSITIVE_CONFIG_KEYS) {
+            EditText field = fields.get(key);
+            if (field != null) {
+                field.setTransformationMethod(PasswordTransformationMethod.getInstance());
+            }
+        }
+    }
+
     private void loadValues() {
         SharedPreferences prefs = getSharedPreferences(BridgeConfigProvider.PREFS_NAME, Context.MODE_PRIVATE);
         for (String key : BridgeConfigProvider.CONFIG_KEYS) {
@@ -130,6 +153,25 @@ public final class SettingsActivity extends Activity {
     }
 
     private void saveValues() {
+        EditText bridgeUrlField = fields.get("bridge_url");
+        String bridgeUrl = bridgeUrlField == null ? "" : bridgeUrlField.getText().toString().trim();
+        if (bridgeUrl.isEmpty()) {
+            bridgeUrl = GatewayEndpoint.PRODUCTION_BASE_URL;
+        }
+        try {
+            bridgeUrl = GatewayEndpoint.normalizeBaseUrl(bridgeUrl);
+        } catch (Throwable ignored) {
+            if (bridgeUrlField != null) {
+                bridgeUrlField.setError(getString(R.string.error_bridge_url_invalid));
+                bridgeUrlField.requestFocus();
+            }
+            Toast.makeText(this, R.string.error_bridge_url_invalid, Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (bridgeUrlField != null) {
+            bridgeUrlField.setText(bridgeUrl);
+        }
+
         SharedPreferences prefs = getSharedPreferences(BridgeConfigProvider.PREFS_NAME, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = prefs.edit();
         for (String key : BridgeConfigProvider.CONFIG_KEYS) {
@@ -149,6 +191,7 @@ public final class SettingsActivity extends Activity {
         }
         editor.commit();
         BridgeConfigFiles.writeExternalMirror(this, prefs);
+        maskSensitiveFields();
         Toast.makeText(this, R.string.settings_saved, Toast.LENGTH_LONG).show();
     }
 

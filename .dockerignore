@@ -12,6 +12,10 @@ android-module/.gradle
 android-module/**/build
 web/admin/node_modules
 web/admin/dist
+web/device/node_modules
+web/device/dist
+web/admin/*.tsbuildinfo
+web/device/*.tsbuildinfo
 *.exe
 *.log
 *.apk

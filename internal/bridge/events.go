@@ -114,14 +114,8 @@ func (e MessageEvent) Timestamp() int64 {
 	return time.Now().Unix()
 }
 
-// CanonicalEventKey identifies one source event across replay and replicas.
-// It deliberately uses a digest so raw message text and identifiers do not
-// become index keys or operational labels.
-func (e MessageEvent) CanonicalEventKey() string {
-	if key := strings.TrimSpace(e.EventKey); key != "" {
-		return key
-	}
-	parts := []string{
+func (e MessageEvent) canonicalEventKeyParts() []string {
+	return []string{
 		strings.TrimSpace(e.Device),
 		strings.TrimSpace(e.OwnerWxID),
 		string(e.Direction),
@@ -140,8 +134,37 @@ func (e MessageEvent) CanonicalEventKey() string {
 		strconv.FormatInt(e.MediaSize, 10),
 		strings.TrimSpace(e.RawProvider),
 	}
+}
+
+// CanonicalEventKey identifies one source event across replay and replicas.
+// It deliberately uses a digest so raw message text and identifiers do not
+// become index keys or operational labels. Callers must treat EventKey as
+// server-owned and clear any ingress value before choosing a version.
+func (e MessageEvent) CanonicalEventKey() string {
+	parts := e.canonicalEventKeyParts()
 	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return "evt_" + hex.EncodeToString(digest[:])
+}
+
+// CanonicalEventKeyV2 adds the phone source timestamp so a reused local
+// msgId in a later WeChat database lifetime cannot collide with old history.
+func (e MessageEvent) CanonicalEventKeyV2() string {
+	if e.CreateTime <= 0 {
+		return ""
+	}
+	parts := append(append([]string(nil), e.canonicalEventKeyParts()...), strconv.FormatInt(e.CreateTime, 10))
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "evt_v2_" + hex.EncodeToString(digest[:])
+}
+
+func IsCanonicalEventKeyV2(value string) bool {
+	const prefix = "evt_v2_"
+	value = strings.TrimSpace(value)
+	if len(value) != len(prefix)+sha256.Size*2 || !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, prefix))
+	return err == nil
 }
 
 type SendTextRequest struct {
