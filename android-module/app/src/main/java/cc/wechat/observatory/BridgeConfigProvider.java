@@ -19,6 +19,7 @@ public final class BridgeConfigProvider extends ContentProvider {
             "api_key",
             "poll_interval_ms",
             "poll_limit",
+            "outbox_websocket_enabled",
             "contact_sync_interval_ms",
             "contact_sync_limit",
             "contact_include_chatrooms",

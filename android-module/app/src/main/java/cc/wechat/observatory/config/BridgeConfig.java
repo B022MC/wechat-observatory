@@ -38,6 +38,7 @@ public final class BridgeConfig {
     public String nickname;
     public long pollIntervalMs;
     public int pollLimit;
+    public boolean outboxWebSocketEnabled;
     public long contactSyncIntervalMs;
     public int contactSyncLimit;
     public boolean includeChatrooms;
@@ -67,6 +68,9 @@ public final class BridgeConfig {
         config.nickname = "";
         config.pollIntervalMs = longSetting(properties, "poll_interval_ms", 1000L);
         config.pollLimit = (int) longSetting(properties, "poll_limit", 20L);
+        // HTTP polling re-reads the current wxid on every cycle and is more
+        // tolerant of WeChat replacing its account database while running.
+        config.outboxWebSocketEnabled = booleanSetting(properties, "outbox_websocket_enabled", false);
         config.contactSyncIntervalMs = longSetting(properties, "contact_sync_interval_ms", 600000L);
         config.contactSyncLimit = (int) longSetting(properties, "contact_sync_limit", DEFAULT_CONTACT_SYNC_LIMIT);
         config.includeChatrooms = booleanSetting(properties, "contact_include_chatrooms", true);
@@ -299,6 +303,7 @@ public final class BridgeConfig {
                 + " selfWxid=" + (Strings.isBlank(config.selfWxid) ? "<empty>" : config.selfWxid)
                 + " apiKey=" + (Strings.isBlank(config.apiKey) ? "<empty>" : "<set>")
                 + " pollIntervalMs=" + config.pollIntervalMs
+                + " outboxWebSocketEnabled=" + config.outboxWebSocketEnabled
                 + " includeChatrooms=" + config.includeChatrooms);
     }
 
@@ -369,6 +374,7 @@ public final class BridgeConfig {
                 "api_key",
                 "poll_interval_ms",
                 "poll_limit",
+                "outbox_websocket_enabled",
                 "contact_sync_interval_ms",
                 "contact_sync_limit",
                 "contact_include_chatrooms",

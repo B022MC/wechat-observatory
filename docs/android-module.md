@@ -31,6 +31,7 @@ cd android-module
 - Observatory 服务地址：默认 `https://47.108.232.203/observatory`
 - API Key：从 Web 管理台生成
 - 轮询间隔：默认 `1000`
+- 出站 WebSocket：默认关闭；频繁切换微信账号时保持 `0`
 - 通讯录同步间隔：默认 `600000`
 - 是否包含群聊：默认 `1`
 - 是否上传媒体：默认 `0`
@@ -48,6 +49,7 @@ cd android-module
 | `api_key` | 空 | Web 管理台生成的 API Key |
 | `poll_interval_ms` | `1000` | HTTP 轮询出站消息间隔 |
 | `poll_limit` | `1` | 每次最多拉取条数，服务端当前只租约一条 |
+| `outbox_websocket_enabled` | `0` | 是否启用出站 WebSocket；频繁切号建议保持 `0` |
 | `contact_sync_interval_ms` | `600000` | 通讯录同步间隔，`0` 表示关闭 |
 | `contact_sync_limit` | `10000` | 一次同步联系人数量上限 |
 | `contact_include_chatrooms` | `1` | 是否同步群聊 |
@@ -71,11 +73,11 @@ POST /module/register
 ## 发送流程
 
 1. 管理台调用 `POST /api/send/text` 创建出站任务。
-2. 服务端通过 WebSocket 唤醒模块。
+2. 模块默认通过 HTTP 轮询获取任务；启用 WebSocket 时由服务端实时唤醒连接。
 3. 模块在微信进程里执行发送。
-4. 模块通过 WebSocket 或 HTTP ACK 回报结果。
+4. 模块通过 HTTP 或 WebSocket ACK 回报结果。
 
-WebSocket 不可用时，模块会退回 HTTP 轮询。
+默认使用 HTTP 轮询，每次请求重新绑定当前 wxid；将 `outbox_websocket_enabled` 设为 `1` 后才启用 WebSocket，连接失败时仍会退回 HTTP 轮询。
 
 ## 联系人和媒体
 

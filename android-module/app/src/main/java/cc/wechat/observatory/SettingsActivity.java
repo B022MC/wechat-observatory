@@ -24,6 +24,7 @@ import cc.wechat.observatory.gateway.GatewayEndpoint;
 public final class SettingsActivity extends Activity {
     private static final String DEFAULT_POLL_INTERVAL_MS = "1000";
     private static final String DEFAULT_POLL_LIMIT = "1";
+    private static final String DEFAULT_OUTBOX_WEBSOCKET_ENABLED = "0";
     private static final String DEFAULT_CONTACT_SYNC_INTERVAL_MS = "600000";
     private static final String DEFAULT_CONTACT_SYNC_LIMIT = String.valueOf(BridgeConfig.DEFAULT_CONTACT_SYNC_LIMIT);
     private static final String DEFAULT_CONTACT_INCLUDE_CHATROOMS = "1";
@@ -31,7 +32,7 @@ public final class SettingsActivity extends Activity {
     private static final String DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES = "5242880";
     private static final String DEFAULT_STALE_MESSAGE_GRACE_MS = String.valueOf(BridgeConfig.DEFAULT_STALE_MESSAGE_GRACE_MS);
     private static final String DEFAULT_STALE_MESSAGE_REPLAY_LIMIT = String.valueOf(BridgeConfig.DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
-    private static final String[] SENSITIVE_CONFIG_KEYS = new String[]{"api_key"};
+    private static final String[] SENSITIVE_CONFIG_KEYS = new String[]{"bridge_url", "api_key"};
     private static final Map<String, String> DEFAULTS = new LinkedHashMap<>();
 
     static {
@@ -40,6 +41,7 @@ public final class SettingsActivity extends Activity {
         DEFAULTS.put("api_key", "");
         DEFAULTS.put("poll_interval_ms", DEFAULT_POLL_INTERVAL_MS);
         DEFAULTS.put("poll_limit", DEFAULT_POLL_LIMIT);
+        DEFAULTS.put("outbox_websocket_enabled", DEFAULT_OUTBOX_WEBSOCKET_ENABLED);
         DEFAULTS.put("contact_sync_interval_ms", DEFAULT_CONTACT_SYNC_INTERVAL_MS);
         DEFAULTS.put("contact_sync_limit", DEFAULT_CONTACT_SYNC_LIMIT);
         DEFAULTS.put("contact_include_chatrooms", DEFAULT_CONTACT_INCLUDE_CHATROOMS);
@@ -81,11 +83,12 @@ public final class SettingsActivity extends Activity {
         hint.setPadding(0, 0, 0, dp(14));
         root.addView(hint);
 
-        addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         addField(root, "api_key", R.string.label_api_key, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         maskSensitiveFields();
         addField(root, "poll_interval_ms", R.string.label_poll_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "poll_limit", R.string.label_poll_limit, InputType.TYPE_CLASS_NUMBER);
+        addField(root, "outbox_websocket_enabled", R.string.label_outbox_websocket_enabled, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_sync_interval_ms", R.string.label_contact_sync_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_sync_limit", R.string.label_contact_sync_limit, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_include_chatrooms", R.string.label_contact_include_chatrooms, InputType.TYPE_CLASS_NUMBER);

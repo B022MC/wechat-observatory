@@ -10,6 +10,7 @@
     <string name="error_bridge_url_invalid">请输入完整的 HTTP 或 HTTPS 服务地址，不能包含查询参数或锚点</string>
     <string name="label_poll_interval">出站轮询间隔毫秒</string>
     <string name="label_poll_limit">单次拉取数量</string>
+    <string name="label_outbox_websocket_enabled">是否启用出站 WebSocket 0/1（频繁切号建议 0）</string>
     <string name="label_contact_sync_interval">通讯录同步间隔毫秒</string>
     <string name="label_contact_sync_limit">通讯录同步上限</string>
     <string name="label_contact_include_chatrooms">是否同步群聊 0/1</string>

@@ -76,6 +76,7 @@ bridge_url=https://47.108.232.203/observatory
 api_key=wg_dev_key
 poll_interval_ms=1000
 poll_limit=1
+outbox_websocket_enabled=0
 contact_sync_interval_ms=600000
 contact_sync_limit=10000
 contact_include_chatrooms=1
@@ -89,9 +90,11 @@ Restart WeChat after changing config.
 
 The settings screen stores `bridge_url` and defaults it to
 `https://47.108.232.203/observatory`. The module derives API requests and the
-WebSocket outbox stream from that validated base URL. HTTPS uses the platform
-trust store and hostname verification; HTTP remains available only when it is
-explicitly configured. WebSocket failure keeps HTTP polling as the fallback.
+optional WebSocket outbox stream from that validated base URL. HTTPS uses the
+platform trust store and hostname verification; HTTP remains available only
+when it is explicitly configured. WebSocket is disabled by default so account
+switches stay bound to the latest wxid; enabling it is available through
+`outbox_websocket_enabled=1`, and failures still fall back to HTTP polling.
 
 `poll_interval_ms` controls how often the module checks the gateway outbox.
 The worker currently sleeps at least 1000ms between polls, so values below
@@ -123,18 +126,19 @@ When WeChat loads, the module:
 
 1. Registers the current WeChat identity with `/module/register` when
    `api_key` is configured and the current WeChat `wxid` has been detected.
-2. Opens `GET /module/outbox/ws?api_key=...&device=...&wxid=...`.
-3. Receives `outbox` messages as soon as the gateway queues reply actions.
-4. Attempts to send each returned item from inside WeChat.
-5. Reports results with a WebSocket `ack` message.
+2. Uses `POST /module/outbox/poll` by default, so each cycle can use the
+   latest account wxid after a WeChat account switch.
+3. Attempts to send each returned item from inside WeChat.
+4. Reports results with `POST /module/outbox/ack`.
 
-If the WebSocket connection cannot be established or drops, the module falls
-back to `POST /module/outbox/poll` and `POST /module/outbox/ack`. The fallback
-uses the same MySQL outbox state machine, so queued replies are not lost.
+Set `outbox_websocket_enabled=1` to use
+`GET /module/outbox/ws?api_key=...&device=...&wxid=...` for lower delivery
+latency. If that connection drops, the module falls back to the same HTTP
+polling and ACK endpoints.
 
-The outbox WebSocket loop runs on its own daemon worker. The main worker keeps
-registration, contact sync, and inbound message polling fallback alive while
-the outbox socket is connected.
+The outbox worker runs independently from registration, contact sync, and
+inbound message polling. HTTP polling is the recommended mode when the WeChat
+account may be switched while the process stays alive.
 
 The send hook is intentionally isolated in `HookEntry.sendText`. For WeChat
 Android `8.0.75`, it uses the lower-level send builder path:

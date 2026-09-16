@@ -27,6 +27,17 @@ public final class BridgeConfigTest {
         BridgeConfig config = BridgeConfig.fromProperties(new Properties());
 
         assertEquals(GatewayEndpoint.PRODUCTION_BASE_URL, config.baseUrl);
+        assertEquals(false, config.outboxWebSocketEnabled);
+    }
+
+    @Test
+    public void outboxWebSocketCanBeEnabledExplicitly() {
+        Properties properties = new Properties();
+        properties.setProperty("outbox_websocket_enabled", "1");
+
+        BridgeConfig config = BridgeConfig.fromProperties(properties);
+
+        assertEquals(true, config.outboxWebSocketEnabled);
     }
 
     @Test
