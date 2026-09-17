@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "generatedBy": "hand-written from the module bindings verified on device (888A, 2026-09-16)",
+  "wechat": {
+    "versionName": "8.0.74",
+    "versionCode": "3120"
+  },
+  "dexHash": null,
+  "capabilities": {
+    "bootstrap": "ok",
+    "identity": "ok",
+    "observation": "ok",
+    "send": "ok"
+  },
+  "identity": {
+    "idQueries": [
+      "SELECT value FROM userinfo WHERE id=2 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=42 LIMIT 1"
+    ],
+    "nicknameQueries": [
+      "SELECT value FROM userinfo WHERE id=4 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=5 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=6 LIMIT 1"
+    ]
+  },
+  "observation": {
+    "class": "com.tencent.wcdb.database.SQLiteDatabase",
+    "activeDatabasesField": "sActiveDatabases",
+    "insertMethod": "insertWithOnConflict"
+  },
+  "send": {
+    "preferred": "builder",
+    "paths": [
+      {
+        "id": "builder",
+        "factory": "w11.s1",
+        "builder": "w11.r1",
+        "queue": "w11.n1",
+        "collection": "c01.h7",
+        "typeResolver": "c01.e2",
+        "sessionFactory": "aq1.l",
+        "localIdField": "f459357f",
+        "enqueueAccessor": "w11.s1"
+      },
+      {
+        "id": "netscene",
+        "class": "w11.r0",
+        "ctor": "(Ljava/lang/String;Ljava/lang/String;IIJ)V",
+        "enqueue": "com.tencent.mm.modelbase.z2",
+        "queueElement": "com.tencent.mm.modelbase.m1",
+        "localIdField": "f459357f"
+      },
+      {
+        "id": "event",
+        "class": "com.tencent.mm.autogen.events.SendMsgEvent",
+        "payloadField": "f71992g",
+        "payloadWxid": "f7337a",
+        "payloadText": "f7338b",
+        "payloadType": "f7339c",
+        "payloadFlag": "f7340d",
+        "dispatch": "e"
+      },
+      {
+        "id": "sendmgr",
+        "accessor": "tg3.t1",
+        "accessorMethod": "a",
+        "impl": "dk5.s5",
+        "method": "(Ljava/lang/String;Ljava/lang/String;II)V"
+      }
+    ],
+    "bootstrap": {
+      "registry": "fs.g",
+      "registrySlot": "f283324a",
+      "registryApplication": "f283326c",
+      "registryEnum": "fs.k2",
+      "kernel": "i95.n0",
+      "kernelFlag": "f307062f",
+      "kernelArg": "i95.y",
+      "kernelService": "k95.a",
+      "provider": "com.tencent.mm.app.p0",
+      "providerField": "f70808d",
+      "appContext": "com.tencent.mm.sdk.platformtools.x2",
+      "appContextField": "f210311a"
+    }
+  },
+  "missing": []
+}

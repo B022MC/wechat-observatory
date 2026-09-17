@@ -21,3 +21,7 @@ web/device/*.tsbuildinfo
 android-module/.gradle/
 android-module/build/
 android-module/app/build/
+
+# python cache
+__pycache__/
+*.pyc
