@@ -482,7 +482,42 @@ public final class HookEntry implements IXposedHookLoadPackage {
         report.append(" send.mgr=").append(checkPath(classLoader,
                 new String[]{"tg3.t1", "rn3.u1"}));
         report.append(" bootstrap=").append(checkBootstrap(classLoader));
+        report.append(" gates=").append(readinessDetail(classLoader));
         log(report.toString());
+    }
+
+    /** Why isWeChatReadyForSend() would pass or fail: registry slot and kernel flag. */
+    private static String readinessDetail(ClassLoader classLoader) {
+        StringBuilder detail = new StringBuilder("registrySlot=");
+        try {
+            Field field = findFieldAny(resolveClass(classLoader,
+                    new String[]{"fs.g", "qs.g"}, "f283324a", "a"), "f283324a", "a");
+            Object value = field.get(null);
+            if (value != null && value.getClass().isArray()
+                    && java.lang.reflect.Array.getLength(value) > 0) {
+                detail.append(java.lang.reflect.Array.get(value, 0) != null);
+            } else {
+                detail.append("empty");
+            }
+        } catch (Throwable t) {
+            detail.append("err(").append(shortError(t)).append(")");
+        }
+        detail.append(" kernelFlag=");
+        try {
+            Field field = findFieldAny(resolveClass(classLoader, KERNEL_NAMES,
+                    "f307062f", "f"), "f307062f", "f");
+            Object value = field.get(null);
+            if (value instanceof boolean[] && ((boolean[]) value).length > 0) {
+                detail.append(((boolean[]) value)[0]);
+            } else if (value instanceof Boolean) {
+                detail.append(value);
+            } else {
+                detail.append("unknown");
+            }
+        } catch (Throwable t) {
+            detail.append("err(").append(shortError(t)).append(")");
+        }
+        return detail.toString();
     }
 
     private static String wechatVersion() {
@@ -537,14 +572,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
             WECHAT_CLASS_LOADER = classLoader;
             ensureWeChatRegistries(classLoader);
             if (!isStaticArraySlotReady(classLoader, new String[]{"fs.g", "qs.g"}, "f283324a", "a")) {
-                return readyState(false, "extension registry not initialized");
+                return readyState(false, "extension registry not initialized ["
+                        + readinessDetail(classLoader) + "]");
             }
             if (!isStaticBooleanFlag(classLoader, KERNEL_NAMES, "f307062f", "f")) {
-                return readyState(false, "service manager not initialized");
+                return readyState(false, "service manager not initialized ["
+                        + readinessDetail(classLoader) + "]");
             }
             return readyState(true, "ready");
         } catch (Throwable t) {
-            return readyState(false, "readiness check failed: " + shortError(t));
+            StackTraceElement[] trace = t.getStackTrace();
+            return readyState(false, "readiness check failed: " + t.getClass().getSimpleName()
+                    + ": " + shortError(t)
+                    + " at " + (trace.length > 0 ? trace[0] : "?")
+                    + " [" + readinessDetail(classLoader) + "]");
         }
     }
 
@@ -763,7 +804,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static boolean isStaticArraySlotReady(ClassLoader classLoader, String[] classNames, String... fieldNames) throws Exception {
-        Field field = findFieldAny(resolveClass(classLoader, classNames), fieldNames);
+        Field field = findFieldAny(resolveClass(classLoader, classNames, fieldNames), fieldNames);
         Object value = field.get(null);
         if (value == null || !value.getClass().isArray() || java.lang.reflect.Array.getLength(value) == 0) {
             return false;
@@ -772,7 +813,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static boolean isStaticBooleanFlag(ClassLoader classLoader, String[] classNames, String... fieldNames) throws Exception {
-        Field field = findFieldAny(resolveClass(classLoader, classNames), fieldNames);
+        Field field = findFieldAny(resolveClass(classLoader, classNames, fieldNames), fieldNames);
         Object value = field.get(null);
         if (value instanceof boolean[]) {
             boolean[] flags = (boolean[]) value;
