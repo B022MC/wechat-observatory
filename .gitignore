@@ -25,3 +25,8 @@ android-module/app/build/
 # python cache
 __pycache__/
 *.pyc
+
+# APKs pulled from the device by tools/wechat_hook_probe.py --from-device
+.wechat-apks/
+*.apk
+

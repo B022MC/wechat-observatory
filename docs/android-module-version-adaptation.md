@@ -140,46 +140,70 @@ L2 判据：向 `filehelper` 发一条探针文本 → 查本地 `message` 表�
 
 ### 3.4 发布闭环
 
-```
-微信发新版 → 灰度机升级 → L1 解析候选 → L2 canary 验证
-        → 上报 gateway（矩阵显示"候选可用"）→ 管理员转正 → profile 下发
-        → 其余设备升级即可用；期间老版本设备继续走 L0，不受影响
+## 4. 实际采用的流程：插 USB 直接适配（不做自动分发/灰度）
+
+结论：不做 gateway 下发 profile、不做 canary 灰度。微信更新时按下面四步人工适配，
+工具负责**把"改哪里"直接指出来**：
+
+```bash
+# 1) 手机插上 USB，直接拉当前微信包并诊断（退出码非 0 = 需要适配）
+python tools/wechat_hook_probe.py --from-device
+
+# 2) 与上一个能用的版本对比，列出丢掉的类和改名的成员
+python tools/wechat_hook_probe.py --from-device --compare wechat-8.0.74-base.apk
+
+# 3) 按报告改 HookEntry.java 里的类名/字段名，必要时更新 assets/profiles/
+
+# 4) 重新构建 + 安装，看 capability report 是否全 ok
+python tools/wechat_hook_probe.py --from-device --profile \
+       android-module/app/src/main/assets/profiles/wechat.json   # 需要时刷新 profile
 ```
 
-## 4. 兼容老版本的保证
+`--compare` 会输出三类信息：
+
+- **LOST**：上个版本有、新版本没有的类（需要重新定位）；
+- **成员变化**：类还在但方法/字段被改名或改签名（例如
+  `SendMsgEvent.g: Lam/mt; -> Lfm/xt;` 说明 payload 类被换包；
+  `fs.g` 从"带静态字段的类"变成 **enum**，所以 `f283324a` 必然不存在）；
+- **无差异**：这些 hook 点可以直接复用。
+
+## 5. 兼容老版本的保证
 
 1. 观测/身份/outbox 不依赖混淆名，保持单一实现、零分支；
-2. 发送收敛为 `SendAdapter.send(wxid, text, type) -> msgId`，各路径只差 binding，老路径不删除；
-3. profile 是数据，历史版本条目只追加；
-4. CI 回归：`tools/wechat_hook_probe.py <apk>` 对每个受支持版本断言 hook 点齐全（实测 20s/包），退出码非 0 即失败。
+2. 发送仍是"多路径依次尝试"，新版本加路径即可，老路径不删除；
+3. CI 回归：`tools/wechat_hook_probe.py <apk>` 对每个受支持版本断言
+   observation / identity / bootstrap 全绿（实测 20s/包），退出码非 0 即失败。
 
-## 5. 已知无法自动化的部分
+## 6. 已知无法自动化的部分
 
-`ensureWeChatRegistries`（唤醒微信内核单例：`fs.g#f283324a`、`i95.n0#f307062f`、
-`com.tencent.mm.app.p0#f70808d`）没有可靠的形状特征，自动推断有把微信搞崩的风险。策略：
+`ensureWeChatRegistries`（唤醒微信内核单例：`fs.g`、`i95.n0`、
+`com.tencent.mm.app.p0`）没有可靠的形状特征，自动推断有把微信搞崩的风险。
+`--compare` 只能告诉你它变了（8.0.78 里 `i95.n0`/`i95.y` 直接消失、`fs.g` 变成 enum），
+具体怎么改仍需人工判断。
 
-1. 优先选择**不需要内核引导**的路径（`SendMsgEvent` 走 autogen 事件总线，名字非混淆，优先押注）；
-2. 需要时按"静态单例访问器 + canary 验证"生成候选；
-3. 兜底：新版标记为"需人工适配"并在后台显式提示，而不是静默失效。
+## 7. 已实现
 
-## 6. 已实现（P1）
-
-### 6.1 `tools/wechat_hook_probe.py`
+### 7.1 `tools/wechat_hook_probe.py`
 
 ```bash
 # 检查某个微信包是否还包含模块需要的全部 hook 点（退出码非 0 = 有缺失）
 python tools/wechat_hook_probe.py weixin.apk
 
-# 生成 profile 骨架 + 结构候选
-python tools/wechat_hook_probe.py weixin.apk --json profile.json --shape-scan
+# 直接从 USB 设备拉当前微信包再检查
+python tools/wechat_hook_probe.py --from-device
+
+# 与上一个可用版本对比
+python tools/wechat_hook_probe.py weixin.apk --compare wechat-8.0.74-base.apk
+
+# 生成 profile + 结构候选
+python tools/wechat_hook_probe.py weixin.apk --profile out.json --shape-scan
 ```
 
-- hook 点清单里 **stable 项**（WCDB、modelbase、SendMsgEvent 等非混淆名）必须全绿；
-- **obfuscated 项**缺失即对应能力失效；
-- 会顺便从 `HookEntry.java` 提取字面量交叉验证，避免清单与代码漂移；
-- 依赖：仅标准库；有 `aapt2` 时读版本号，没有就从 manifest 的 UTF-16 字符串里取。
+判定规则：**observation / identity / bootstrap 是硬门槛**，任一不过退出码非 0；
+`send` 只作信息展示（列出还完整的路径）；混淆字段名一律按 advisory 处理，
+因为能正常工作的 8.0.74 里它们同样"缺失"（模块有短名回退）。
 
-### 6.2 模块启动自检
+### 7.2 模块启动自检
 
 `HookEntry.runWorker()` 启动时输出一行（每进程一次，行为不变）：
 
@@ -189,11 +213,17 @@ capability report: wechat=8.0.78/3180 observation=ok identity=ok
   send.event=ok send.mgr=missing(...) bootstrap=missing(NoSuchFieldException: f283324a)
 ```
 
-`send.*` 全 missing 就是"新版微信下只能收不能发"的指纹。
+`send.*` 全 missing，或 `bootstrap=missing(...)`，就是"新版微信下只能收不能发"的指纹。
 
-## 7. 后续（P2 / P3）
+### 7.3 版本档案（assets/profiles/）
 
-| 阶段 | 内容 |
-|---|---|
-| P2 | 抽出 profile 读取层；内置 `assets/profiles/`（8.0.74/75/76/78）；服务端下发 + 本地缓存。行为与现在完全一致，零回归 |
-| P3 | L1 结构定位 + L2 canary 自验证 + 映射缓存上报 + 后台矩阵页与一键转正 |
+`wechat.8.0.74.json`（手机导出包生成，可用）、`wechat.8.0.76.json`、
+`wechat.8.0.78.json`（后两者 bootstrap 不完整、不可用）。这些文件当前只是**记录**，
+模块仍在代码里解析 hook 点；后续如果要让模块直接读它们，再单独做读取层。
+
+## 8. 明确不做的部分
+
+- 不做 gateway 下发 profile、不做 canary 灰度、不做映射缓存共享；
+- 不做无障碍/企业微信等替代通道。
+
+版本适配按第 4 节的"插 USB 四步走"人工完成，工具负责定位差异。

@@ -174,6 +174,114 @@ def dex_digest(blobs: list[bytes]) -> str:
     return "sha256:" + digest.hexdigest()[:32]
 
 
+def adb(*args: str, timeout: int = 300) -> str:
+    exe = shutil.which("adb") or "adb"
+    proc = subprocess.run([exe, *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError("adb %s failed: %s" % (" ".join(args), (proc.stderr or proc.stdout).strip()))
+    return proc.stdout
+
+
+def pull_device_apk(package: str = "com.tencent.mm", dest_dir: Path | None = None) -> Path:
+    """Copy the installed APK off a USB-connected device.
+
+    WeChat's install path contains ``~~<hash>==`` segments, so the path is taken
+    verbatim from `pm path` rather than assembled by hand.
+    """
+    out = adb("shell", "pm", "path", package)
+    paths = [line.split(":", 1)[1].strip() for line in out.splitlines() if line.startswith("package:")]
+    base = next((p for p in paths if p.endswith("base.apk")), None)
+    if not base:
+        raise RuntimeError("no base.apk reported by pm path for %s" % package)
+    dest_dir = dest_dir or Path.cwd()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    local = dest_dir / ("%s-%s" % (package.replace(".", "-"), base.split("==")[-1].strip("/")))
+    local = local.with_suffix(".apk")
+    adb("pull", base, str(local))
+    return local
+
+
+def class_members(apk: Path, class_names: list[str]) -> dict[str, dict[str, list[str]]]:
+    """Declared methods/fields per class, for diffing two WeChat builds.
+
+    Needs androguard; used only by --compare.
+    """
+    try:
+        from loguru import logger
+        logger.remove()
+        from androguard.core.dex import DEX
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("--compare needs androguard (pip install androguard): %s" % exc)
+
+    wanted = set(class_names)
+    found: dict[str, dict[str, list[str]]] = {}
+    with zipfile.ZipFile(apk) as archive:
+        for name in [n for n in archive.namelist() if n.endswith(".dex")]:
+            dex = DEX(archive.read(name))
+            for cls in dex.get_classes():
+                internal = cls.get_name()
+                dotted = internal[1:-1].replace("/", ".") if internal.startswith("L") else internal
+                if dotted not in wanted:
+                    continue
+                entry = found.setdefault(dotted, {"methods": [], "fields": []})
+                for method in cls.get_methods():
+                    entry["methods"].append(method.get_name() + method.get_descriptor())
+                for field in cls.get_fields():
+                    entry["fields"].append(field.get_name() + ":" + str(field.get_descriptor()))
+    for entry in found.values():
+        entry["methods"] = sorted(set(entry["methods"]))
+        entry["fields"] = sorted(set(entry["fields"]))
+    return found
+
+
+def compare_versions(old_apk: Path, new_apk: Path, class_names: list[str]) -> dict:
+    old_present = {n: token_present(load_dex_blobs(old_apk), n) for n in class_names}
+    new_present = {n: token_present(load_dex_blobs(new_apk), n) for n in class_names}
+    lost = [n for n in class_names if old_present[n] and not new_present[n]]
+    kept = [n for n in class_names if old_present[n] and new_present[n]]
+    gained = [n for n in class_names if not old_present[n] and new_present[n]]
+    old_members = class_members(old_apk, kept)
+    new_members = class_members(new_apk, kept)
+    changed = {}
+    for name in kept:
+        before, after = old_members.get(name, {}), new_members.get(name, {})
+        diff = {
+            "methodsRemoved": sorted(set(before.get("methods", [])) - set(after.get("methods", []))),
+            "methodsAdded": sorted(set(after.get("methods", [])) - set(before.get("methods", []))),
+            "fieldsRemoved": sorted(set(before.get("fields", [])) - set(after.get("fields", []))),
+            "fieldsAdded": sorted(set(after.get("fields", [])) - set(before.get("fields", []))),
+        }
+        if any(diff.values()):
+            changed[name] = diff
+    return {"lost": lost, "kept": kept, "gained": gained, "changed": changed}
+
+
+def print_comparison(old_apk: Path, new_apk: Path, report: dict) -> None:
+    print("=" * 78)
+    print("compare: %s  ->  %s" % (old_apk.name, new_apk.name))
+    print("=" * 78)
+    if report["lost"]:
+        print("\n[类在新版本中消失 —— 需要重新定位]")
+        for name in report["lost"]:
+            print("  LOST  %s" % name)
+    if report["gained"]:
+        print("\n[新版本新增的候选类]")
+        for name in report["gained"]:
+            print("  NEW   %s" % name)
+    if report["changed"]:
+        print("\n[类还在，但成员变了 —— 方法/字段被改名]")
+        for name, diff in report["changed"].items():
+            print("  %s" % name)
+            for key in ("methodsRemoved", "methodsAdded", "fieldsRemoved", "fieldsAdded"):
+                values = diff.get(key) or []
+                if values:
+                    print("      %-15s %s" % (key, ", ".join(values[:8]) +
+                                              (" ..." if len(values) > 8 else "")))
+    if not report["lost"] and not report["changed"] and not report["gained"]:
+        print("\n无差异：这些 hook 点在新版本中完全一致。")
+
+
 def find_aapt2() -> str | None:
     """Locate aapt2 without requiring ANDROID_HOME; version info is optional."""
     found = shutil.which("aapt2")
@@ -442,7 +550,15 @@ def build_profile(result: dict) -> dict:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Probe a WeChat APK for module hook points")
-    parser.add_argument("apk", nargs="+", help="WeChat APK file(s)")
+    parser.add_argument("apk", nargs="*", help="WeChat APK file(s)")
+    parser.add_argument("--from-device", action="store_true",
+                        help="pull the installed WeChat APK off the USB device first")
+    parser.add_argument("--device-dir", default=".wechat-apks",
+                        help="where --from-device stores the pulled APK (default .wechat-apks)")
+    parser.add_argument("--compare", metavar="OLD_APK",
+                        help="diff hook classes against a previously working WeChat APK")
+    parser.add_argument("--compare-classes", nargs="*", default=None,
+                        help="classes to diff with --compare (default: the hook points)")
     parser.add_argument("--source", help="HookEntry.java used to cross-check literals")
     parser.add_argument("--json", help="write the raw probe result as JSON")
     parser.add_argument("--profile",
@@ -459,9 +575,21 @@ def main(argv: list[str]) -> int:
         if candidate.exists():
             source = candidate
 
+    apk_args = list(args.apk)
+    if args.from_device:
+        try:
+            pulled = pull_device_apk(dest_dir=Path(args.device_dir))
+            print("pulled %s\n" % pulled)
+            apk_args.append(str(pulled))
+        except Exception as exc:
+            print("device pull failed: %s" % exc, file=sys.stderr)
+            return 1
+    if not apk_args:
+        parser.error("no APK given (pass a path or use --from-device)")
+
     results = []
     failed = False
-    for apk in args.apk:
+    for apk in apk_args:
         path = Path(apk)
         if not path.exists():
             print("no such file: %s" % path, file=sys.stderr)
@@ -476,6 +604,14 @@ def main(argv: list[str]) -> int:
         if verdict["observation"] != "ok" or verdict["identity"] != "ok" \
                 or verdict["bootstrap"] != "ok":
             failed = True
+
+    if args.compare and results:
+        hook_classes = args.compare_classes
+        if not hook_classes:
+            hook_classes = sorted({row["token"] for row in results[0]["hooks"]
+                                   if row["kind"] == "class" and "." in row["token"]})
+        report = compare_versions(Path(args.compare), Path(results[0]["apk"]), hook_classes)
+        print_comparison(Path(args.compare), Path(results[0]["apk"]), report)
 
     if args.json:
         payload = results[0] if len(results) == 1 else results
