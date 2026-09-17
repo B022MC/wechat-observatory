@@ -2851,10 +2851,29 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 + (last == null ? "" : " (" + shortError(last) + ")"));
     }
 
-    /** First enum constant of a class that may live under several names. */
+    /**
+     * First enum constant of a class that may live under several names.
+     *
+     * <p>A name can be reused by an unrelated, non-enum class on a newer WeChat
+     * build (com.tencent.mm.app.q0 is one), so candidates that are not enums are
+     * skipped instead of selected.
+     */
     private static Object enumConstantAny(ClassLoader classLoader, String[] names, String preferred) throws Exception {
-        Class<?> enumClass = resolveClass(classLoader, names);
-        return enumConstant(enumClass, preferred);
+        Throwable last = null;
+        for (String name : names) {
+            try {
+                Class<?> cls = findClass(classLoader, name);
+                Object[] constants = cls.getEnumConstants();
+                if (constants == null || constants.length == 0) {
+                    continue;
+                }
+                return enumConstant(cls, preferred);
+            } catch (Throwable t) {
+                last = t;
+            }
+        }
+        throw new ClassNotFoundException("no enum among " + joinNames(names)
+                + (last == null ? "" : " (" + shortError(last) + ")"));
     }
 
     private static Object enumConstant(Class<?> enumClass, String name) throws Exception {
