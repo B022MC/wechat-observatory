@@ -1,17 +1,35 @@
 {
   "schema": 1,
-  "generatedBy": "hand-written from the module bindings verified on device (888A, 2026-09-16)",
+  "generatedBy": "tools/wechat_hook_probe.py",
   "wechat": {
     "versionName": "8.0.74",
     "versionCode": "3120"
   },
-  "dexHash": null,
+  "dexHash": "sha256:2449f21fa073f05f63c2bac2412f6a1f",
   "capabilities": {
-    "bootstrap": "ok",
-    "identity": "ok",
     "observation": "ok",
-    "send": "ok"
+    "identity": "ok",
+    "send": "paths:builder,netscene,event,sendmgr",
+    "bootstrap": "ok"
   },
+  "completePaths": [
+    "builder",
+    "netscene",
+    "event",
+    "sendmgr"
+  ],
+  "advisoryMissing": [
+    "f283324a",
+    "f70808d",
+    "f307062f",
+    "f210311a",
+    "f459357f",
+    "f71992g",
+    "f7337a",
+    "f7338b",
+    "f7339c",
+    "f7340d"
+  ],
   "identity": {
     "idQueries": [
       "SELECT value FROM userinfo WHERE id=2 LIMIT 1",
@@ -29,18 +47,16 @@
     "insertMethod": "insertWithOnConflict"
   },
   "send": {
-    "preferred": "builder",
+    "preferred": "sendmgr",
     "paths": [
       {
         "id": "builder",
         "factory": "w11.s1",
         "builder": "w11.r1",
         "queue": "w11.n1",
-        "collection": "c01.h7",
-        "typeResolver": "c01.e2",
-        "sessionFactory": "aq1.l",
-        "localIdField": "f459357f",
-        "enqueueAccessor": "w11.s1"
+        "unresolved": [
+          "localIdField"
+        ]
       },
       {
         "id": "netscene",
@@ -48,40 +64,50 @@
         "ctor": "(Ljava/lang/String;Ljava/lang/String;IIJ)V",
         "enqueue": "com.tencent.mm.modelbase.z2",
         "queueElement": "com.tencent.mm.modelbase.m1",
-        "localIdField": "f459357f"
+        "unresolved": [
+          "localIdField"
+        ]
       },
       {
         "id": "event",
         "class": "com.tencent.mm.autogen.events.SendMsgEvent",
-        "payloadField": "f71992g",
-        "payloadWxid": "f7337a",
-        "payloadText": "f7338b",
-        "payloadType": "f7339c",
-        "payloadFlag": "f7340d",
-        "dispatch": "e"
+        "unresolved": [
+          "payloadField",
+          "payloadWxid",
+          "payloadText",
+          "payloadType",
+          "payloadFlag"
+        ]
       },
       {
         "id": "sendmgr",
         "accessor": "tg3.t1",
-        "accessorMethod": "a",
         "impl": "dk5.s5",
         "method": "(Ljava/lang/String;Ljava/lang/String;II)V"
       }
     ],
     "bootstrap": {
       "registry": "fs.g",
-      "registrySlot": "f283324a",
-      "registryApplication": "f283326c",
-      "registryEnum": "fs.k2",
+      "registrySlot": null,
       "kernel": "i95.n0",
-      "kernelFlag": "f307062f",
-      "kernelArg": "i95.y",
-      "kernelService": "k95.a",
+      "kernelFlag": null,
       "provider": "com.tencent.mm.app.p0",
-      "providerField": "f70808d",
-      "appContext": "com.tencent.mm.sdk.platformtools.x2",
-      "appContextField": "f210311a"
+      "providerField": null
     }
   },
-  "missing": []
+  "missing": [
+    "f210311a",
+    "f283324a",
+    "f283325b",
+    "f283326c",
+    "f307062f",
+    "f459357f",
+    "f459386a",
+    "f70808d",
+    "f71992g",
+    "f7337a",
+    "f7338b",
+    "f7339c",
+    "f7340d"
+  ]
 }

@@ -12,13 +12,27 @@
 - 版本一换，发送链路静默失效（观测还能用，回复发不出去）；
 - 现有代码在 `findClass` 失败时静默 fallback，线上只能靠 adb 抓 logcat 排查。
 
-实测（`tools/wechat_hook_probe.py`）：
+实测（`tools/wechat_hook_probe.py`，8.0.74 用的是从手机导出的官方包）：
 
-| 微信版本 | versionCode | observation | identity | send | bootstrap |
-|---|---|---|---|---|---|
-| 8.0.74 | 3120 | ok | ok | ok（现网验证） | ok |
-| 8.0.76 | 3141 | ok | ok | **missing 14/18** | **missing 6/11** |
-| 8.0.78 | 3180 | ok | ok | **missing 15/18** | **missing 6/11** |
+| 微信版本 | versionCode | observation | identity | 可用发送路径 | bootstrap | 结论 |
+|---|---|---|---|---|---|---|
+| 8.0.74 | 3120 | ok | ok | builder, netscene, event, sendmgr | **ok** | 可用（真机验证） |
+| 8.0.76 | 3141 | ok | ok | event | **incomplete: i95.n0, i95.y** | 不可用 |
+| 8.0.78 | 3180 | ok | ok | event | **incomplete: i95.n0, i95.y** | 不可用 |
+
+判定规则（已与真机行为交叉验证）：
+
+1. `observation` / `identity` 用非混淆名，缺失即致命；
+2. **`bootstrap` 是真正的门控**：`HookEntry.isWeChatReadyForSend()` 必须先解析
+   `fs.g` 注册表槽位与 `i95.n0` 内核标志，否则直接跳过 outbox 投递，表现就是
+   "能收不能发"。8.0.76 / 8.0.78 正好缺 `i95.n0`、`i95.y`；
+3. 混淆**字段名不能作为判据**：8.0.74（正常工作的版本）里这些字段名同样"缺失"，
+   因为模块本身有短名回退（`findFieldAny(..., "f283324a", "a")`）。工具把它们
+   列为 advisory，仅作提示。
+
+设备侧交叉验证：8.0.74 真机 capability 报告为
+`observation=ok send.builder=ok send.netscene=ok send.event=ok send.mgr=ok bootstrap=ok`，
+与探针结论一致。
 
 另外 8.0.78 里连调用**形状**都变了：旧签名
 `(Ljava/lang/String;Ljava/lang/String;IIJ)V` 与 `(Ljava/lang/String;Ljava/lang/String;II)V`

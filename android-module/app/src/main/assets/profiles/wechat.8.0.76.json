@@ -7,11 +7,26 @@
   },
   "dexHash": "sha256:8b9355615a2654e412447c8fee73c1e2",
   "capabilities": {
-    "bootstrap": "missing:6/11",
-    "identity": "ok",
     "observation": "ok",
-    "send": "missing:14/18"
+    "identity": "ok",
+    "send": "paths:event",
+    "bootstrap": "incomplete(i95.n0,i95.y)"
   },
+  "completePaths": [
+    "event"
+  ],
+  "advisoryMissing": [
+    "f283324a",
+    "f70808d",
+    "f307062f",
+    "f210311a",
+    "f459357f",
+    "f71992g",
+    "f7337a",
+    "f7338b",
+    "f7339c",
+    "f7340d"
+  ],
   "identity": {
     "idQueries": [
       "SELECT value FROM userinfo WHERE id=2 LIMIT 1",
