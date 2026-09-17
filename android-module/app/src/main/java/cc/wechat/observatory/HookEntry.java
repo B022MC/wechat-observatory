@@ -2,6 +2,7 @@ package cc.wechat.observatory;
 
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.pm.PackageInfo;
 import android.app.Application;
 import android.os.Handler;
 import android.os.Looper;
@@ -79,6 +80,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_MESSAGE_ID = 0L;
     private static volatile boolean MESSAGE_WATERMARK_READY = false;
     private static volatile boolean STALE_MESSAGE_REPLAY_LIMIT_LOGGED = false;
+    private static volatile boolean CAPABILITY_REPORTED = false;
     private static volatile long LAST_WEBSOCKET_FAIL_LOG_AT = 0L;
     private static volatile String CURRENT_WXID = "";
     private static volatile String CURRENT_NICKNAME = "";
@@ -358,6 +360,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         while (true) {
             BridgeConfig config = BridgeConfig.load(bridgeContext());
             try {
+                reportCapabilities(classLoader);
                 if (config.enabled && !isBlank(config.baseUrl) && !isBlank(config.apiKey)) {
                     if (!bindRuntimeIdentity(config)) {
                         if (!sleepOnce(Math.max(3000L, config.pollIntervalMs))) {
@@ -446,6 +449,77 @@ public final class HookEntry implements IXposedHookLoadPackage {
         } catch (InterruptedException ignored) {
             Thread.currentThread().interrupt();
             return false;
+        }
+    }
+
+    /**
+     * One-shot startup probe of every WeChat hook point this module depends on.
+     *
+     * <p>WeChat re-obfuscates its internal class and field names on every
+     * release, so a build that used to work can silently lose the send path.
+     * This logs a single line that makes the loss visible in logcat (and in any
+     * shipped log) without changing module behaviour.
+     */
+    private static void reportCapabilities(ClassLoader classLoader) {
+        if (CAPABILITY_REPORTED) {
+            return;
+        }
+        CAPABILITY_REPORTED = true;
+        StringBuilder report = new StringBuilder("capability report: wechat=");
+        report.append(wechatVersion());
+        report.append(" observation=").append(checkObservation(classLoader));
+        report.append(" identity=").append(isBlank(CURRENT_WXID) ? "pending" : "ok");
+        report.append(" send.builder=").append(checkClasses(classLoader, "w11.s1", "w11.r1"));
+        report.append(" send.netscene=").append(checkClasses(classLoader,
+                "w11.r0", "com.tencent.mm.modelbase.z2", "com.tencent.mm.modelbase.m1"));
+        report.append(" send.event=").append(checkClasses(classLoader,
+                "com.tencent.mm.autogen.events.SendMsgEvent"));
+        report.append(" send.mgr=").append(checkClasses(classLoader, "tg3.t1", "dk5.s5"));
+        report.append(" bootstrap=").append(checkBootstrap(classLoader));
+        log(report.toString());
+    }
+
+    private static String wechatVersion() {
+        try {
+            Context context = bridgeContext();
+            if (context == null) {
+                return "unknown";
+            }
+            PackageInfo info = context.getPackageManager().getPackageInfo("com.tencent.mm", 0);
+            return info.versionName + "/" + info.versionCode;
+        } catch (Throwable t) {
+            return "unknown";
+        }
+    }
+
+    private static String checkObservation(ClassLoader classLoader) {
+        try {
+            findField(findClass(classLoader, "com.tencent.wcdb.database.SQLiteDatabase"),
+                    "sActiveDatabases");
+            return "ok";
+        } catch (Throwable t) {
+            return "missing(" + shortError(t) + ")";
+        }
+    }
+
+    private static String checkClasses(ClassLoader classLoader, String... classNames) {
+        try {
+            for (String className : classNames) {
+                findClass(classLoader, className);
+            }
+            return "ok";
+        } catch (Throwable t) {
+            return "missing(" + shortError(t) + ")";
+        }
+    }
+
+    private static String checkBootstrap(ClassLoader classLoader) {
+        try {
+            findFieldAny(findClass(classLoader, "fs.g"), "f283324a", "a");
+            findFieldAny(findClass(classLoader, "i95.n0"), "f307062f", "f");
+            return "ok";
+        } catch (Throwable t) {
+            return "missing(" + shortError(t) + ")";
         }
     }
 
