@@ -880,6 +880,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
         String wxid = "";
         String nickname = "";
+        String rawId2 = "";
+        String rawId42 = "";
         String[][] candidates = new String[][]{
                 {"SELECT value FROM userinfo WHERE id=2 LIMIT 1", ""},
                 {"SELECT value FROM userinfo WHERE id=42 LIMIT 1", ""},
@@ -898,12 +900,65 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 }
                 continue;
             }
+            if (candidate[0].contains("id=2")) {
+                rawId2 = value;
+            } else {
+                rawId42 = value;
+            }
             if (looksLikeAccountId(value)) {
                 wxid = value;
                 break;
             }
         }
+        if (isBlank(wxid)) {
+            // Last resort: the account directory under MicroMsg/ is named after a
+            // stable per-account hash, so it identifies the login even when WeChat
+            // stores no usable value in userinfo.
+            wxid = accountDirectoryIdentity(db);
+        }
+        if (isBlank(wxid)) {
+            log("identity candidates unusable: userinfo.id2=" + abbreviate(rawId2)
+                    + " id42=" + abbreviate(rawId42) + " nickname=" + abbreviate(nickname));
+        }
         return new WeChatIdentity(wxid, nickname);
+    }
+
+    private static String abbreviate(String value) {
+        if (isBlank(value)) {
+            return "<empty>";
+        }
+        String trimmed = value.trim();
+        return trimmed.length() <= 24 ? trimmed : trimmed.substring(0, 24) + "...";
+    }
+
+    /**
+     * Derive a stable login identity from the account database path
+     * (/data/user/0/com.tencent.mm/MicroMsg/&lt;hash&gt;/EnMicroMsg.db).
+     */
+    private static String accountDirectoryIdentity(Object db) {
+        try {
+            String path = databasePath(db);
+            int slash = path == null ? -1 : path.lastIndexOf('/');
+            if (slash <= 0) {
+                return "";
+            }
+            String dir = path.substring(0, slash);
+            int parent = dir.lastIndexOf('/');
+            String hash = parent >= 0 ? dir.substring(parent + 1) : dir;
+            if (hash.length() < 8) {
+                return "";
+            }
+            for (int i = 0; i < hash.length(); i++) {
+                char c = hash.charAt(i);
+                boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (!hex) {
+                    return "";
+                }
+            }
+            return "acct_" + hash.toLowerCase(Locale.US);
+        } catch (Throwable t) {
+            return "";
+        }
     }
 
     private static String readSingleString(Object db, String sql) {
@@ -1751,16 +1806,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return false;
         }
         String normalized = value.trim();
-        if (normalized.length() < 3 || normalized.length() > 64) {
+        if (normalized.length() < 2 || normalized.length() > 64) {
             return false;
         }
+        // WeChat stores the login identity as a wxid, a WeChat ID (alias) or, on
+        // some accounts, the account's own display value. Anything printable
+        // without whitespace is accepted here: refusing it would block device
+        // registration entirely, which is worse than an unusual owner id. The
+        // stricter looksLikeWxid() check still guards chatroom sender parsing.
         for (int i = 0; i < normalized.length(); i++) {
             char c = normalized.charAt(i);
-            boolean allowed = (c >= 'a' && c <= 'z')
-                    || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9')
-                    || c == '_' || c == '-' || c == '.';
-            if (!allowed) {
+            if (Character.isWhitespace(c) || Character.isISOControl(c)) {
                 return false;
             }
         }
