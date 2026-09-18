@@ -37,6 +37,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
 
@@ -1993,6 +1994,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
             Object identityDatabase = null;
             Object contactDatabase = null;
+            // Do NOT switch on the first database with a foreign identity: when two
+            // WeChat accounts are visible at once (account switch, or a second
+            // WeChat instance on the same phone) that turns into a switch storm,
+            // because each scan picks the other account and re-registers forever.
+            Map<String, Object> otherIdentities = new LinkedHashMap<String, Object>();
             for (Object db : databases) {
                 if (db == null) {
                     continue;
@@ -2000,14 +2006,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 try {
                     WeChatIdentity identity = readWeChatIdentity(db);
                     if (!isBlank(identity.wxid)) {
-                        if (!isBlank(CURRENT_WXID) && !CURRENT_WXID.equals(identity.wxid)) {
-                            LAST_DATABASE = db;
-                            log("selected switched WeChat identity wxid=" + identity.wxid
-                                    + " path=" + databasePath(db));
-                            return db;
-                        }
-                        if (identityDatabase == null) {
-                            identityDatabase = db;
+                        if (isBlank(CURRENT_WXID) || CURRENT_WXID.equals(identity.wxid)) {
+                            if (identityDatabase == null) {
+                                identityDatabase = db;
+                            }
+                        } else if (!otherIdentities.containsKey(identity.wxid)) {
+                            otherIdentities.put(identity.wxid, db);
                         }
                     }
                     JSONArray contacts = readContacts(db, config);
@@ -2033,6 +2037,28 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (identityDatabase != null) {
                 LAST_DATABASE = identityDatabase;
                 return identityDatabase;
+            }
+            if (otherIdentities.size() == 1) {
+                Object switched = otherIdentities.values().iterator().next();
+                LAST_DATABASE = switched;
+                log("selected switched WeChat identity wxid="
+                        + otherIdentities.keySet().iterator().next()
+                        + " path=" + databasePath(switched));
+                return switched;
+            }
+            if (otherIdentities.size() > 1) {
+                // Ambiguous set: stay on the account we already bound to when it is
+                // still visible, otherwise take the first one deterministically.
+                for (Object db : otherIdentities.values()) {
+                    if (db == LAST_DATABASE) {
+                        return LAST_DATABASE;
+                    }
+                }
+                Object chosen = otherIdentities.values().iterator().next();
+                LAST_DATABASE = chosen;
+                log("multiple WeChat accounts visible (" + otherIdentities.size()
+                        + "); keeping path=" + databasePath(chosen));
+                return chosen;
             }
             if (contactDatabase != null) {
                 LAST_DATABASE = contactDatabase;
