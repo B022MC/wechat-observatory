@@ -2,6 +2,7 @@ package cc.wechat.observatory;
 
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.app.Application;
 import android.os.Handler;
@@ -91,6 +92,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_REGISTER_SUCCESS_AT = 0L;
     private static volatile Context APP_CONTEXT;
     private static volatile ClassLoader WECHAT_CLASS_LOADER;
+    // One WeChat login must always report the same owner id for both contacts and
+    // messages. The account database scan can see several MicroMsg/<hash>/
+    // EnMicroMsg.db at once (account switch, second WeChat instance, stale dirs),
+    // and picking a different one after a restart splits one login across several
+    // owner ids - the console then cannot join messages to contacts and renders
+    // every chat as "未收录". The choice is remembered per api_key.
+    private static final String STATE_PREFS = "wechat_observatory_state";
+    private static final int EMPTY_CONTACT_SYNC_RESCAN_AFTER = 2;
+    private static volatile int EMPTY_CONTACT_SYNC_STREAK = 0;
     private static final int SEND_QUEUE_MAX_ATTEMPTS = 5;
     private static final long SEND_QUEUE_RETRY_DELAY_MS = 500L;
     private static final int SEND_STATUS_MAX_CHECKS = 10;
@@ -720,6 +730,49 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return app instanceof Context ? (Context) app : null;
     }
 
+    private static SharedPreferences identityState() {
+        try {
+            Context context = bridgeContext();
+            return context == null
+                    ? null
+                    : context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String storedIdentity(String apiKey) {
+        if (isBlank(apiKey)) {
+            return "";
+        }
+        try {
+            SharedPreferences prefs = identityState();
+            if (prefs == null) {
+                return "";
+            }
+            String value = prefs.getString("identity_" + apiKey, "");
+            return value == null ? "" : value.trim();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static void storeIdentity(String apiKey, String identity) {
+        if (isBlank(apiKey) || isBlank(identity)) {
+            return;
+        }
+        try {
+            SharedPreferences prefs = identityState();
+            if (prefs == null || identity.equals(prefs.getString("identity_" + apiKey, ""))) {
+                return;
+            }
+            prefs.edit().putString("identity_" + apiKey, identity).commit();
+            log("identity pinned identity=" + identity);
+        } catch (Throwable t) {
+            log("identity pin failed: " + shortError(t));
+        }
+    }
+
     private static ClassLoader runtimeClassLoader(ClassLoader fallback) {
         List<ClassLoader> candidates = new ArrayList<>();
         addClassLoader(candidates, Thread.currentThread().getContextClassLoader());
@@ -866,7 +919,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
             REGISTERED_KEY = "";
             REGISTERED_DEVICE = "";
             LAST_REGISTER_SUCCESS_AT = 0L;
-            log("wechat identity changed wxid=" + wxid);
+            // Contacts already uploaded under the previous identity would never be
+            // matched by the console again: re-upload them under the new owner now.
+            LAST_CONTACT_SYNC_AT = 0L;
+            log("wechat identity changed wxid=" + wxid + "; re-uploading contact snapshot");
         }
         CURRENT_WXID = wxid;
         CURRENT_NICKNAME = nickname;
@@ -911,17 +967,19 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 break;
             }
         }
+        boolean fromDirectory = false;
         if (isBlank(wxid)) {
             // Last resort: the account directory under MicroMsg/ is named after a
             // stable per-account hash, so it identifies the login even when WeChat
             // stores no usable value in userinfo.
             wxid = accountDirectoryIdentity(db);
+            fromDirectory = !isBlank(wxid);
         }
         if (isBlank(wxid)) {
             log("identity candidates unusable: userinfo.id2=" + abbreviate(rawId2)
                     + " id42=" + abbreviate(rawId42) + " nickname=" + abbreviate(nickname));
         }
-        return new WeChatIdentity(wxid, nickname);
+        return new WeChatIdentity(wxid, nickname, fromDirectory);
     }
 
     private static String abbreviate(String value) {
@@ -1003,10 +1061,32 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final class WeChatIdentity {
         final String wxid;
         final String nickname;
+        /** True when wxid is only the account directory hash, not a value WeChat stores. */
+        final boolean fromDirectory;
 
         WeChatIdentity(String wxid, String nickname) {
+            this(wxid, nickname, false);
+        }
+
+        WeChatIdentity(String wxid, String nickname, boolean fromDirectory) {
             this.wxid = wxid == null ? "" : wxid.trim();
             this.nickname = nickname == null ? "" : nickname.trim();
+            this.fromDirectory = fromDirectory;
+        }
+    }
+
+    /** One account database seen during the active-database scan. */
+    private static final class DatabaseCandidate {
+        final Object db;
+        final String wxid;
+        final boolean fromDirectory;
+        final int contactCount;
+
+        DatabaseCandidate(Object db, String wxid, boolean fromDirectory, int contactCount) {
+            this.db = db;
+            this.wxid = wxid == null ? "" : wxid;
+            this.fromDirectory = fromDirectory;
+            this.contactCount = contactCount;
         }
     }
 
@@ -1090,9 +1170,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
         try {
             JSONArray contacts = readContacts(db, config);
             if (contacts.length() == 0) {
-                log("contact sync skipped: no friend contacts read");
+                EMPTY_CONTACT_SYNC_STREAK++;
+                log("contact sync skipped: no friend contacts read (streak="
+                        + EMPTY_CONTACT_SYNC_STREAK + " path=" + databasePath(db) + ")");
+                if (EMPTY_CONTACT_SYNC_STREAK >= EMPTY_CONTACT_SYNC_RESCAN_AFTER) {
+                    EMPTY_CONTACT_SYNC_STREAK = 0;
+                    LAST_DATABASE = null;
+                    log("dropping cached WeChat database: contacts unreadable, rescanning active set");
+                }
                 return;
             }
+            EMPTY_CONTACT_SYNC_STREAK = 0;
             JSONObject body = new JSONObject();
             body.put("api_key", config.apiKey);
             body.put("device", config.device);
@@ -1100,6 +1188,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             body.put("complete", true);
             body.put("contacts", contacts);
             postJson(config, "/module/contacts/snapshot", body.toString());
+            storeIdentity(config.apiKey, config.selfWxid);
             log("contact sync uploaded count=" + contacts.length()
                     + " includeChatrooms=" + config.includeChatrooms);
         } catch (Throwable t) {
@@ -1992,40 +2081,27 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (verboseScanLog) {
                 log("contact database scan active db count=" + databases.length);
             }
-            Object identityDatabase = null;
-            Object contactDatabase = null;
-            // Do NOT switch on the first database with a foreign identity: when two
-            // WeChat accounts are visible at once (account switch, or a second
-            // WeChat instance on the same phone) that turns into a switch storm,
-            // because each scan picks the other account and re-registers forever.
-            Map<String, Object> otherIdentities = new LinkedHashMap<String, Object>();
+            Object previousDatabase = LAST_DATABASE;
+            List<DatabaseCandidate> candidates = new ArrayList<DatabaseCandidate>();
+            // A database with an identity but no readable contacts is useless: the
+            // contact snapshot would stay empty forever while messages keep arriving
+            // under that identity, which is exactly how a device ends up with
+            // messages but no contacts in the console.
             for (Object db : databases) {
                 if (db == null) {
                     continue;
                 }
                 try {
                     WeChatIdentity identity = readWeChatIdentity(db);
-                    if (!isBlank(identity.wxid)) {
-                        if (isBlank(CURRENT_WXID) || CURRENT_WXID.equals(identity.wxid)) {
-                            if (identityDatabase == null) {
-                                identityDatabase = db;
-                            }
-                        } else if (!otherIdentities.containsKey(identity.wxid)) {
-                            otherIdentities.put(identity.wxid, db);
-                        }
-                    }
                     JSONArray contacts = readContacts(db, config);
-                    if (contacts.length() > 0) {
-                        if (contactDatabase == null) {
-                            contactDatabase = db;
-                            if (verboseScanLog) {
-                                log("found contact database candidate path=" + databasePath(db)
-                                        + " contacts=" + contacts.length());
-                            }
-                        }
-                    }
+                    int contactCount = contacts.length();
+                    candidates.add(new DatabaseCandidate(
+                            db, identity.wxid, identity.fromDirectory, contactCount));
                     if (verboseScanLog) {
-                        log("contact database candidate empty path=" + databasePath(db));
+                        log("contact database candidate path=" + databasePath(db)
+                                + " contacts=" + contactCount
+                                + " identity=" + (isBlank(identity.wxid) ? "<none>" : identity.wxid)
+                                + (identity.fromDirectory ? " (directory hash)" : ""));
                     }
                 } catch (Throwable ignored) {
                     if (verboseScanLog) {
@@ -2034,39 +2110,97 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     }
                 }
             }
-            if (identityDatabase != null) {
-                LAST_DATABASE = identityDatabase;
-                return identityDatabase;
-            }
-            if (otherIdentities.size() == 1) {
-                Object switched = otherIdentities.values().iterator().next();
-                LAST_DATABASE = switched;
-                log("selected switched WeChat identity wxid="
-                        + otherIdentities.keySet().iterator().next()
-                        + " path=" + databasePath(switched));
-                return switched;
-            }
-            if (otherIdentities.size() > 1) {
-                // Ambiguous set: stay on the account we already bound to when it is
-                // still visible, otherwise take the first one deterministically.
-                for (Object db : otherIdentities.values()) {
-                    if (db == LAST_DATABASE) {
-                        return LAST_DATABASE;
-                    }
+            DatabaseCandidate chosen = pickDatabase(
+                    candidates, CURRENT_WXID, storedIdentity(config.apiKey));
+            if (chosen != null) {
+                LAST_DATABASE = chosen.db;
+                String pinned = storedIdentity(config.apiKey);
+                if (chosen.db != previousDatabase || !chosen.wxid.equals(config.selfWxid)) {
+                    log("selected WeChat database path=" + databasePath(chosen.db)
+                            + " identity=" + (isBlank(chosen.wxid) ? "<none>" : chosen.wxid)
+                            + (chosen.fromDirectory ? " (directory hash)" : "")
+                            + " contacts=" + chosen.contactCount);
                 }
-                Object chosen = otherIdentities.values().iterator().next();
-                LAST_DATABASE = chosen;
-                log("multiple WeChat accounts visible (" + otherIdentities.size()
-                        + "); keeping path=" + databasePath(chosen));
-                return chosen;
-            }
-            if (contactDatabase != null) {
-                LAST_DATABASE = contactDatabase;
-                log("captured WeChat database from active set path=" + databasePath(contactDatabase));
-                return contactDatabase;
+                if (!isBlank(pinned) && !pinned.equals(chosen.wxid)
+                        && chosen.contactCount > 0) {
+                    log("identity drift pinned=" + pinned + " selected=" + chosen.wxid
+                            + " path=" + databasePath(chosen.db));
+                }
+                return chosen.db;
             }
         } catch (Throwable t) {
             log("contact database scan failed: " + shortError(t));
+        }
+        return null;
+    }
+
+    /**
+     * Prefer the account this device is already bound to, and never pick a
+     * database that cannot read contacts while a contact-capable one exists.
+     */
+    private static DatabaseCandidate pickDatabase(
+            List<DatabaseCandidate> candidates, String boundIdentity, String pinnedIdentity) {
+        if (candidates == null || candidates.isEmpty()) {
+            return null;
+        }
+        DatabaseCandidate bestContacts = null;
+        DatabaseCandidate bestNeutralContacts = null;
+        for (DatabaseCandidate candidate : candidates) {
+            if (candidate.contactCount <= 0) {
+                continue;
+            }
+            if (bestContacts == null || candidate.contactCount > bestContacts.contactCount) {
+                bestContacts = candidate;
+            }
+            boolean neutral = !candidate.fromDirectory && !isBlank(candidate.wxid);
+            if (neutral && (bestNeutralContacts == null
+                    || candidate.contactCount > bestNeutralContacts.contactCount)) {
+                bestNeutralContacts = candidate;
+            }
+        }
+        DatabaseCandidate byContacts = bestNeutralContacts != null ? bestNeutralContacts : bestContacts;
+        DatabaseCandidate matchPinned = findByIdentity(candidates, pinnedIdentity, true);
+        DatabaseCandidate matchBound = findByIdentity(candidates, boundIdentity, true);
+        if (matchPinned != null) {
+            return matchPinned;
+        }
+        if (matchBound != null) {
+            return matchBound;
+        }
+        if (byContacts != null) {
+            return byContacts;
+        }
+        matchPinned = findByIdentity(candidates, pinnedIdentity, false);
+        if (matchPinned != null) {
+            return matchPinned;
+        }
+        matchBound = findByIdentity(candidates, boundIdentity, false);
+        if (matchBound != null) {
+            return matchBound;
+        }
+        // No contact-capable database and no known identity: stay with a database
+        // that at least exposes a real (non directory-hash) identity.
+        for (DatabaseCandidate candidate : candidates) {
+            if (!candidate.fromDirectory && !isBlank(candidate.wxid)) {
+                return candidate;
+            }
+        }
+        return candidates.get(0);
+    }
+
+    private static DatabaseCandidate findByIdentity(
+            List<DatabaseCandidate> candidates, String identity, boolean requireContacts) {
+        if (isBlank(identity)) {
+            return null;
+        }
+        for (DatabaseCandidate candidate : candidates) {
+            if (!identity.equals(candidate.wxid)) {
+                continue;
+            }
+            if (requireContacts && candidate.contactCount <= 0) {
+                continue;
+            }
+            return candidate;
         }
         return null;
     }

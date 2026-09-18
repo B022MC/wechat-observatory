@@ -226,4 +226,75 @@ capability report: wechat=8.0.78/3180 observation=ok identity=ok
 - 不做 gateway 下发 profile、不做 canary 灰度、不做映射缓存共享；
 - 不做无障碍/企业微信等替代通道。
 
-版本适配按第 4 节的"插 USB 四步走"人工完成，工具负责定位差异。
+版本适配按第 4 节的"插 USB 四步走"人工完成，工具负责定位差别。
+
+## 9. 控制台"全是未收录"的根因与处置（0.1.6）
+
+### 症状与判据
+
+微信看台（`/device` PWA）里某个设备的会话全部显示 **未收录好友 / 未收录群聊**。
+
+`device-assets/index-*.js` 的渲染逻辑是：
+
+```js
+As(target, contact) = contact ? 昵称 : (target.endsWith("@chatroom") ? "未收录群聊" : "未收录好友")
+```
+
+而取数与联系人都是按 owner 过滤的：
+
+```
+/api/messages?device=<D>&owner_wxid=<O>
+/api/module-contacts?device=<D>&owner_wxid=<O>
+```
+
+所以只要"消息的 owner"与"联系人的 owner"不是同一个值，联系人集合为空 → 每条会话都未收录。
+
+### 判据 SQL
+
+```sql
+SELECT e.peer, COUNT(*) msgs,
+       MAX(CASE WHEN c.wxid IS NULL THEN 0 ELSE 1 END) in_contacts,
+       MAX(CASE WHEN c.owner_wxid = e.owner_wxid THEN 1 ELSE 0 END) owner_match
+FROM (SELECT COALESCE(chat_id, room_id, IF(direction='sent', to_wxid, from_wxid)) peer, owner_wxid
+      FROM bridge_message_events WHERE device='<D>') e
+LEFT JOIN bridge_module_contacts c ON c.device='<D>' AND c.wxid = e.peer
+GROUP BY e.peer;
+```
+
+`in_contacts=0` 占多数即命中此问题。
+
+### 模块侧根因（0.1.5 及更早）
+
+`findContactDatabase()` 先挑"有身份"的库并**立即返回**，而 `readWeChatIdentity()` 有
+账号目录哈希兜底，于是**每个** `MicroMsg/<hash>/EnMicroMsg.db` 看起来都"有身份"：
+扫描到的第一个库被锁定，即使它 `readContacts()` 返回 0。表现为：
+
+- 身份 = 该目录哈希（`acct_<hash>`），且随微信重启/账号目录增减而漂移；
+- 联系人快照每轮 `contact sync skipped: no friend contacts read`，永久停在旧批次；
+- 同一个登录的联系人与消息落在不同 owner 上 → 看台未收录。
+
+### 0.1.6 的修复
+
+1. 扫描时对每个候选库同时取"身份 + 可读联系人数"，按
+   `已绑定/已固定身份且有联系人 > 有真实身份且有联系人 > 联系人数最多 > 其它` 打分选择，
+   **不再选读不出联系人的库**；
+2. 选择结果按 `api_key` 固定到 `wechat_observatory_state`（微信私有 prefs），跨重启不再漂移；
+3. 连续 2 次读不出联系人 → 丢弃缓存库句柄强制重扫；
+4. 身份变化时立即重传联系人快照（旧快照在新 owner 下永远匹配不上）。
+
+### 服务端兜底（历史数据）
+
+模块固定身份后，仍可能有历史行散落在旧 owner 下，按 wxid 去重合并到一个 owner 即可：
+
+```sql
+-- 备份
+CREATE TABLE bak_<D>_contacts AS SELECT * FROM bridge_module_contacts WHERE device='<D>';
+CREATE TABLE bak_<D>_events   AS SELECT * FROM bridge_message_events WHERE device='<D>';
+-- 联系人：按 wxid 保留 last_seen_at 最新的一行（唯一索引是 device+owner_wxid+wxid）
+DELETE FROM bridge_module_contacts WHERE device='<D>' AND id NOT IN (<每个 wxid 最新行 id>);
+UPDATE bridge_module_contacts SET owner_wxid='<O>' WHERE device='<D>';
+UPDATE bridge_message_events SET owner_wxid='<O>' WHERE device='<D>' AND owner_wxid<>'<O>';
+```
+
+注意：多账号手机（如 61538A 同时有两个 `wxid_*` owner）是**合法**的，不要在服务端做
+"每设备只留一个 owner"的自动合并，否则会把两个真实账号压成一个。
