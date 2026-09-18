@@ -1,0 +1,113 @@
+{
+  "schema": 1,
+  "generatedBy": "tools/wechat_hook_probe.py",
+  "wechat": {
+    "versionName": "8.0.74",
+    "versionCode": "3120"
+  },
+  "dexHash": "sha256:2449f21fa073f05f63c2bac2412f6a1f",
+  "capabilities": {
+    "observation": "ok",
+    "identity": "ok",
+    "send": "paths:builder,netscene,event,sendmgr",
+    "bootstrap": "ok"
+  },
+  "completePaths": [
+    "builder",
+    "netscene",
+    "event",
+    "sendmgr"
+  ],
+  "advisoryMissing": [
+    "f283324a",
+    "f70808d",
+    "f307062f",
+    "f210311a",
+    "f459357f",
+    "f71992g",
+    "f7337a",
+    "f7338b",
+    "f7339c",
+    "f7340d"
+  ],
+  "identity": {
+    "idQueries": [
+      "SELECT value FROM userinfo WHERE id=2 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=42 LIMIT 1"
+    ],
+    "nicknameQueries": [
+      "SELECT value FROM userinfo WHERE id=4 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=5 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=6 LIMIT 1"
+    ]
+  },
+  "observation": {
+    "class": "com.tencent.wcdb.database.SQLiteDatabase",
+    "activeDatabasesField": "sActiveDatabases",
+    "insertMethod": "insertWithOnConflict"
+  },
+  "send": {
+    "preferred": "sendmgr",
+    "paths": [
+      {
+        "id": "builder",
+        "factory": "w11.s1",
+        "builder": "w11.r1",
+        "queue": "w11.n1",
+        "unresolved": [
+          "localIdField"
+        ]
+      },
+      {
+        "id": "netscene",
+        "class": "w11.r0",
+        "ctor": "(Ljava/lang/String;Ljava/lang/String;IIJ)V",
+        "enqueue": "com.tencent.mm.modelbase.z2",
+        "queueElement": "com.tencent.mm.modelbase.m1",
+        "unresolved": [
+          "localIdField"
+        ]
+      },
+      {
+        "id": "event",
+        "class": "com.tencent.mm.autogen.events.SendMsgEvent",
+        "unresolved": [
+          "payloadField",
+          "payloadWxid",
+          "payloadText",
+          "payloadType",
+          "payloadFlag"
+        ]
+      },
+      {
+        "id": "sendmgr",
+        "accessor": "tg3.t1",
+        "impl": "dk5.s5",
+        "method": "(Ljava/lang/String;Ljava/lang/String;II)V"
+      }
+    ],
+    "bootstrap": {
+      "registry": "fs.g",
+      "registrySlot": null,
+      "kernel": "i95.n0",
+      "kernelFlag": null,
+      "provider": "com.tencent.mm.app.p0",
+      "providerField": null
+    }
+  },
+  "missing": [
+    "f210311a",
+    "f283324a",
+    "f283325b",
+    "f283326c",
+    "f307062f",
+    "f459357f",
+    "f459386a",
+    "f70808d",
+    "f71992g",
+    "f7337a",
+    "f7338b",
+    "f7339c",
+    "f7340d"
+  ]
+}

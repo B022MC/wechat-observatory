@@ -10,8 +10,8 @@ android {
         applicationId "cc.wechat.observatory"
         minSdk 23
         targetSdk 35
-        versionCode 2
-        versionName "0.1.1-alias-id"
+        versionCode 4
+        versionName "0.1.3-wechat-8078"
     }
 }
 

@@ -2,6 +2,7 @@ package cc.wechat.observatory;
 
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.pm.PackageInfo;
 import android.app.Application;
 import android.os.Handler;
 import android.os.Looper;
@@ -79,6 +80,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_MESSAGE_ID = 0L;
     private static volatile boolean MESSAGE_WATERMARK_READY = false;
     private static volatile boolean STALE_MESSAGE_REPLAY_LIMIT_LOGGED = false;
+    private static volatile boolean CAPABILITY_REPORTED = false;
     private static volatile long LAST_WEBSOCKET_FAIL_LOG_AT = 0L;
     private static volatile String CURRENT_WXID = "";
     private static volatile String CURRENT_NICKNAME = "";
@@ -358,6 +360,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         while (true) {
             BridgeConfig config = BridgeConfig.load(bridgeContext());
             try {
+                reportCapabilities(classLoader);
                 if (config.enabled && !isBlank(config.baseUrl) && !isBlank(config.apiKey)) {
                     if (!bindRuntimeIdentity(config)) {
                         if (!sleepOnce(Math.max(3000L, config.pollIntervalMs))) {
@@ -449,27 +452,156 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * One-shot startup probe of every WeChat hook point this module depends on.
+     *
+     * <p>WeChat re-obfuscates its internal class and field names on every
+     * release, so a build that used to work can silently lose the send path.
+     * This logs a single line that makes the loss visible in logcat (and in any
+     * shipped log) without changing module behaviour.
+     */
+    private static void reportCapabilities(ClassLoader classLoader) {
+        if (CAPABILITY_REPORTED) {
+            return;
+        }
+        CAPABILITY_REPORTED = true;
+        StringBuilder report = new StringBuilder("capability report: wechat=");
+        report.append(wechatVersion());
+        report.append(" observation=").append(checkObservation(classLoader));
+        report.append(" identity=").append(isBlank(CURRENT_WXID) ? "pending" : "ok");
+        report.append(" send.builder=").append(checkPath(classLoader,
+                new String[]{"w11.s1", "v51.s1"},
+                new String[]{"w11.r1", "v51.r1"},
+                new String[]{"w11.n1", "v51.n1"}));
+        report.append(" send.netscene=").append(checkPath(classLoader,
+                new String[]{"w11.r0", "v51.r0"},
+                new String[]{"com.tencent.mm.modelbase.z2"},
+                new String[]{"com.tencent.mm.modelbase.m1"}));
+        report.append(" send.event=").append(checkPath(classLoader,
+                new String[]{"com.tencent.mm.autogen.events.SendMsgEvent"}));
+        report.append(" send.mgr=").append(checkPath(classLoader,
+                new String[]{"tg3.t1", "rn3.u1"}));
+        report.append(" bootstrap=").append(checkBootstrap(classLoader));
+        report.append(" gates=").append(readinessDetail(classLoader));
+        log(report.toString());
+    }
+
+    /** Why isWeChatReadyForSend() would pass or fail: registry slot and kernel flag. */
+    private static String readinessDetail(ClassLoader classLoader) {
+        StringBuilder detail = new StringBuilder("registrySlot=");
+        try {
+            Field field = findFieldAny(resolveClass(classLoader,
+                    new String[]{"fs.g", "qs.g"}, "f283324a", "a"), "f283324a", "a");
+            Object value = field.get(null);
+            if (value != null && value.getClass().isArray()
+                    && java.lang.reflect.Array.getLength(value) > 0) {
+                detail.append(java.lang.reflect.Array.get(value, 0) != null);
+            } else {
+                detail.append("empty");
+            }
+        } catch (Throwable t) {
+            detail.append("err(").append(shortError(t)).append(")");
+        }
+        detail.append(" kernelFlag=");
+        try {
+            Field field = findFieldAny(resolveClass(classLoader, KERNEL_NAMES,
+                    "f307062f", "f"), "f307062f", "f");
+            Object value = field.get(null);
+            if (value instanceof boolean[] && ((boolean[]) value).length > 0) {
+                detail.append(((boolean[]) value)[0]);
+            } else if (value instanceof Boolean) {
+                detail.append(value);
+            } else {
+                detail.append("unknown");
+            }
+        } catch (Throwable t) {
+            detail.append("err(").append(shortError(t)).append(")");
+        }
+        return detail.toString();
+    }
+
+    private static String wechatVersion() {
+        try {
+            Context context = bridgeContext();
+            if (context == null) {
+                return "unknown";
+            }
+            PackageInfo info = context.getPackageManager().getPackageInfo("com.tencent.mm", 0);
+            return info.versionName + "/" + info.versionCode;
+        } catch (Throwable t) {
+            return "unknown";
+        }
+    }
+
+    private static String checkObservation(ClassLoader classLoader) {
+        try {
+            findField(findClass(classLoader, "com.tencent.wcdb.database.SQLiteDatabase"),
+                    "sActiveDatabases");
+            return "ok";
+        } catch (Throwable t) {
+            return "missing(" + shortError(t) + ")";
+        }
+    }
+
+    /** A send path is available when every one of its classes resolves. */
+    private static String checkPath(ClassLoader classLoader, String[]... groups) {
+        try {
+            for (String[] group : groups) {
+                resolveClass(classLoader, group);
+            }
+            return "ok";
+        } catch (Throwable t) {
+            return "missing(" + shortError(t) + ")";
+        }
+    }
+
+    private static String checkBootstrap(ClassLoader classLoader) {
+        try {
+            findFieldAny(resolveClass(classLoader, new String[]{"fs.g", "qs.g"},
+                    "f283324a", "a"), "f283324a", "a");
+            findFieldAny(resolveClass(classLoader, KERNEL_NAMES, "f307062f", "f"), "f307062f", "f");
+            return "ok";
+        } catch (Throwable t) {
+            return "missing(" + shortError(t) + ")";
+        }
+    }
+
     private static boolean isWeChatReadyForSend(ClassLoader classLoader) {
         try {
             classLoader = runtimeClassLoader(classLoader);
             WECHAT_CLASS_LOADER = classLoader;
             ensureWeChatRegistries(classLoader);
-            if (!isStaticArraySlotReady(classLoader, "fs.g", "f283324a", "a")) {
-                return readyState(false, "fs.g extension registry not initialized");
+            if (!isStaticArraySlotReady(classLoader, new String[]{"fs.g", "qs.g"}, "f283324a", "a")) {
+                return readyState(false, "extension registry not initialized ["
+                        + readinessDetail(classLoader) + "]");
             }
-            if (!isStaticBooleanFlag(classLoader, "i95.n0", "f307062f", "f")) {
-                return readyState(false, "i95.n0 service manager not initialized");
+            if (!isStaticBooleanFlag(classLoader, KERNEL_NAMES, "f307062f", "f")) {
+                return readyState(false, "service manager not initialized ["
+                        + readinessDetail(classLoader) + "]");
             }
             return readyState(true, "ready");
         } catch (Throwable t) {
-            return readyState(false, "readiness check failed: " + shortError(t));
+            StackTraceElement[] trace = t.getStackTrace();
+            return readyState(false, "readiness check failed: " + t.getClass().getSimpleName()
+                    + ": " + shortError(t)
+                    + " at " + (trace.length > 0 ? trace[0] : "?")
+                    + " [" + readinessDetail(classLoader) + "]");
         }
     }
 
     private static void ensureWeChatRegistries(ClassLoader classLoader) throws Exception {
         classLoader = runtimeClassLoader(classLoader);
-        Class<?> appContext = findClass(classLoader, "com.tencent.mm.sdk.platformtools.x2");
-        Object application = findFieldAny(appContext, "f210311a", "a").get(null);
+        // The application-context holder is re-obfuscated like everything else,
+        // and a name can be reused for an unrelated class, so this lookup must
+        // never abort registry init: fall back to the running application.
+        Class<?> appContext = null;
+        Object application = null;
+        try {
+            appContext = findClass(classLoader, "com.tencent.mm.sdk.platformtools.x2");
+            application = staticFieldOfType(appContext, Context.class);
+        } catch (Throwable t) {
+            log("application context holder lookup skipped: " + shortError(t));
+        }
         if (application == null) {
             application = currentApplication();
         }
@@ -477,38 +609,76 @@ public final class HookEntry implements IXposedHookLoadPackage {
             log("WeChat application context is null during registry init");
             return;
         }
-        if (findFieldAny(appContext, "f210311a", "a").get(null) == null) {
-            findMethod(appContext, "u", Context.class).invoke(null, application);
-            log("initialized WeChat MMApplicationContext from module");
+        if (appContext != null) {
+            try {
+                if (staticFieldOfType(appContext, Context.class) == null) {
+                    findMethod(appContext, "u", Context.class).invoke(null, application);
+                    log("initialized WeChat MMApplicationContext from module");
+                }
+            } catch (Throwable t) {
+                log("MMApplicationContext init skipped: " + shortError(t));
+            }
         }
 
-        Class<?> extensionRegistry = findClass(classLoader, "fs.g");
+        Class<?> extensionRegistry = resolveClass(classLoader,
+                new String[]{"fs.g", "qs.g"}, "f283324a", "a");
         Field registryField = findFieldAny(extensionRegistry, "f283324a", "a");
         Object registryArray = registryField.get(null);
         if (registryArray != null
                 && registryArray.getClass().isArray()
                 && java.lang.reflect.Array.getLength(registryArray) > 0
                 && java.lang.reflect.Array.get(registryArray, 0) == null) {
-            java.lang.reflect.Array.set(registryArray, 0, enumConstant(classLoader, "fs.k2", "INSTANCE"));
+            java.lang.reflect.Array.set(registryArray, 0,
+                    enumConstantAny(classLoader, new String[]{"fs.k2", "qs.k2"}, "INSTANCE"));
             findFieldAny(extensionRegistry, "f283326c", "c").set(null, application);
-            findFieldAny(extensionRegistry, "f283325b", "b").set(null, enumConstant(classLoader, "com.tencent.mm.app.q0", "INSTANCE"));
-            log("initialized fs.g extension registry from module");
+            findFieldAny(extensionRegistry, "f283325b", "b").set(null,
+                    enumConstantAny(classLoader, SERVICE_ENUM_NAMES, "INSTANCE"));
+            log("initialized extension registry from module");
         }
 
-        if (!isStaticBooleanFlag(classLoader, "i95.n0", "f307062f", "f")) {
-            Class<?> providerClass = findClass(classLoader, "com.tencent.mm.app.p0");
-            Object provider = findFieldAny(providerClass, "f70808d", "d").get(null);
-            Object y = findMethod(provider.getClass(), "b").invoke(provider);
-            Method initialize = findMethod(
-                    findClass(classLoader, "i95.n0"),
-                    "d",
-                    Application.class,
-                    findClass(classLoader, "i95.y"),
-                    findClass(classLoader, "k95.a"));
-            initialize.invoke(null, application, y, enumConstant(classLoader, "com.tencent.mm.app.q0", "INSTANCE"));
-            log("initialized i95.n0 service manager from module");
+        if (!isStaticBooleanFlag(classLoader, KERNEL_NAMES, "f307062f", "f")) {
+            Class<?> kernel = resolveClass(classLoader, KERNEL_NAMES, "f307062f", "f");
+            Class<?> kernelArg = resolveClass(classLoader, new String[]{"i95.y", "ph5.y"});
+            Class<?> kernelService = resolveClass(classLoader, new String[]{"k95.a", "rh5.a"});
+            Object argument = staticFieldOfType(kernel, kernelArg);
+            if (argument == null) {
+                // Older builds expose the argument through the app provider.
+                Class<?> providerClass = resolveClass(classLoader,
+                        new String[]{"com.tencent.mm.app.p0"}, "f70808d", "d");
+                Object provider = findFieldAny(providerClass, "f70808d", "d").get(null);
+                argument = findMethod(provider.getClass(), "b").invoke(provider);
+            }
+            Method initialize = findMethod(kernel, "d", Application.class, kernelArg, kernelService);
+            initialize.invoke(null, application, argument,
+                    enumConstantAny(classLoader, SERVICE_ENUM_NAMES, "INSTANCE"));
+            log("initialized WeChat service manager from module");
         }
     }
+
+    /** Kernel service-manager class, renamed between WeChat releases. */
+    private static final String[] KERNEL_NAMES = new String[]{"i95.n0", "ph5.n0"};
+
+    /** Send builder factory (w11.s1 on 8.0.74/75, v51.s1 on 8.0.78). */
+    private static final String[] BUILDER_FACTORY_NAMES = new String[]{"w11.s1", "v51.s1"};
+
+    /** Session factory used to seed the builder factory field. */
+    private static final String[] SESSION_FACTORY_NAMES = new String[]{"aq1.l", "vu1.l"};
+
+    /** Forward-info payload passed to the builder. */
+    private static final String[] FORWARD_INFO_NAMES = new String[]{"c01.h7", "b41.h7"};
+
+    /** Type resolver used to pick the message type for a talker. */
+    private static final String[] TYPE_RESOLVER_NAMES = new String[]{"c01.e2", "b41.e2"};
+
+    /** Text message NetScene (w11.r0 on 8.0.74/75, v51.r0 on 8.0.78). */
+    private static final String[] NETSCENE_NAMES = new String[]{"w11.r0", "v51.r0"};
+
+    /** SendMsgMgr accessor class. */
+    private static final String[] SENDMGR_ACCESSOR_NAMES = new String[]{"tg3.t1", "rn3.u1"};
+
+    /** Enum implementing the kernel service interface, renamed between releases. */
+    private static final String[] SERVICE_ENUM_NAMES =
+            new String[]{"com.tencent.mm.app.q0", "com.tencent.mm.app.l0"};
 
     private static Object enumConstant(ClassLoader classLoader, String className, String name) throws Exception {
         Class<?> enumClass = findClass(classLoader, className);
@@ -602,12 +772,23 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static ClassLoader firstLoadable(List<ClassLoader> candidates) {
         for (ClassLoader candidate : candidates) {
-            try {
-                Class.forName("w11.r0", false, candidate);
-                Class.forName("i95.n0", false, candidate);
-                return candidate;
-            } catch (Throwable ignored) {
-                // Try the next candidate.
+            for (String name : NETSCENE_NAMES) {
+                try {
+                    Class.forName(name, false, candidate);
+                    return candidate;
+                } catch (Throwable ignored) {
+                    // Try the next name or loader.
+                }
+            }
+        }
+        for (ClassLoader candidate : candidates) {
+            for (String name : KERNEL_NAMES) {
+                try {
+                    Class.forName(name, false, candidate);
+                    return candidate;
+                } catch (Throwable ignored) {
+                    // Try the next name or loader.
+                }
             }
         }
         return null;
@@ -622,8 +803,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return ready;
     }
 
-    private static boolean isStaticArraySlotReady(ClassLoader classLoader, String className, String... fieldNames) throws Exception {
-        Field field = findFieldAny(findClass(classLoader, className), fieldNames);
+    private static boolean isStaticArraySlotReady(ClassLoader classLoader, String[] classNames, String... fieldNames) throws Exception {
+        Field field = findFieldAny(resolveClass(classLoader, classNames, fieldNames), fieldNames);
         Object value = field.get(null);
         if (value == null || !value.getClass().isArray() || java.lang.reflect.Array.getLength(value) == 0) {
             return false;
@@ -631,8 +812,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return java.lang.reflect.Array.get(value, 0) != null;
     }
 
-    private static boolean isStaticBooleanFlag(ClassLoader classLoader, String className, String... fieldNames) throws Exception {
-        Field field = findFieldAny(findClass(classLoader, className), fieldNames);
+    private static boolean isStaticBooleanFlag(ClassLoader classLoader, String[] classNames, String... fieldNames) throws Exception {
+        Field field = findFieldAny(resolveClass(classLoader, classNames, fieldNames), fieldNames);
         Object value = field.get(null);
         if (value instanceof boolean[]) {
             boolean[] flags = (boolean[]) value;
@@ -2523,12 +2704,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static long sendViaNetScene(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
-        Class<?> netSceneClass = findClass(classLoader, "w11.r0");
-        Constructor<?> ctor = findConstructor(netSceneClass, String.class, String.class, int.class, int.class, long.class);
-        Object scene = ctor.newInstance(wxid, text, msgType, 4, 0L);
+        Class<?> netSceneClass = resolveClass(classLoader, NETSCENE_NAMES);
+        Object scene = newNetScene(netSceneClass, wxid, text, msgType);
         long msgId = getLongField(scene, "f459357f", "f");
         if (msgId == -1L) {
-            throw new IllegalStateException("w11.r0 inserted local msg failed");
+            throw new IllegalStateException("NetScene inserted local msg failed");
         }
 
         Class<?> runCgi = findClass(classLoader, "com.tencent.mm.modelbase.z2");
@@ -2542,12 +2722,26 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return msgId;
     }
 
+    /**
+     * Build the text NetScene. WeChat 8.0.78 appended a trailing String to the
+     * constructor, so both shapes are attempted.
+     */
+    private static Object newNetScene(Class<?> netSceneClass, String wxid, String text, int msgType) throws Exception {
+        try {
+            return findConstructor(netSceneClass, String.class, String.class, int.class, int.class, long.class)
+                    .newInstance(wxid, text, msgType, 4, 0L);
+        } catch (NoSuchMethodException ignored) {
+            return findConstructor(netSceneClass, String.class, String.class, int.class, int.class,
+                    long.class, String.class).newInstance(wxid, text, msgType, 4, 0L, "");
+        }
+    }
+
     private static void sendViaSendMsgMgr(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
-        Class<?> accessorClass = findClass(classLoader, "tg3.t1");
+        Class<?> accessorClass = resolveClass(classLoader, SENDMGR_ACCESSOR_NAMES);
         Method accessor = findNoArgMethod(accessorClass, "a");
         Object service = accessor.invoke(null);
         if (service == null) {
-            throw new IllegalStateException("tg3.t1.a returned null");
+            throw new IllegalStateException("SendMsgMgr accessor returned null");
         }
         Method send = findMethod(service.getClass(), "fj", String.class, String.class, int.class, int.class);
         send.invoke(service, wxid, text, msgType, 0);
@@ -2555,23 +2749,23 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static PreparedBuilderSend prepareSendBuilder(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
         ensureSendBuilderFactory(classLoader);
-        Class<?> builderFactory = findClass(classLoader, "w11.s1");
+        Class<?> builderFactory = resolveClass(classLoader, BUILDER_FACTORY_NAMES, "f459386a", "a");
         Method create = findMethod(builderFactory, "a", String.class);
         Object builder = create.invoke(null, wxid);
         if (builder == null) {
-            throw new IllegalStateException("w11.s1.a returned null");
+            throw new IllegalStateException("send builder factory returned null");
         }
 
         findMethod(builder.getClass(), "g", String.class).invoke(builder, wxid);
         findMethod(builder.getClass(), "e", String.class).invoke(builder, text);
-        findMethod(builder.getClass(), "h", int.class).invoke(builder, msgType);
+        findMethodAny(builder.getClass(), new String[]{"h", "i"}, int.class).invoke(builder, msgType);
         setForwardInfo(classLoader, builder);
         setOptionalIntField(builder, 0, "f459371f", "f");
         setOptionalIntField(builder, 4, "f459374i", "i");
 
         Object request = findNoArgMethod(builder.getClass(), "a").invoke(builder);
         if (request == null) {
-            throw new IllegalStateException("w11.r1.a returned null");
+            throw new IllegalStateException("send builder produced no request");
         }
         long chatRecordId = getOptionalLongField(request, "f459336b", "b");
         return new PreparedBuilderSend(request, chatRecordId);
@@ -2583,19 +2777,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void ensureSendBuilderFactory(ClassLoader classLoader) throws Exception {
-        Class<?> builderFactory = findClass(classLoader, "w11.s1");
+        Class<?> builderFactory = resolveClass(classLoader, BUILDER_FACTORY_NAMES, "f459386a", "a");
         Field factoryField = findFieldAny(builderFactory, "f459386a", "a");
         if (factoryField.get(null) != null) {
             return;
         }
-        Object factory = newInstanceAny(findClass(classLoader, "aq1.l"));
+        Object factory = newInstanceAny(resolveClass(classLoader, SESSION_FACTORY_NAMES));
         factoryField.set(null, factory);
-        log("initialized w11.s1 send factory with aq1.l");
+        log("initialized send factory from session factory");
     }
 
     private static void setForwardInfo(ClassLoader classLoader, Object builder) {
         try {
-            Object forwardInfo = findClass(classLoader, "c01.h7").getDeclaredConstructor().newInstance();
+            Object forwardInfo = resolveClass(classLoader, FORWARD_INFO_NAMES)
+                    .getDeclaredConstructor().newInstance();
             findMethod(builder.getClass(), "f", forwardInfo.getClass()).invoke(builder, forwardInfo);
         } catch (Throwable t) {
             log("forward info setup skipped: " + shortError(t));
@@ -2604,7 +2799,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static int resolveMessageType(ClassLoader classLoader, String wxid) {
         try {
-            Class<?> typeResolver = findClass(classLoader, "c01.e2");
+            Class<?> typeResolver = resolveClass(classLoader, TYPE_RESOLVER_NAMES);
             Object result = findMethod(typeResolver, "C", String.class).invoke(null, wxid);
             if (result instanceof Number) {
                 int value = ((Number) result).intValue();
@@ -2622,6 +2817,100 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static Class<?> findClass(ClassLoader classLoader, String name) throws ClassNotFoundException {
         return Class.forName(name, false, classLoader);
+    }
+
+    /**
+     * Resolve a WeChat internal class across builds.
+     *
+     * <p>WeChat renames its obfuscated packages on every release (w11.s1 became
+     * v51.s1 in 8.0.78, fs.g became qs.g). A name can even be reused for a
+     * different class, so candidates are validated by the fields they must
+     * declare before they are accepted.
+     */
+    private static Class<?> resolveClass(ClassLoader classLoader, String[] names, String... requiredFields) throws Exception {
+        Throwable last = null;
+        for (String name : names) {
+            try {
+                Class<?> cls = findClass(classLoader, name);
+                if (requiredFields == null || requiredFields.length == 0) {
+                    return cls;
+                }
+                for (String field : requiredFields) {
+                    try {
+                        findField(cls, field);
+                        return cls;
+                    } catch (NoSuchFieldException ignored) {
+                        // try the next required field of this candidate
+                    }
+                }
+            } catch (Throwable t) {
+                last = t;
+            }
+        }
+        throw new ClassNotFoundException("none of " + joinNames(names) + " resolved"
+                + (last == null ? "" : " (" + shortError(last) + ")"));
+    }
+
+    /**
+     * First enum constant of a class that may live under several names.
+     *
+     * <p>A name can be reused by an unrelated, non-enum class on a newer WeChat
+     * build (com.tencent.mm.app.q0 is one), so candidates that are not enums are
+     * skipped instead of selected.
+     */
+    private static Object enumConstantAny(ClassLoader classLoader, String[] names, String preferred) throws Exception {
+        Throwable last = null;
+        for (String name : names) {
+            try {
+                Class<?> cls = findClass(classLoader, name);
+                Object[] constants = cls.getEnumConstants();
+                if (constants == null || constants.length == 0) {
+                    continue;
+                }
+                return enumConstant(cls, preferred);
+            } catch (Throwable t) {
+                last = t;
+            }
+        }
+        throw new ClassNotFoundException("no enum among " + joinNames(names)
+                + (last == null ? "" : " (" + shortError(last) + ")"));
+    }
+
+    private static Object enumConstant(Class<?> enumClass, String name) throws Exception {
+        Object[] constants = enumClass.getEnumConstants();
+        if (constants != null && constants.length > 0) {
+            for (Object constant : constants) {
+                if (name.equals(String.valueOf(constant))) {
+                    return constant;
+                }
+            }
+            return constants[0];
+        }
+        return findFieldAny(enumClass, name).get(null);
+    }
+
+    /** Static field whose declared type is {@code type} or a subtype of it. */
+    private static Object staticFieldOfType(Class<?> cls, Class<?> type) {
+        Class<?> current = cls;
+        while (current != null) {
+            for (Field field : current.getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(field.getModifiers())
+                        || !type.isAssignableFrom(field.getType())) {
+                    continue;
+                }
+                try {
+                    field.setAccessible(true);
+                    Object value = field.get(null);
+                    if (value != null) {
+                        return value;
+                    }
+                } catch (Throwable ignored) {
+                    // keep looking
+                }
+            }
+            current = current.getSuperclass();
+        }
+        return null;
     }
 
     private static Object newInstanceAny(Class<?> cls) throws Exception {
@@ -2697,6 +2986,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Method method = cls.getMethod(name, parameterTypes);
         method.setAccessible(true);
         return method;
+    }
+
+    /** First method that exists under any of the given names (renames across builds). */
+    private static Method findMethodAny(Class<?> cls, String[] names, Class<?>... parameterTypes)
+            throws NoSuchMethodException {
+        NoSuchMethodException last = null;
+        for (String name : names) {
+            try {
+                return findMethod(cls, name, parameterTypes);
+            } catch (NoSuchMethodException e) {
+                last = e;
+            }
+        }
+        throw last == null ? new NoSuchMethodException(joinNames(names)) : last;
     }
 
     private static Constructor<?> findConstructor(Class<?> cls, Class<?>... parameterTypes) throws NoSuchMethodException {

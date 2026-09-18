@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "generatedBy": "tools/wechat_hook_probe.py",
+  "wechat": {
+    "versionName": "8.0.78",
+    "versionCode": "3180"
+  },
+  "dexHash": "sha256:a91bcc47ff50f1f2ceb4ba8eabace79e",
+  "capabilities": {
+    "observation": "ok",
+    "identity": "ok",
+    "send": "paths:event",
+    "bootstrap": "incomplete(i95.n0,i95.y)"
+  },
+  "completePaths": [
+    "event"
+  ],
+  "advisoryMissing": [
+    "f283324a",
+    "f70808d",
+    "f307062f",
+    "f210311a",
+    "f459357f",
+    "f71992g",
+    "f7337a",
+    "f7338b",
+    "f7339c",
+    "f7340d"
+  ],
+  "identity": {
+    "idQueries": [
+      "SELECT value FROM userinfo WHERE id=2 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=42 LIMIT 1"
+    ],
+    "nicknameQueries": [
+      "SELECT value FROM userinfo WHERE id=4 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=5 LIMIT 1",
+      "SELECT value FROM userinfo WHERE id=6 LIMIT 1"
+    ]
+  },
+  "observation": {
+    "class": "com.tencent.wcdb.database.SQLiteDatabase",
+    "activeDatabasesField": "sActiveDatabases",
+    "insertMethod": "insertWithOnConflict"
+  },
+  "send": {
+    "preferred": null,
+    "paths": [
+      {
+        "id": "builder",
+        "unresolved": [
+          "factory",
+          "builder",
+          "queue",
+          "localIdField"
+        ]
+      },
+      {
+        "id": "netscene",
+        "ctor": "(Ljava/lang/String;Ljava/lang/String;IIJ)V",
+        "enqueue": "com.tencent.mm.modelbase.z2",
+        "queueElement": "com.tencent.mm.modelbase.m1",
+        "unresolved": [
+          "class",
+          "localIdField"
+        ]
+      },
+      {
+        "id": "event",
+        "class": "com.tencent.mm.autogen.events.SendMsgEvent",
+        "unresolved": [
+          "payloadField",
+          "payloadWxid",
+          "payloadText",
+          "payloadType",
+          "payloadFlag"
+        ]
+      },
+      {
+        "id": "sendmgr",
+        "method": "(Ljava/lang/String;Ljava/lang/String;II)V",
+        "unresolved": [
+          "accessor",
+          "impl"
+        ]
+      }
+    ],
+    "bootstrap": {
+      "registry": "fs.g",
+      "registrySlot": null,
+      "kernel": null,
+      "kernelFlag": null,
+      "provider": "com.tencent.mm.app.p0",
+      "providerField": null
+    }
+  },
+  "missing": [
+    "aq1.l",
+    "c01.e2",
+    "c01.h7",
+    "dk5.s5",
+    "f210311a",
+    "f283324a",
+    "f283325b",
+    "f283326c",
+    "f307062f",
+    "f459357f",
+    "f459386a",
+    "f70808d",
+    "f71992g",
+    "f7337a",
+    "f7338b",
+    "f7339c",
+    "f7340d",
+    "i95.n0",
+    "i95.y",
+    "tg3.t1",
+    "w11.n1",
+    "w11.r0",
+    "w11.r1",
+    "w11.s1"
+  ]
+}
