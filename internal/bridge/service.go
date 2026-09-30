@@ -14,21 +14,26 @@ import (
 )
 
 type Service struct {
-	cfg          Config
-	hub          *Hub
-	persistence  Persistence
-	outbox       Outbox
-	adminReader  AdminReader
-	instanceID   string
-	sessionTTL   time.Duration
-	pollEvery    time.Duration
-	offlineAfter time.Duration
+	accountMu      sync.Mutex
+	accountCurrent map[string]AccountBinding
+	accountHistory map[string]AccountBinding
+	cfg            Config
+	hub            *Hub
+	persistence    Persistence
+	outbox         Outbox
+	adminReader    AdminReader
+	instanceID     string
+	sessionTTL     time.Duration
+	pollEvery      time.Duration
+	offlineAfter   time.Duration
 
 	mu               sync.RWMutex
 	nextChatRecordID int64
 
 	outboxNotifyMu sync.Mutex
 	outboxNotify   map[string]map[chan struct{}]struct{}
+
+	diagnostics diagnosticDeduper
 }
 
 const maxOutboxPollBatch = 1
@@ -73,6 +78,8 @@ type Config struct {
 func NewService(cfg Config, opts ...Option) *Service {
 	service := &Service{
 		cfg:              cfg,
+		accountCurrent:   map[string]AccountBinding{},
+		accountHistory:   map[string]AccountBinding{},
 		hub:              NewHub(500),
 		outbox:           NewMemoryOutbox(),
 		outboxNotify:     map[string]map[chan struct{}]struct{}{},
@@ -325,7 +332,7 @@ func (s *Service) UpsertDevice(ctx context.Context, req DeviceUpsertRequest) (Mo
 	return status, nil
 }
 
-func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequest) (*ModuleRegistrationResult, error) {
+func (s *Service) registerModule(ctx context.Context, req ModuleRegistrationRequest) (*ModuleRegistrationResult, error) {
 	req, err := req.Validate(s.cfg.DefaultDevice)
 	if err != nil {
 		return nil, err
@@ -394,7 +401,7 @@ func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequ
 	}, nil
 }
 
-func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult, error) {
+func (s *Service) ingest(ctx context.Context, event MessageEvent) (*IngestResult, error) {
 	auth, err := s.authorizeModuleAPIKey(ctx, event.APIKey)
 	if err != nil {
 		return nil, err
@@ -422,9 +429,8 @@ func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult
 		return nil, err
 	}
 	event.Device = auth.Device
-	if ownerWxID := s.deviceWxID(ctx, event.Device); ownerWxID != "" {
-		event.OwnerWxID = ownerWxID
-	}
+	// Owner was validated against the source session before entering ingestion.
+	event.AccountSession = ""
 	// event_key is a server-owned transport identity. Never allow the module to
 	// choose the business idempotency boundary. A v2 device must never fall
 	// back to the legacy key family because that would make a retry eligible
@@ -467,7 +473,7 @@ func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult
 	return result, nil
 }
 
-func (s *Service) SendText(ctx context.Context, req SendTextRequest) (int64, error) {
+func (s *Service) sendText(ctx context.Context, req SendTextRequest) (int64, error) {
 	req, err := req.Validate(s.cfg.DefaultDevice)
 	if err != nil {
 		return 0, err
@@ -509,7 +515,7 @@ func (s *Service) SendText(ctx context.Context, req SendTextRequest) (int64, err
 	return firstID, nil
 }
 
-func (s *Service) PollOutbox(ctx context.Context, req ModulePollRequest) ([]ModuleOutboxItem, error) {
+func (s *Service) pollOutbox(ctx context.Context, req ModulePollRequest) ([]ModuleOutboxItem, error) {
 	req, err := req.Validate(s.cfg.DefaultDevice)
 	if err != nil {
 		return nil, err
@@ -544,7 +550,7 @@ func (s *Service) PollOutbox(ctx context.Context, req ModulePollRequest) ([]Modu
 	return items, nil
 }
 
-func (s *Service) AcquireOutboxSession(ctx context.Context, apiKey, requestedDevice, wxid string) (ModuleSessionLease, error) {
+func (s *Service) acquireOutboxSession(ctx context.Context, apiKey, requestedDevice, wxid string) (ModuleSessionLease, error) {
 	auth, err := s.authorizeModuleAPIKey(ctx, apiKey)
 	if err != nil {
 		return ModuleSessionLease{}, err
@@ -593,7 +599,7 @@ func (s *Service) ReleaseOutboxSession(ctx context.Context, lease ModuleSessionL
 	}
 }
 
-func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]ModuleOutboxItem, error) {
+func (s *Service) ackOutbox(ctx context.Context, req ModuleAckRequest) ([]ModuleOutboxItem, error) {
 	req, err := req.Validate(s.cfg.DefaultDevice)
 	if err != nil {
 		return nil, err
@@ -634,7 +640,7 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 			ChatRecordID: recordID,
 			Device:       item.Device,
 			OwnerWxID:    firstNonEmpty(item.OwnerWxID, s.deviceWxID(ctx, item.Device)),
-			From:         s.deviceWxID(ctx, item.Device),
+			From:         item.OwnerWxID,
 			To:           item.WxID,
 			Text:         item.Text,
 			MessageType:  1,
@@ -652,7 +658,7 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 	return items, nil
 }
 
-func (s *Service) RecordModuleContacts(ctx context.Context, req ModuleContactSnapshotRequest) (int, error) {
+func (s *Service) recordModuleContacts(ctx context.Context, req ModuleContactSnapshotRequest) (int, error) {
 	req, err := req.Validate(s.cfg.DefaultDevice)
 	if err != nil {
 		return 0, err
@@ -923,7 +929,9 @@ func safeCodePart(value string) string {
 }
 
 type ModuleRegistrationResult struct {
-	Device ModuleDeviceView `json:"device"`
+	AccountSession    string           `json:"account_session,omitempty"`
+	AccountGeneration int64            `json:"account_generation,omitempty"`
+	Device            ModuleDeviceView `json:"device"`
 }
 
 type ModuleDeviceView struct {

@@ -1,5 +1,13 @@
 # API
 
+> Android 0.1.8 uses persistent account sessions. For protected devices add
+> `instance_id`, `account_session`, `account_generation` to registration;
+> carry `account_session` on all module data requests and explicit `owner_wxid`
+> on messages. Admin sends should carry the generation returned by module status.
+> The examples below describe the legacy baseline; see
+> [account-session-isolation.md](account-session-isolation.md) before upgrading.
+
+
 `wechat-observatory` 有两类 API：
 
 - 管理 API：Web 管理台使用，认证头是 `X-Bridge-Password`。

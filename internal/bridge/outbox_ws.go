@@ -40,6 +40,7 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 	apiKey := strings.TrimSpace(r.URL.Query().Get("api_key"))
 	device := strings.TrimSpace(r.URL.Query().Get("device"))
 	wxid := strings.TrimSpace(r.URL.Query().Get("wxid"))
+	accountSession := strings.TrimSpace(r.URL.Query().Get("account_session"))
 	if device == "" {
 		device = s.service.DefaultDevice()
 	}
@@ -49,8 +50,12 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	device = auth.Device
-	session, err := s.service.AcquireOutboxSession(r.Context(), apiKey, device, wxid)
+	session, err := s.service.AcquireOutboxSession(r.Context(), apiKey, device, wxid, accountSession)
 	if err != nil {
+		if errors.Is(err, ErrAccountSession) {
+			writeError(w, http.StatusConflict, "account_session_conflict", err.Error())
+			return
+		}
 		if errors.Is(err, ErrModuleSessionActive) {
 			writeError(w, http.StatusConflict, "device_session_active", "device session is active; retry shortly")
 			return
@@ -76,7 +81,7 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 	outgoing := make(chan outboxWSMessage, 8)
 	activity := make(chan struct{}, 1)
 	pong := make(chan struct{}, 1)
-	go s.readOutboxWS(ctx, cancel, conn, apiKey, device, wxid, outgoing, activity, pong)
+	go s.readOutboxWS(ctx, cancel, conn, apiKey, device, wxid, accountSession, outgoing, activity, pong)
 
 	outgoing <- outboxWSMessage{Type: "ready", OK: true, Time: time.Now().Unix()}
 	outgoing <- outboxWSMessage{Type: "probe"}
@@ -120,7 +125,7 @@ func (s *HTTPServer) outboxWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	deliver := func() bool {
 		deliveryRequested = false
-		items, err := s.service.PollOutbox(ctx, ModulePollRequest{APIKey: apiKey, Device: device, WxID: wxid, Limit: 1})
+		items, err := s.service.PollOutbox(ctx, ModulePollRequest{APIKey: apiKey, Device: device, WxID: wxid, AccountSession: accountSession, Limit: 1})
 		if err != nil {
 			if !conn.writeJSON(outboxWSMessage{Type: "error", Error: err.Error(), Time: time.Now().Unix()}) {
 				return false
@@ -213,6 +218,7 @@ func (s *HTTPServer) readOutboxWS(
 	apiKey string,
 	device string,
 	wxid string,
+	accountSession string,
 	outgoing chan<- outboxWSMessage,
 	activity chan<- struct{},
 	pong chan<- struct{},
@@ -255,6 +261,7 @@ func (s *HTTPServer) readOutboxWS(
 				msg.Ack.APIKey = apiKey
 				msg.Ack.Device = device
 				msg.Ack.WxID = wxid
+				msg.Ack.AccountSession = accountSession
 				items, err := s.service.AckOutbox(ctx, *msg.Ack)
 				if err != nil {
 					outgoing <- outboxWSMessage{Type: "error", Error: err.Error(), Time: time.Now().Unix()}
@@ -279,6 +286,9 @@ func (s *HTTPServer) readOutboxWS(
 func isModuleAuthError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, ErrAccountSession) {
+		return true
 	}
 	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "invalid api key") ||

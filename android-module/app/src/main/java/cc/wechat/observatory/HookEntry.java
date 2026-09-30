@@ -2,7 +2,6 @@ package cc.wechat.observatory;
 
 import android.content.ContentValues;
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.app.Application;
 import android.os.Handler;
@@ -38,7 +37,6 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
 
@@ -53,9 +51,15 @@ import cc.wechat.observatory.gateway.WebSocketFrame;
 import cc.wechat.observatory.model.MessagePayload;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.wechat.LocalMessageConfirmation;
-import cc.wechat.observatory.wechat.HistoricalMessageReplayGuard;
 import cc.wechat.observatory.wechat.QueueSubmissionRetrier;
+import cc.wechat.observatory.wechat.OutboxDeliveryPacing;
 import cc.wechat.observatory.wechat.SendResult;
+import cc.wechat.observatory.wechat.RuntimeAccount;
+import cc.wechat.observatory.wechat.AccountSession;
+import cc.wechat.observatory.wechat.AccountDatabaseSelector;
+import cc.wechat.observatory.wechat.WeChatAccountResolver;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -71,39 +75,38 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final String WECHAT_PACKAGE = "com.tencent.mm";
     private static final AtomicBoolean WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean OUTBOX_WORKER_STARTED = new AtomicBoolean(false);
-    private static final HistoricalMessageReplayGuard HISTORICAL_MESSAGE_REPLAY_GUARD = new HistoricalMessageReplayGuard();
     private static volatile String LAST_READY_STATE = "";
     private static volatile String LAST_CLASSLOADER_STATE = "";
-    private static volatile Object LAST_DATABASE;
-    private static volatile long LAST_CONTACT_SYNC_AT = 0L;
-    private static volatile long LAST_CONTACT_SYNC_SKIP_LOG_AT = 0L;
     private static volatile long LAST_CONTACT_SCAN_LOG_AT = 0L;
-    private static volatile long LAST_MESSAGE_POLL_AT = 0L;
-    private static volatile long LAST_MESSAGE_ID = 0L;
-    private static volatile boolean MESSAGE_WATERMARK_READY = false;
-    private static volatile boolean STALE_MESSAGE_REPLAY_LIMIT_LOGGED = false;
     private static volatile boolean CAPABILITY_REPORTED = false;
     private static volatile long LAST_WEBSOCKET_FAIL_LOG_AT = 0L;
     private static volatile String CURRENT_WXID = "";
-    private static volatile String CURRENT_NICKNAME = "";
     private static volatile String REGISTERED_KEY = "";
     private static volatile String REGISTERED_DEVICE = "";
     private static volatile long LAST_REGISTER_ATTEMPT_AT = 0L;
     private static volatile long LAST_REGISTER_SUCCESS_AT = 0L;
     private static volatile Context APP_CONTEXT;
     private static volatile ClassLoader WECHAT_CLASS_LOADER;
-    // One WeChat login must always report the same owner id for both contacts and
-    // messages. The account database scan can see several MicroMsg/<hash>/
-    // EnMicroMsg.db at once (account switch, second WeChat instance, stale dirs),
-    // and picking a different one after a restart splits one login across several
-    // owner ids - the console then cannot join messages to contacts and renders
-    // every chat as "未收录". The choice is remembered per api_key.
-    private static final String STATE_PREFS = "wechat_observatory_state";
-    private static final int EMPTY_CONTACT_SYNC_RESCAN_AFTER = 2;
-    private static volatile int EMPTY_CONTACT_SYNC_STREAK = 0;
+    private static volatile RuntimeAccount CURRENT_ACCOUNT;
+    private static volatile long LAST_ACCOUNT_ERROR_AT;
+    private static final Object ACCOUNT_UPLOAD_LOCK = new Object();
+    private static final ExecutorService INSERT_REPORTER = Executors.newSingleThreadExecutor();
     private static final int SEND_QUEUE_MAX_ATTEMPTS = 5;
     private static final long SEND_QUEUE_RETRY_DELAY_MS = 500L;
     private static final int SEND_STATUS_MAX_CHECKS = 10;
+
+    private static final cc.wechat.observatory.gateway.DiagnosticsReporter DIAGNOSTICS =
+            cc.wechat.observatory.gateway.DiagnosticsReporter.create();
+    private static volatile String LAST_ACCOUNT_ERROR = "";
+    private static volatile String LAST_REGISTER_PROBLEM = "";
+    private static volatile String LAST_CAPABILITY_REPORT = "";
+    private static final AtomicBoolean STARTUP_REPORTED = new AtomicBoolean(false);
+    private static volatile boolean WECHAT_READY;
+    private static volatile String LAST_OUTBOX_STAGE = "";
+    private static volatile long LAST_OUTBOX_PROGRESS_AT = System.currentTimeMillis();
+    private static final long OUTBOX_QUIET_REPORT_MS = 60000L;
+    private static final long OUTBOX_STALL_REPORT_MS = 300000L;
+    private static final AtomicBoolean OUTBOX_WATCHDOG_STARTED = new AtomicBoolean(false);
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -111,6 +114,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return;
         }
         boolean mainProcess = WECHAT_PACKAGE.equals(lpparam.processName);
+        if (!mainProcess) {
+            return; // Only the main process owns the logged-in account and its registration.
+        }
 
         try {
             Class<?> sqliteDatabase = XposedHelpers.findClass("com.tencent.wcdb.database.SQLiteDatabase", lpparam.classLoader);
@@ -124,87 +130,29 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            handleInsert(param);
+                            final Object database = param.thisObject;
+                            final Object[] arguments = param.args.clone();
+                            if (arguments.length > 2 && arguments[2] instanceof ContentValues) {
+                                arguments[2] = new ContentValues((ContentValues) arguments[2]);
+                            }
+                            if (arguments.length > 0 && "message".equals(arguments[0])) {
+                                final RuntimeAccount sourceAccount = CURRENT_ACCOUNT;
+                                INSERT_REPORTER.execute(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        handleInsert(database, arguments, sourceAccount);
+                                    }
+                                });
+                            }
                         }
                     });
-            hookDatabaseCaptureMethods(sqliteDatabase);
             log("hooked WeChat WCDB access methods");
-            if (mainProcess) {
-                hookApplicationAttach(lpparam.classLoader);
-                hookWeChatApplication(lpparam.classLoader);
-            } else {
-                log("skip outbox worker in process " + lpparam.processName);
-            }
+            hookApplicationAttach(lpparam.classLoader);
+            hookWeChatApplication(lpparam.classLoader);
         } catch (Throwable t) {
             log("hook failed: " + t);
+            reportHookFailureLater("hook failed: " + t);
         }
-    }
-
-    private static void hookDatabaseCaptureMethods(Class<?> sqliteDatabase) {
-        for (Method method : sqliteDatabase.getDeclaredMethods()) {
-            String name = method.getName();
-            if (!shouldHookDatabaseMethod(name) || Modifier.isStatic(method.getModifiers())) {
-                continue;
-            }
-            try {
-                method.setAccessible(true);
-                XposedBridge.hookMethod(method, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        captureDatabaseFromArgs(param.thisObject, param.args);
-                    }
-
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        captureDatabaseFromArgs(param.thisObject, param.args);
-                    }
-                });
-            } catch (Throwable t) {
-                log("hook db method " + name + " failed: " + shortError(t));
-            }
-        }
-    }
-
-    private static boolean shouldHookDatabaseMethod(String name) {
-        return "rawQuery".equals(name)
-                || "rawQueryWithFactory".equals(name)
-                || "query".equals(name)
-                || "queryWithFactory".equals(name)
-                || "insert".equals(name)
-                || "insertOrThrow".equals(name)
-                || "replace".equals(name)
-                || "replaceOrThrow".equals(name)
-                || "update".equals(name)
-                || "updateWithOnConflict".equals(name)
-                || "delete".equals(name);
-    }
-
-    private static void captureDatabaseFromArgs(Object db, Object[] args) {
-        if (db == null || args == null) {
-            return;
-        }
-        for (Object arg : args) {
-            if (arg instanceof String && looksLikeContactOrMessageAccess((String) arg)) {
-                if (LAST_DATABASE != db) {
-                    LAST_DATABASE = db;
-                    log("captured WeChat database from " + shorten((String) arg, 80));
-                }
-                return;
-            }
-        }
-    }
-
-    private static boolean looksLikeContactOrMessageAccess(String value) {
-        if (isBlank(value)) {
-            return false;
-        }
-        String normalized = value.trim().toLowerCase(Locale.US);
-        return "message".equals(normalized)
-                || "rcontact".equals(normalized)
-                || normalized.contains(" from message")
-                || normalized.contains(" from rcontact")
-                || normalized.startsWith("select ") && normalized.contains("rcontact")
-                || normalized.startsWith("select ") && normalized.contains("message");
     }
 
     private static String shorten(String value, int maxLength) {
@@ -294,20 +242,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
         thread.start();
     }
 
-    private static void handleInsert(XC_MethodHook.MethodHookParam param) {
+    private static void handleInsert(Object database, Object[] arguments, RuntimeAccount sourceAccount) {
         try {
-            String table = stringArg(param.args, 0);
-            if (param.thisObject != null && ("message".equals(table) || "rcontact".equals(table))) {
-                LAST_DATABASE = param.thisObject;
-            }
+            String table = stringArg(arguments, 0);
             if (!"message".equals(table)) {
                 return;
             }
-            if (!(param.args[2] instanceof ContentValues)) {
+            if (!(arguments[2] instanceof ContentValues)) {
                 return;
             }
 
-            ContentValues values = (ContentValues) param.args[2];
+            ContentValues values = (ContentValues) arguments[2];
             String talker = values.getAsString("talker");
             String content = values.getAsString("content");
             Integer isSend = values.getAsInteger("isSend");
@@ -326,10 +271,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 return;
             }
             long normalizedCreateTime = normalizeCreateTime(createTime);
-            if (!allowsHistoricalMessage(config, normalizedCreateTime)) {
+            if (!bindRuntimeIdentity(config)) {
                 return;
             }
-            if (!bindRuntimeIdentity(config)) {
+            if (sourceAccount == null || config.runtimeAccount != sourceAccount
+                    || !sourceAccount.ownsDatabase(databasePath(database))) {
+                return;
+            }
+            if (!allowsHistoricalMessage(config, normalizedCreateTime)) {
                 return;
             }
             if (!ensureRegistered(config)) {
@@ -338,17 +287,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
             MessagePayload payload = buildMessagePayload(config, talker, content, isSend, msgId, createTime, messageType, imgPath);
             post(config, payload);
-            if (msgId != null && msgId > LAST_MESSAGE_ID) {
-                LAST_MESSAGE_ID = msgId;
-                MESSAGE_WATERMARK_READY = true;
-            }
+            // Only the ordered poll advances its watermark. A later successful
+            // hook upload must not skip earlier rows awaiting a network retry.
         } catch (Throwable t) {
             log("handle insert failed: " + t);
         }
     }
 
     private static void post(BridgeConfig config, MessagePayload payload) throws Exception {
-        postJson(config, "/webhook/lsposed/message", payload.toJson());
+        synchronized (ACCOUNT_UPLOAD_LOCK) {
+            if (!ensureRegistered(config)) {
+                throw new IllegalStateException("Account changed or registration is pending");
+            }
+            JSONObject response = new JSONObject(postJson(config, "/webhook/lsposed/message", payload.toJson()));
+            JSONObject result = response.optJSONObject("result");
+            if (result == null || !result.optBoolean("published", false)
+                    || !result.optString("persistence_error", "").isEmpty()) {
+                throw new IOException("Message persistence pending; retry from source database");
+            }
+        }
     }
 
     private static void startWorker(final ClassLoader classLoader) {
@@ -370,33 +327,40 @@ public final class HookEntry implements IXposedHookLoadPackage {
         WECHAT_CLASS_LOADER = classLoader;
         while (true) {
             BridgeConfig config = BridgeConfig.load(bridgeContext());
+            String stage = "startup";
             try {
                 reportCapabilities(classLoader);
                 if (config.enabled && !isBlank(config.baseUrl) && !isBlank(config.apiKey)) {
+                    reportStartupOnce(config);
+                    stage = "identity";
                     if (!bindRuntimeIdentity(config)) {
+                        reportDiagnostic(config, "identity", "current WeChat account unavailable: " + LAST_ACCOUNT_ERROR);
                         if (!sleepOnce(Math.max(3000L, config.pollIntervalMs))) {
                             return;
                         }
                         continue;
                     }
+                    stage = "register";
                     if (!ensureRegistered(config)) {
+                        String problem = LAST_REGISTER_PROBLEM;
+                        if (!isBlank(problem)) {
+                            reportDiagnostic(config, "register", problem);
+                        }
                         if (!sleepOnce(Math.max(3000L, config.pollIntervalMs))) {
                             return;
                         }
                         continue;
                     }
-                    if (!isWeChatReadyForSend(classLoader)) {
-                        log("WeChat send stack not ready; skip outbox poll");
-                        if (!sleepOnce(Math.max(5000L, config.pollIntervalMs))) {
-                            return;
-                        }
-                        continue;
-                    }
+                    stage = "contacts";
                     syncContactsIfDue(config);
+                    stage = "poll";
                     pollMessagesIfDue(config);
+                } else if (config.enabled && !isBlank(config.baseUrl)) {
+                    reportDiagnostic(config, "config", "api key not configured");
                 }
             } catch (Throwable t) {
                 log("worker failed: " + t);
+                reportDiagnostic(config, stage, String.valueOf(t));
             }
             if (!sleepOnce(Math.max(1000L, config.pollIntervalMs))) {
                 return;
@@ -416,11 +380,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }, "wechat-observatory-outbox");
         thread.setDaemon(true);
         thread.start();
+        startOutboxWatchdog();
     }
 
     private static void runOutboxWorker(ClassLoader classLoader) {
         while (true) {
             BridgeConfig config = BridgeConfig.load(bridgeContext());
+            noteOutboxStage("loop");
+            boolean completedOutboxItem = false;
             try {
                 if (config.enabled && !isBlank(config.baseUrl) && !isBlank(config.apiKey)) {
                     if (!bindRuntimeIdentity(config)) {
@@ -435,19 +402,26 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         }
                         continue;
                     }
-                    if (!isWeChatReadyForSend(classLoader)) {
+                    WECHAT_READY = isWeChatReadyForSend(classLoader);
+                    if (!WECHAT_READY) {
                         log("WeChat send stack not ready; skip outbox delivery");
                     } else if (!config.outboxWebSocketEnabled) {
-                        // Polling keeps each request bound to the latest wxid.
-                        pollOutbox(config, classLoader);
+                        // A completed ACK releases the next queued item immediately.
+                        noteOutboxStage("poll");
+                        completedOutboxItem = pollOutbox(config, classLoader);
+                        noteOutboxStage("idle");
                     } else if (!runOutboxWebSocket(config, classLoader)) {
-                        pollOutbox(config, classLoader);
+                        noteOutboxStage("poll");
+                        completedOutboxItem = pollOutbox(config, classLoader);
+                        noteOutboxStage("idle");
                     }
                 }
             } catch (Throwable t) {
                 log("outbox worker failed: " + t);
+                reportDiagnostic(config, "outbox-worker", String.valueOf(t));
             }
-            if (!sleepOnce(Math.max(1000L, config.pollIntervalMs))) {
+            long delay = OutboxDeliveryPacing.nextDelayMs(completedOutboxItem, config.pollIntervalMs);
+            if (delay > 0 && !sleepOnce(delay)) {
                 return;
             }
         }
@@ -494,7 +468,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 new String[]{"tg3.t1", "rn3.u1"}));
         report.append(" bootstrap=").append(checkBootstrap(classLoader));
         report.append(" gates=").append(readinessDetail(classLoader));
-        log(report.toString());
+        LAST_CAPABILITY_REPORT = report.toString();
+        log(LAST_CAPABILITY_REPORT);
     }
 
     /** Why isWeChatReadyForSend() would pass or fail: registry slot and kernel flag. */
@@ -730,49 +705,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return app instanceof Context ? (Context) app : null;
     }
 
-    private static SharedPreferences identityState() {
-        try {
-            Context context = bridgeContext();
-            return context == null
-                    ? null
-                    : context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    private static String storedIdentity(String apiKey) {
-        if (isBlank(apiKey)) {
-            return "";
-        }
-        try {
-            SharedPreferences prefs = identityState();
-            if (prefs == null) {
-                return "";
-            }
-            String value = prefs.getString("identity_" + apiKey, "");
-            return value == null ? "" : value.trim();
-        } catch (Throwable t) {
-            return "";
-        }
-    }
-
-    private static void storeIdentity(String apiKey, String identity) {
-        if (isBlank(apiKey) || isBlank(identity)) {
-            return;
-        }
-        try {
-            SharedPreferences prefs = identityState();
-            if (prefs == null || identity.equals(prefs.getString("identity_" + apiKey, ""))) {
-                return;
-            }
-            prefs.edit().putString("identity_" + apiKey, identity).commit();
-            log("identity pinned identity=" + identity);
-        } catch (Throwable t) {
-            log("identity pin failed: " + shortError(t));
-        }
-    }
-
     private static ClassLoader runtimeClassLoader(ClassLoader fallback) {
         List<ClassLoader> candidates = new ArrayList<>();
         addClassLoader(candidates, Thread.currentThread().getContextClassLoader());
@@ -884,241 +816,109 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return result instanceof Boolean && (Boolean) result;
     }
 
-    private static boolean bindRuntimeIdentity(BridgeConfig config) {
-        String wxid = "";
-        String nickname = "";
-        // WeChat can keep the module process alive while replacing its account
-        // database. Always rescan the active database set before using the
-        // cached handle, otherwise a switched account can inherit the old wxid.
-        Object db = findContactDatabaseOnMainThread(config);
-        if (db == null) {
-            db = LAST_DATABASE;
-        } else if (LAST_DATABASE != db) {
-            log("runtime database changed path=" + databasePath(db));
-            LAST_DATABASE = db;
-        }
-        WeChatIdentity identity = readWeChatIdentity(db);
-        wxid = identity.wxid;
-        nickname = identity.nickname;
-        if (isBlank(wxid)) {
-            wxid = CURRENT_WXID;
-        }
-        if (isBlank(nickname) && !isBlank(wxid)) {
-            nickname = readSingleString(db,
-                    "SELECT nickname FROM rcontact WHERE username = ? LIMIT 1",
-                    new String[]{wxid});
-        }
-        if (isBlank(nickname)) {
-            nickname = CURRENT_NICKNAME;
-        }
-        if (isBlank(wxid)) {
-            log("runtime identity not ready: current wxid cannot be detected yet");
+    private static boolean bindRuntimeIdentity(final BridgeConfig config) {
+        try {
+            return callOnMainThread(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    RuntimeAccount detected;
+                    try {
+                        detected = resolveCurrentAccount();
+                    } catch (Exception e) {
+                        // Only the serialized main-thread resolver invalidates a binding.
+                        // A delayed worker failure must not clear a newer successful one.
+                        CURRENT_ACCOUNT = null;
+                        CURRENT_WXID = "";
+                        throw e;
+                    }
+                    RuntimeAccount account = CURRENT_ACCOUNT;
+                    String target = config.baseUrl + "\n" + config.apiKey;
+                    if (!detected.sameLogin(account) || !target.equals(account.registrationTarget)) {
+                        account = detected;
+                        account.session = AccountSession.allocate(bridgeContext());
+                        account.registrationTarget = target;
+                        CURRENT_ACCOUNT = account;
+                        log("current WeChat account wxid=" + account.wxid
+                                + " nickname=" + account.nickname + " path=" + account.mainDatabasePath);
+                    }
+                    CURRENT_WXID = account.wxid;
+                    config.runtimeAccount = account;
+                    config.selfWxid = account.wxid;
+                    config.nickname = isBlank(detected.nickname) ? account.wxid : detected.nickname;
+                    return true;
+                }
+            });
+        } catch (Throwable t) {
+            LAST_ACCOUNT_ERROR = shortError(t);
+            if (System.currentTimeMillis() - LAST_ACCOUNT_ERROR_AT > 60000L) {
+                LAST_ACCOUNT_ERROR_AT = System.currentTimeMillis();
+                log("current account pending: " + shortError(t));
+            }
             return false;
         }
-        if (!isBlank(CURRENT_WXID) && !wxid.equals(CURRENT_WXID)) {
-            REGISTERED_KEY = "";
-            REGISTERED_DEVICE = "";
-            LAST_REGISTER_SUCCESS_AT = 0L;
-            // Contacts already uploaded under the previous identity would never be
-            // matched by the console again: re-upload them under the new owner now.
-            LAST_CONTACT_SYNC_AT = 0L;
-            log("wechat identity changed wxid=" + wxid + "; re-uploading contact snapshot");
-        }
-        CURRENT_WXID = wxid;
-        CURRENT_NICKNAME = nickname;
-        config.selfWxid = wxid;
-        config.nickname = isBlank(nickname) ? wxid : nickname;
-        return true;
     }
 
-    private static WeChatIdentity readWeChatIdentity(Object db) {
-        if (db == null) {
-            return new WeChatIdentity("", "");
-        }
-        String wxid = "";
-        String nickname = "";
-        String rawId2 = "";
-        String rawId42 = "";
-        String[][] candidates = new String[][]{
-                {"SELECT value FROM userinfo WHERE id=2 LIMIT 1", ""},
-                {"SELECT value FROM userinfo WHERE id=42 LIMIT 1", ""},
-                {"SELECT value FROM userinfo WHERE id=4 LIMIT 1", "nickname"},
-                {"SELECT value FROM userinfo WHERE id=5 LIMIT 1", "nickname"},
-                {"SELECT value FROM userinfo WHERE id=6 LIMIT 1", "nickname"}
-        };
-        for (String[] candidate : candidates) {
-            String value = readSingleString(db, candidate[0]);
-            if (isBlank(value)) {
-                continue;
-            }
-            if ("nickname".equals(candidate[1])) {
-                if (isBlank(nickname)) {
-                    nickname = value;
-                }
-                continue;
-            }
-            if (candidate[0].contains("id=2")) {
-                rawId2 = value;
-            } else {
-                rawId42 = value;
-            }
-            if (looksLikeAccountId(value)) {
-                wxid = value;
-                break;
-            }
-        }
-        boolean fromDirectory = false;
-        if (isBlank(wxid)) {
-            // Last resort: the account directory under MicroMsg/ is named after a
-            // stable per-account hash, so it identifies the login even when WeChat
-            // stores no usable value in userinfo.
-            wxid = accountDirectoryIdentity(db);
-            fromDirectory = !isBlank(wxid);
-        }
-        if (isBlank(wxid)) {
-            log("identity candidates unusable: userinfo.id2=" + abbreviate(rawId2)
-                    + " id42=" + abbreviate(rawId42) + " nickname=" + abbreviate(nickname));
-        }
-        return new WeChatIdentity(wxid, nickname, fromDirectory);
+    private static RuntimeAccount resolveCurrentAccount() throws Exception {
+        ClassLoader loader = runtimeClassLoader(WECHAT_CLASS_LOADER == null
+                ? HookEntry.class.getClassLoader() : WECHAT_CLASS_LOADER);
+        return WeChatAccountResolver.resolve(loader);
     }
 
-    private static String abbreviate(String value) {
-        if (isBlank(value)) {
-            return "<empty>";
+    private static boolean isCurrentAccount(final RuntimeAccount account) {
+        if (account == null || CURRENT_ACCOUNT != account) {
+            return false;
         }
-        String trimmed = value.trim();
-        return trimmed.length() <= 24 ? trimmed : trimmed.substring(0, 24) + "...";
-    }
-
-    /**
-     * Derive a stable login identity from the account database path
-     * (/data/user/0/com.tencent.mm/MicroMsg/&lt;hash&gt;/EnMicroMsg.db).
-     */
-    private static String accountDirectoryIdentity(Object db) {
         try {
-            String path = databasePath(db);
-            int slash = path == null ? -1 : path.lastIndexOf('/');
-            if (slash <= 0) {
-                return "";
-            }
-            String dir = path.substring(0, slash);
-            int parent = dir.lastIndexOf('/');
-            String hash = parent >= 0 ? dir.substring(parent + 1) : dir;
-            if (hash.length() < 8) {
-                return "";
-            }
-            for (int i = 0; i < hash.length(); i++) {
-                char c = hash.charAt(i);
-                boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-                if (!hex) {
-                    return "";
+            return callOnMainThread(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    return CURRENT_ACCOUNT == account && account.sameLogin(resolveCurrentAccount());
                 }
-            }
-            return "acct_" + hash.toLowerCase(Locale.US);
+            });
         } catch (Throwable t) {
-            return "";
-        }
-    }
-
-    private static String readSingleString(Object db, String sql) {
-        Object cursor = null;
-        try {
-            cursor = rawQuery(db, sql, new String[]{});
-            if (cursor == null) {
-                return "";
-            }
-            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
-            if (Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
-                return stringColumn(cursor, 0);
-            }
-        } catch (Throwable ignored) {
-            // WeChat database schemas vary between versions; try the next candidate.
-        } finally {
-            closeQuietly(cursor);
-        }
-        return "";
-    }
-
-    private static String readSingleString(Object db, String sql, String[] args) {
-        Object cursor = null;
-        try {
-            cursor = rawQuery(db, sql, args == null ? new String[]{} : args);
-            if (cursor == null) {
-                return "";
-            }
-            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
-            if (Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
-                return stringColumn(cursor, 0);
-            }
-        } catch (Throwable ignored) {
-            // WeChat database schemas vary between versions; keep the wxid fallback.
-        } finally {
-            closeQuietly(cursor);
-        }
-        return "";
-    }
-
-    private static final class WeChatIdentity {
-        final String wxid;
-        final String nickname;
-        /** True when wxid is only the account directory hash, not a value WeChat stores. */
-        final boolean fromDirectory;
-
-        WeChatIdentity(String wxid, String nickname) {
-            this(wxid, nickname, false);
-        }
-
-        WeChatIdentity(String wxid, String nickname, boolean fromDirectory) {
-            this.wxid = wxid == null ? "" : wxid.trim();
-            this.nickname = nickname == null ? "" : nickname.trim();
-            this.fromDirectory = fromDirectory;
-        }
-    }
-
-    /** One account database seen during the active-database scan. */
-    private static final class DatabaseCandidate {
-        final Object db;
-        final String wxid;
-        final boolean fromDirectory;
-        final int contactCount;
-
-        DatabaseCandidate(Object db, String wxid, boolean fromDirectory, int contactCount) {
-            this.db = db;
-            this.wxid = wxid == null ? "" : wxid;
-            this.fromDirectory = fromDirectory;
-            this.contactCount = contactCount;
+            return false;
         }
     }
 
     private static boolean ensureRegistered(BridgeConfig config) throws Exception {
-        if (isBlank(config.apiKey) || isBlank(config.selfWxid)) {
-            return false;
-        }
-        String key = config.apiKey + "\n" + config.selfWxid + "\n" + config.signature;
-        long now = System.currentTimeMillis();
-        if (key.equals(REGISTERED_KEY) && !isBlank(REGISTERED_DEVICE)) {
-            config.device = REGISTERED_DEVICE;
-            if (now - LAST_REGISTER_SUCCESS_AT < 60000L) {
-                return true;
+        synchronized (ACCOUNT_UPLOAD_LOCK) {
+            if (!isCurrentAccount(config.runtimeAccount)) {
+                LAST_REGISTER_PROBLEM = "WeChat account changed before registration";
+                return false;
             }
+            if (isBlank(config.apiKey) || isBlank(config.selfWxid)) {
+                LAST_REGISTER_PROBLEM = isBlank(config.apiKey) ? "api key not configured" : "own wxid unavailable";
+                return false;
+            }
+            String key = config.apiKey + "\n" + config.selfWxid + "\n" + config.signature + "\n" + config.runtimeAccount.session.id;
+            long now = System.currentTimeMillis();
+            if (key.equals(REGISTERED_KEY) && !isBlank(REGISTERED_DEVICE)) {
+                config.device = REGISTERED_DEVICE;
+                if (now - LAST_REGISTER_SUCCESS_AT < 60000L) {
+                    return true;
+                }
+            }
+            if (now - LAST_REGISTER_ATTEMPT_AT < 5000L) {
+                return false;
+            }
+            LAST_REGISTER_ATTEMPT_AT = now;
+            return registerModule(config, key);
         }
-        if (now - LAST_REGISTER_ATTEMPT_AT < 5000L) {
-            return false;
-        }
-        LAST_REGISTER_ATTEMPT_AT = now;
-        return registerModule(config, key);
     }
 
     private static boolean registerModule(BridgeConfig config, String key) throws Exception {
         if (isBlank(config.apiKey) || isBlank(config.selfWxid)) {
             return false;
         }
-        String body = "{"
-                + "\"api_key\":\"" + json(config.apiKey) + "\","
-                + "\"device\":\"" + json(config.device) + "\","
-                + "\"wxid\":\"" + json(config.selfWxid) + "\","
-                + "\"nickname\":\"" + json(config.nickname) + "\""
-                + "}";
+        JSONObject registration = new JSONObject();
+        registration.put("api_key", config.apiKey);
+        registration.put("device", config.device);
+        registration.put("wxid", config.selfWxid);
+        registration.put("nickname", config.nickname);
+        registration.put("instance_id", config.runtimeAccount.session.instanceId);
+        registration.put("account_session", config.runtimeAccount.session.id);
+        registration.put("account_generation", config.runtimeAccount.session.generation);
+        String body = registration.toString();
         String response = postJson(config, "/module/register", body);
         JSONObject root = new JSONObject(response);
         JSONObject result = root.optJSONObject("result");
@@ -1135,10 +935,19 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 }
             }
         }
-        if (isBlank(device)) {
-            log("module register response missing server device");
+        if (result == null || !config.runtimeAccount.session.acceptsEcho(
+                result.optString("account_session", ""), result.optLong("account_generation", 0))) {
+            log("module register pending: server account-session support required");
+            LAST_REGISTER_PROBLEM = "server did not confirm account session: " + shorten(response, 300);
             return false;
         }
+        if (!isCurrentAccount(config.runtimeAccount)) return false;
+        if (isBlank(device)) {
+            log("module register response missing server device");
+            LAST_REGISTER_PROBLEM = "register response missing server device";
+            return false;
+        }
+        LAST_REGISTER_PROBLEM = "";
         REGISTERED_KEY = key;
         REGISTERED_DEVICE = device;
         LAST_REGISTER_SUCCESS_AT = System.currentTimeMillis();
@@ -1148,80 +957,71 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void syncContactsIfDue(BridgeConfig config) {
-        if (config.contactSyncIntervalMs <= 0L) {
-            return;
-        }
+        RuntimeAccount account = config.runtimeAccount;
         long now = System.currentTimeMillis();
-        if (now - LAST_CONTACT_SYNC_AT < config.contactSyncIntervalMs) {
+        if (account == null || config.contactSyncIntervalMs <= 0L
+                || now - account.lastContactSyncAt < config.contactSyncIntervalMs) {
             return;
         }
-        Object db = LAST_DATABASE;
+        Object db = findAccountDatabase(account, true);
         if (db == null) {
-            db = findContactDatabaseOnMainThread(config);
-        }
-        if (db == null) {
-            if (now - LAST_CONTACT_SYNC_SKIP_LOG_AT > 60000L) {
-                LAST_CONTACT_SYNC_SKIP_LOG_AT = now;
-                log("contact sync skipped: WeChat database not captured yet");
-            }
+            noteOutboxStage("contacts-db-missing");
             return;
         }
-        LAST_CONTACT_SYNC_AT = now;
         try {
             JSONArray contacts = readContacts(db, config);
             if (contacts.length() == 0) {
-                EMPTY_CONTACT_SYNC_STREAK++;
-                log("contact sync skipped: no friend contacts read (streak="
-                        + EMPTY_CONTACT_SYNC_STREAK + " path=" + databasePath(db) + ")");
-                if (EMPTY_CONTACT_SYNC_STREAK >= EMPTY_CONTACT_SYNC_RESCAN_AFTER) {
-                    EMPTY_CONTACT_SYNC_STREAK = 0;
-                    LAST_DATABASE = null;
-                    log("dropping cached WeChat database: contacts unreadable, rescanning active set");
-                }
+                account.contactDatabase = null;
+                logAccountScan("current account contact snapshot pending path=" + databasePath(db));
                 return;
             }
-            EMPTY_CONTACT_SYNC_STREAK = 0;
             JSONObject body = new JSONObject();
             body.put("api_key", config.apiKey);
             body.put("device", config.device);
-            body.put("wxid", config.selfWxid);
+            body.put("wxid", account.wxid);
+            body.put("account_session", account.session.id);
             body.put("complete", true);
             body.put("contacts", contacts);
-            postJson(config, "/module/contacts/snapshot", body.toString());
-            storeIdentity(config.apiKey, config.selfWxid);
-            log("contact sync uploaded count=" + contacts.length()
-                    + " includeChatrooms=" + config.includeChatrooms);
+            synchronized (ACCOUNT_UPLOAD_LOCK) {
+                if (!ensureRegistered(config)) {
+                    return;
+                }
+                noteOutboxStage("contacts");
+                postJson(config, "/module/contacts/snapshot", body.toString());
+                noteOutboxStage("idle");
+                account.lastContactSyncAt = now;
+            }
+            log("contact sync uploaded count=" + contacts.length() + " wxid=" + account.wxid);
         } catch (Throwable t) {
-            log("contact sync failed: " + shortError(t));
+            account.contactDatabase = null;
+            logAccountScan("contact sync pending: " + shortError(t));
         }
     }
 
     private static void pollMessagesIfDue(BridgeConfig config) {
+        RuntimeAccount account = config.runtimeAccount;
         long now = System.currentTimeMillis();
-        if (now - LAST_MESSAGE_POLL_AT < Math.max(1000L, config.pollIntervalMs)) {
+        if (account == null || now - account.lastMessagePollAt < Math.max(1000L, config.pollIntervalMs)) {
             return;
         }
-        LAST_MESSAGE_POLL_AT = now;
-        Object db = LAST_DATABASE;
-        if (db == null) {
-            db = findContactDatabaseOnMainThread(config);
-        }
+        account.lastMessagePollAt = now;
+        Object db = findAccountDatabase(account, false);
         if (db == null) {
             return;
         }
         try {
-            if (!MESSAGE_WATERMARK_READY) {
-                LAST_MESSAGE_ID = readMaxMessageId(db);
-                MESSAGE_WATERMARK_READY = true;
-                log("message poll watermark initialized msgId=" + LAST_MESSAGE_ID);
+            if (!account.watermarkReady()) {
+                account.initializeWatermark(readMaxMessageId(db));
+                log("message watermark initialized wxid=" + account.wxid + " msgId=" + account.messageWatermark());
                 return;
             }
             int count = pollNewMessages(db, config);
             if (count > 0) {
-                log("message poll uploaded count=" + count + " lastMsgId=" + LAST_MESSAGE_ID);
+                log("message poll uploaded count=" + count + " wxid=" + account.wxid);
             }
         } catch (Throwable t) {
-            log("message poll failed: " + shortError(t));
+            account.messageDatabase = null;
+            logAccountScan("message poll pending: " + shortError(t));
         }
     }
 
@@ -1242,6 +1042,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static int pollNewMessages(Object db, BridgeConfig config) throws Exception {
+        RuntimeAccount account = config.runtimeAccount;
         boolean hasMediaHint = true;
         Object cursor;
         try {
@@ -1250,7 +1051,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     + "FROM message "
                     + "WHERE msgId > ? AND talker IS NOT NULL AND talker <> '' "
                     + "ORDER BY msgId ASC "
-                    + "LIMIT 50", new String[]{String.valueOf(LAST_MESSAGE_ID)});
+                    + "LIMIT 50", new String[]{String.valueOf(account.messageWatermark())});
         } catch (Throwable t) {
             hasMediaHint = false;
             cursor = rawQuery(db, ""
@@ -1258,7 +1059,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     + "FROM message "
                     + "WHERE msgId > ? AND talker IS NOT NULL AND talker <> '' "
                     + "ORDER BY msgId ASC "
-                    + "LIMIT 50", new String[]{String.valueOf(LAST_MESSAGE_ID)});
+                    + "LIMIT 50", new String[]{String.valueOf(account.messageWatermark())});
         }
         if (cursor == null) {
             return 0;
@@ -1268,26 +1069,27 @@ public final class HookEntry implements IXposedHookLoadPackage {
             Method moveToNext = findNoArgMethod(cursor.getClass(), "moveToNext");
             while (Boolean.TRUE.equals(moveToNext.invoke(cursor))) {
                 long msgId = longColumn(cursor, 0);
-                if (msgId <= LAST_MESSAGE_ID) {
+                if (msgId <= account.messageWatermark()) {
                     continue;
                 }
-                LAST_MESSAGE_ID = msgId;
-
+                if (!isCurrentAccount(account)) {
+                    return count;
+                }
                 String talker = stringColumn(cursor, 1);
                 String content = stringColumn(cursor, 2);
                 int isSend = intColumn(cursor, 3);
                 long createTime = normalizeCreateTime(longColumn(cursor, 4));
                 int type = intColumn(cursor, 5);
                 String imgPath = hasMediaHint ? stringColumn(cursor, 6) : "";
-                if (!shouldReportMessage(talker, content, type)) {
-                    continue;
-                }
-                if (!allowsHistoricalMessage(config, createTime)) {
+                if (!shouldReportMessage(talker, content, type)
+                        || !allowsHistoricalMessage(config, createTime)) {
+                    account.advanceWatermark(msgId);
                     continue;
                 }
 
                 MessagePayload payload = buildMessagePayload(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), msgId, createTime, type <= 0 ? 1 : type, imgPath);
                 post(config, payload);
+                account.advanceWatermark(msgId);
                 count++;
             }
         } finally {
@@ -1324,6 +1126,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
         payload.chatRecordId = msgId == null ? 0L : msgId;
         payload.apiKey = config.apiKey;
         payload.device = config.device;
+        payload.ownerWxid = config.runtimeAccount.wxid;
+        payload.accountSession = config.runtimeAccount.session.id;
         payload.chatId = normalizedTalker;
         payload.chatKind = chatroom ? "room" : "direct";
         payload.roomId = chatroom ? normalizedTalker : "";
@@ -1356,7 +1160,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (!config.mediaUploadEnabled) {
             return;
         }
-        File file = resolveMediaFile(type, mediaHint);
+        File file = resolveMediaFile(config.runtimeAccount, type, mediaHint);
         if (file == null || !file.isFile()) {
             return;
         }
@@ -1397,44 +1201,24 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private static File resolveMediaFile(int type, String mediaHint) {
+    private static File resolveMediaFile(RuntimeAccount account, int type, String mediaHint) {
+        if (account == null) {
+            return null;
+        }
         List<String> names = mediaCandidateNames(type, mediaHint);
         if (names.isEmpty()) {
             return null;
         }
         File direct = directMediaFile(mediaHint);
-        if (direct != null) {
+        if (direct != null && account.ownsDatabase(direct.getAbsolutePath())) {
             return direct;
         }
-        Context context = APP_CONTEXT;
-        if (context == null) {
-            Object app = currentApplication();
-            if (app instanceof Context) {
-                context = (Context) app;
-            }
-        }
-        if (context == null) {
-            return null;
-        }
-        File appRoot = context.getFilesDir() == null ? null : context.getFilesDir().getParentFile();
-        if (appRoot == null) {
-            return null;
-        }
-        File microMsg = new File(appRoot, "MicroMsg");
-        File[] profiles = microMsg.listFiles();
-        if (profiles == null) {
-            return null;
-        }
+        File profile = new File(account.directory);
         String[] roots = mediaSearchRoots(type);
-        for (File profile : profiles) {
-            if (profile == null || !profile.isDirectory()) {
-                continue;
-            }
-            for (String rootName : roots) {
-                File found = findNamedFile(new File(profile, rootName), names, 5, new int[]{0});
-                if (found != null) {
-                    return found;
-                }
+        for (String rootName : roots) {
+            File found = findNamedFile(new File(profile, rootName), names, 5, new int[]{0});
+            if (found != null && account.ownsDatabase(found.getAbsolutePath())) {
+                return found;
             }
         }
         return null;
@@ -1875,51 +1659,39 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 || normalized.contains("_");
     }
 
-    /**
-     * Identity check for the logged-in account row.
-     *
-     * <p>WeChat 8.0.7x stores the current account identifier in
-     * {@code userinfo.id=2} as the account's WeChat ID (alias), for example
-     * {@code xiaodao390696}, when the account signs in with a WeChat ID and
-     * password instead of a wxid-style login. Such values do not satisfy
-     * {@link #looksLikeWxid(String)}, but they are the only stable account
-     * identity present in the database, so device registration must accept
-     * them. The stricter {@code looksLikeWxid} check stays in place for
-     * chatroom sender parsing, where accepting arbitrary text would corrupt
-     * message normalization.
-     */
-    private static boolean looksLikeAccountId(String value) {
-        if (looksLikeWxid(value)) {
-            return true;
-        }
-        if (isBlank(value)) {
-            return false;
-        }
-        String normalized = value.trim();
-        if (normalized.length() < 2 || normalized.length() > 64) {
-            return false;
-        }
-        // WeChat stores the login identity as a wxid, a WeChat ID (alias) or, on
-        // some accounts, the account's own display value. Anything printable
-        // without whitespace is accepted here: refusing it would block device
-        // registration entirely, which is worse than an unusual owner id. The
-        // stricter looksLikeWxid() check still guards chatroom sender parsing.
-        for (int i = 0; i < normalized.length(); i++) {
-            char c = normalized.charAt(i);
-            if (Character.isWhitespace(c) || Character.isISOControl(c)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     private static JSONArray readContacts(Object db, BridgeConfig config) throws Exception {
         int limit = ContactSnapshotPlan.outputLimit(config.contactSyncLimit);
-        Object cursor = rawQuery(db, ContactSnapshotPlan.CONTACT_QUERY, new String[0]);
         JSONArray out = new JSONArray();
         Set<String> seen = new HashSet<>();
+        appendContactRows(db, config, out, seen, limit);
+        Object[] databases = activeDatabases();
+        for (Object candidate : databases) {
+            if (candidate != db && out.length() < limit
+                    && config.runtimeAccount.ownsDatabase(databasePath(candidate))
+                    && supportsQuery(candidate, "SELECT username,nickname,conRemark,alias,type,verifyFlag FROM rcontact LIMIT 0")) {
+                appendContactRows(candidate, config, out, seen, limit);
+            }
+        }
+        if (config.includeChatrooms && out.length() < limit) {
+            appendChatroomContacts(db, out, seen, limit - out.length());
+            for (Object candidate : databases) {
+                if (out.length() >= limit) {
+                    break;
+                }
+                if (candidate != db && config.runtimeAccount.ownsDatabase(databasePath(candidate))
+                        && supportsQuery(candidate, "SELECT chatroomname FROM chatroom LIMIT 0")) {
+                    appendChatroomContacts(candidate, out, seen, limit - out.length());
+                }
+            }
+        }
+        return out;
+    }
+
+    private static void appendContactRows(Object db, BridgeConfig config, JSONArray out,
+                                          Set<String> seen, int limit) throws Exception {
+        Object cursor = rawQuery(db, ContactSnapshotPlan.CONTACT_QUERY, new String[0]);
         if (cursor == null) {
-            return out;
+            throw new IllegalStateException("Contact cursor is pending");
         }
         try {
             Method moveToNext = findNoArgMethod(cursor.getClass(), "moveToNext");
@@ -1948,13 +1720,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
         } finally {
             closeQuietly(cursor);
         }
-        if (config.includeChatrooms && out.length() < limit) {
-            int added = appendChatroomContacts(db, out, seen, limit - out.length());
-            if (added == 0 && out.length() < limit) {
-                appendActiveDatabaseChatrooms(out, seen, limit - out.length());
-            }
-        }
-        return out;
     }
 
     private static int appendChatroomContacts(Object db, JSONArray out, Set<String> seen, int limit) {
@@ -2019,217 +1784,68 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return added;
     }
 
-    private static void appendActiveDatabaseChatrooms(JSONArray out, Set<String> seen, int limit) {
-        if (limit <= 0) {
-            return;
+    private static Object findAccountDatabase(RuntimeAccount account, boolean contacts) {
+        if (!isCurrentAccount(account)) {
+            return null;
+        }
+        Object cached = contacts ? account.contactDatabase : account.messageDatabase;
+        String query = contacts
+                ? "SELECT username,nickname,conRemark,alias,type,verifyFlag FROM rcontact LIMIT 0"
+                : "SELECT msgId,talker,content,isSend,createTime,type FROM message LIMIT 0";
+        if (cached != null && account.ownsDatabase(databasePath(cached)) && supportsQuery(cached, query)) {
+            return cached;
         }
         try {
-            ClassLoader classLoader = WECHAT_CLASS_LOADER;
-            if (classLoader == null) {
-                classLoader = runtimeClassLoader(HookEntry.class.getClassLoader());
+            Object chosen = AccountDatabaseSelector.select(account, activeDatabases(),
+                    new AccountDatabaseSelector.Probe() {
+                        @Override public String path(Object database) {
+                            return databasePath(database);
+                        }
+                        @Override public boolean supports(Object database) {
+                            return supportsQuery(database, query);
+                        }
+                    });
+            if (contacts) {
+                account.contactDatabase = chosen;
             } else {
-                classLoader = runtimeClassLoader(classLoader);
+                account.messageDatabase = chosen;
             }
-            Class<?> dbClass = findClass(classLoader, "com.tencent.wcdb.database.SQLiteDatabase");
-            Field activeField = findField(dbClass, "sActiveDatabases");
-            Object active = activeField.get(null);
-            if (!(active instanceof Map)) {
-                return;
-            }
-            Object[] databases;
-            synchronized (active) {
-                databases = ((Map<?, ?>) active).keySet().toArray();
-            }
-            int total = 0;
-            for (Object candidate : databases) {
-                if (candidate == null || out.length() >= limit) {
-                    continue;
-                }
-                int added = appendChatroomContacts(candidate, out, seen, limit - out.length());
-                if (added > 0) {
-                    total += added;
-                    log("chatroom active database path=" + databasePath(candidate) + " added=" + added);
-                }
-            }
-            if (total == 0) {
-                log("chatroom active database scan found no rows dbCount=" + databases.length);
-            }
+            return chosen;
         } catch (Throwable t) {
-            log("chatroom active database scan failed: " + shortError(t));
-        }
-    }
-
-    private static Object findContactDatabase(BridgeConfig config) {
-        try {
-            ClassLoader classLoader = WECHAT_CLASS_LOADER;
-            if (classLoader == null) {
-                classLoader = runtimeClassLoader(HookEntry.class.getClassLoader());
-            } else {
-                classLoader = runtimeClassLoader(classLoader);
-            }
-            Class<?> dbClass = findClass(classLoader, "com.tencent.wcdb.database.SQLiteDatabase");
-            Field activeField = findField(dbClass, "sActiveDatabases");
-            Object active = activeField.get(null);
-            if (!(active instanceof Map)) {
-                return null;
-            }
-            Object[] databases;
-            synchronized (active) {
-                databases = ((Map<?, ?>) active).keySet().toArray();
-            }
-            boolean verboseScanLog = shouldLogContactScan();
-            if (verboseScanLog) {
-                log("contact database scan active db count=" + databases.length);
-            }
-            Object previousDatabase = LAST_DATABASE;
-            List<DatabaseCandidate> candidates = new ArrayList<DatabaseCandidate>();
-            // A database with an identity but no readable contacts is useless: the
-            // contact snapshot would stay empty forever while messages keep arriving
-            // under that identity, which is exactly how a device ends up with
-            // messages but no contacts in the console.
-            for (Object db : databases) {
-                if (db == null) {
-                    continue;
-                }
-                try {
-                    WeChatIdentity identity = readWeChatIdentity(db);
-                    JSONArray contacts = readContacts(db, config);
-                    int contactCount = contacts.length();
-                    candidates.add(new DatabaseCandidate(
-                            db, identity.wxid, identity.fromDirectory, contactCount));
-                    if (verboseScanLog) {
-                        log("contact database candidate path=" + databasePath(db)
-                                + " contacts=" + contactCount
-                                + " identity=" + (isBlank(identity.wxid) ? "<none>" : identity.wxid)
-                                + (identity.fromDirectory ? " (directory hash)" : ""));
-                    }
-                } catch (Throwable ignored) {
-                    if (verboseScanLog) {
-                        log("contact database candidate failed path=" + databasePath(db)
-                                + " error=" + shortError(ignored));
-                    }
-                }
-            }
-            DatabaseCandidate chosen = pickDatabase(
-                    candidates, CURRENT_WXID, storedIdentity(config.apiKey));
-            if (chosen != null) {
-                LAST_DATABASE = chosen.db;
-                String pinned = storedIdentity(config.apiKey);
-                if (chosen.db != previousDatabase || !chosen.wxid.equals(config.selfWxid)) {
-                    log("selected WeChat database path=" + databasePath(chosen.db)
-                            + " identity=" + (isBlank(chosen.wxid) ? "<none>" : chosen.wxid)
-                            + (chosen.fromDirectory ? " (directory hash)" : "")
-                            + " contacts=" + chosen.contactCount);
-                }
-                if (!isBlank(pinned) && !pinned.equals(chosen.wxid)
-                        && chosen.contactCount > 0) {
-                    log("identity drift pinned=" + pinned + " selected=" + chosen.wxid
-                            + " path=" + databasePath(chosen.db));
-                }
-                return chosen.db;
-            }
-        } catch (Throwable t) {
-            log("contact database scan failed: " + shortError(t));
+            logAccountScan("current-account database pending: " + shortError(t));
         }
         return null;
     }
 
-    /**
-     * Prefer the account this device is already bound to, and never pick a
-     * database that cannot read contacts while a contact-capable one exists.
-     */
-    private static DatabaseCandidate pickDatabase(
-            List<DatabaseCandidate> candidates, String boundIdentity, String pinnedIdentity) {
-        if (candidates == null || candidates.isEmpty()) {
-            return null;
+    private static Object[] activeDatabases() throws Exception {
+        ClassLoader loader = runtimeClassLoader(WECHAT_CLASS_LOADER);
+        Class<?> dbClass = findClass(loader, "com.tencent.wcdb.database.SQLiteDatabase");
+        Object active = findField(dbClass, "sActiveDatabases").get(null);
+        if (!(active instanceof Map)) {
+            return new Object[0];
         }
-        DatabaseCandidate bestContacts = null;
-        DatabaseCandidate bestNeutralContacts = null;
-        for (DatabaseCandidate candidate : candidates) {
-            if (candidate.contactCount <= 0) {
-                continue;
-            }
-            if (bestContacts == null || candidate.contactCount > bestContacts.contactCount) {
-                bestContacts = candidate;
-            }
-            boolean neutral = !candidate.fromDirectory && !isBlank(candidate.wxid);
-            if (neutral && (bestNeutralContacts == null
-                    || candidate.contactCount > bestNeutralContacts.contactCount)) {
-                bestNeutralContacts = candidate;
-            }
+        synchronized (active) {
+            return ((Map<?, ?>) active).keySet().toArray();
         }
-        DatabaseCandidate byContacts = bestNeutralContacts != null ? bestNeutralContacts : bestContacts;
-        DatabaseCandidate matchPinned = findByIdentity(candidates, pinnedIdentity, true);
-        DatabaseCandidate matchBound = findByIdentity(candidates, boundIdentity, true);
-        if (matchPinned != null) {
-            return matchPinned;
-        }
-        if (matchBound != null) {
-            return matchBound;
-        }
-        if (byContacts != null) {
-            return byContacts;
-        }
-        matchPinned = findByIdentity(candidates, pinnedIdentity, false);
-        if (matchPinned != null) {
-            return matchPinned;
-        }
-        matchBound = findByIdentity(candidates, boundIdentity, false);
-        if (matchBound != null) {
-            return matchBound;
-        }
-        // No contact-capable database and no known identity: stay with a database
-        // that at least exposes a real (non directory-hash) identity.
-        for (DatabaseCandidate candidate : candidates) {
-            if (!candidate.fromDirectory && !isBlank(candidate.wxid)) {
-                return candidate;
-            }
-        }
-        return candidates.get(0);
     }
 
-    private static DatabaseCandidate findByIdentity(
-            List<DatabaseCandidate> candidates, String identity, boolean requireContacts) {
-        if (isBlank(identity)) {
-            return null;
-        }
-        for (DatabaseCandidate candidate : candidates) {
-            if (!identity.equals(candidate.wxid)) {
-                continue;
-            }
-            if (requireContacts && candidate.contactCount <= 0) {
-                continue;
-            }
-            return candidate;
-        }
-        return null;
-    }
-
-    private static boolean shouldLogContactScan() {
-        long now = System.currentTimeMillis();
-        if (now - LAST_CONTACT_SCAN_LOG_AT < 60000L) {
+    private static boolean supportsQuery(Object db, String query) {
+        Object cursor = null;
+        try {
+            cursor = rawQuery(db, query, new String[0]);
+            return cursor != null;
+        } catch (Throwable t) {
             return false;
+        } finally {
+            closeQuietly(cursor);
         }
-        LAST_CONTACT_SCAN_LOG_AT = now;
-        return true;
     }
 
-    private static Object findContactDatabaseOnMainThread(final BridgeConfig config) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            return findContactDatabase(config);
-        }
-        FutureTask<Object> task = new FutureTask<>(new Callable<Object>() {
-            @Override
-            public Object call() {
-                return findContactDatabase(config);
-            }
-        });
-        new Handler(Looper.getMainLooper()).post(task);
-        try {
-            return task.get();
-        } catch (Throwable t) {
-            log("contact database main-thread scan failed: " + shortError(t));
-            return null;
+    private static void logAccountScan(String message) {
+        long now = System.currentTimeMillis();
+        if (now - LAST_CONTACT_SCAN_LOG_AT > 60000L) {
+            LAST_CONTACT_SCAN_LOG_AT = now;
+            log(message);
         }
     }
 
@@ -2362,31 +1978,64 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private static void pollOutbox(BridgeConfig config, ClassLoader classLoader) throws Exception {
+    private static boolean pollOutbox(BridgeConfig config, ClassLoader classLoader) throws Exception {
         String body = "{"
                 + "\"api_key\":\"" + json(config.apiKey) + "\","
                 + "\"device\":\"" + json(config.device) + "\","
                 + "\"wxid\":\"" + json(config.selfWxid) + "\","
+                + "\"account_session\":\"" + json(config.runtimeAccount.session.id) + "\","
                 + "\"limit\":" + config.pollLimit
                 + "}";
+        long started = System.currentTimeMillis();
         String response = postJson(config, "/module/outbox/poll", body);
+        logSlowOutboxStage("poll", 0, started);
         JSONObject root = new JSONObject(response);
         JSONArray items = root.optJSONArray("items");
         if (items == null || items.length() == 0) {
-            return;
+            return false;
         }
 
-        JSONArray ackItems = handleOutboxItems(items, classLoader);
+        JSONArray ackItems = handleOutboxItems(items, classLoader, config);
         if (ackItems.length() == 0) {
-            return;
+            return false;
         }
         JSONObject ackBody = new JSONObject();
         ackBody.put("api_key", config.apiKey);
         ackBody.put("device", config.device);
         ackBody.put("wxid", config.selfWxid);
+        ackBody.put("account_session", config.runtimeAccount.session.id);
         ackBody.put("items", ackItems);
-        postJson(config, "/module/outbox/ack", ackBody.toString());
+        started = System.currentTimeMillis();
+        String ackResponse = postJson(config, "/module/outbox/ack", ackBody.toString());
+        logSlowOutboxStage("ack", ackItems.getJSONObject(0).optLong("id", 0), started);
+        return ackConfirmed(ackResponse);
     }
+
+    private static boolean ackConfirmed(String response) {
+        try {
+            JSONArray items = new JSONObject(response).optJSONArray("items");
+            if (items == null) {
+                return false;
+            }
+            for (int i = 0; i < items.length(); i++) {
+                String status = items.getJSONObject(i).optString("status", "");
+                if ("sent".equals(status) || "failed".equals(status)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+            // A malformed or empty ACK response must retain normal pacing.
+        }
+        return false;
+    }
+
+    private static void logSlowOutboxStage(String stage, long id, long started) {
+        long elapsed = System.currentTimeMillis() - started;
+        if (elapsed >= 5000L) {
+            log("outbox slow stage=" + stage + " id=" + id + " elapsed_ms=" + elapsed);
+        }
+    }
+
 
     private static boolean runOutboxWebSocket(BridgeConfig config, ClassLoader classLoader) {
         if (!supportsWebSocket(config)) {
@@ -2407,7 +2056,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
         String path = endpoint.requestPath("/module/outbox/ws")
                 + "?api_key=" + urlEncode(config.apiKey)
                 + "&device=" + urlEncode(config.device)
-                + "&wxid=" + urlEncode(config.selfWxid);
+                + "&wxid=" + urlEncode(config.selfWxid)
+                + "&account_session=" + urlEncode(config.runtimeAccount.session.id);
         byte[] nonce = new byte[16];
         new SecureRandom().nextBytes(nonce);
         String key = Base64.encodeToString(nonce, Base64.NO_WRAP);
@@ -2451,7 +2101,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 JSONObject root = new JSONObject(new String(frame.payload, StandardCharsets.UTF_8));
                 String type = root.optString("type", "");
                 if ("outbox".equals(type)) {
-                    JSONArray ackItems = handleOutboxItems(root.optJSONArray("items"), classLoader);
+                    JSONArray ackItems = handleOutboxItems(root.optJSONArray("items"), classLoader, config);
                     if (ackItems.length() > 0) {
                         JSONObject ackBody = new JSONObject();
                         ackBody.put("type", "ack");
@@ -2459,6 +2109,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         ack.put("api_key", config.apiKey);
                         ack.put("device", config.device);
                         ack.put("wxid", config.selfWxid);
+                        ack.put("account_session", config.runtimeAccount.session.id);
                         ack.put("items", ackItems);
                         ackBody.put("ack", ack);
                         writeWebSocketText(output, ackBody.toString());
@@ -2480,12 +2131,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
         // A WeChat account switch updates CURRENT_WXID without changing module config.
         // Close the old stream so the outer worker can register and reconnect with the
         // new account identity instead of continuing to lease the old session.
-        return !isBlank(CURRENT_WXID)
-                && !isBlank(config.selfWxid)
-                && !CURRENT_WXID.equals(config.selfWxid);
+        return !isCurrentAccount(config.runtimeAccount);
     }
 
-    private static JSONArray handleOutboxItems(JSONArray items, ClassLoader classLoader) throws Exception {
+    private static JSONArray handleOutboxItems(JSONArray items, ClassLoader classLoader, BridgeConfig config) throws Exception {
         JSONArray ackItems = new JSONArray();
         if (items == null) {
             return ackItems;
@@ -2498,7 +2147,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (id <= 0 || isBlank(wxid) || isBlank(text)) {
                 continue;
             }
-            SendResult result = sendText(classLoader, wxid, text);
+            if (!config.selfWxid.equals(item.optString("owner_wxid", ""))
+                    || !config.device.equals(item.optString("device", ""))
+                    || !isCurrentAccount(config.runtimeAccount)) {
+                throw new IllegalStateException("Outbox account scope changed");
+            }
+            long started = System.currentTimeMillis();
+            SendResult result = sendText(classLoader, wxid, text, config.runtimeAccount);
+            logSlowOutboxStage("send", id, started);
             JSONObject ack = new JSONObject();
             ack.put("id", id);
             ack.put("status", result.ok ? "sent" : "failed");
@@ -2712,7 +2368,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         log(message);
     }
 
-    private static SendResult sendText(ClassLoader classLoader, String wxid, String text) {
+    private static SendResult sendText(ClassLoader classLoader, String wxid, String text, final RuntimeAccount account) {
         final ClassLoader targetClassLoader = classLoader;
         final String targetWxid = wxid;
         final String targetText = text;
@@ -2720,6 +2376,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
             final PreparedTextSend prepared = callOnMainThread(new Callable<PreparedTextSend>() {
                 @Override
                 public PreparedTextSend call() {
+                    if (!isCurrentAccount(account)) {
+                        return PreparedTextSend.completed(SendResult.failed("WeChat account changed before send"));
+                    }
                     return prepareTextSendOnWeChatThread(targetClassLoader, targetWxid, targetText);
                 }
             });
@@ -2737,6 +2396,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                             boolean queued = callOnMainThread(new Callable<Boolean>() {
                                 @Override
                                 public Boolean call() throws Exception {
+                                    if (!isCurrentAccount(account)) {
+                                        throw new IllegalStateException("WeChat account changed before queue submission");
+                                    }
                                     return executeSendBuilderRequest(request);
                                 }
                             });
@@ -2758,7 +2420,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     SEND_QUEUE_MAX_ATTEMPTS,
                     SEND_QUEUE_RETRY_DELAY_MS);
             if (!accepted) {
-                LocalMessageConfirmation.Result confirmation = confirmLocalMessage(prepared.chatRecordId);
+                LocalMessageConfirmation.Result confirmation = confirmLocalMessage(prepared.chatRecordId, account);
                 if (confirmation == LocalMessageConfirmation.Result.SENT) {
                     log("sendText confirmed by local message status wxid=" + targetWxid
                             + " msgType=" + prepared.msgType
@@ -2787,7 +2449,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private static LocalMessageConfirmation.Result confirmLocalMessage(final long chatRecordId) throws Exception {
+    private static LocalMessageConfirmation.Result confirmLocalMessage(final long chatRecordId, final RuntimeAccount account) throws Exception {
         if (chatRecordId <= 0L) {
             return LocalMessageConfirmation.Result.TIMEOUT;
         }
@@ -2795,7 +2457,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 new LocalMessageConfirmation.StatusReader() {
                     @Override
                     public int readStatus() throws Exception {
-                        return readLocalMessageStatus(chatRecordId);
+                        return readLocalMessageStatus(chatRecordId, account);
                     }
                 },
                 new LocalMessageConfirmation.Sleeper() {
@@ -2808,8 +2470,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 SEND_QUEUE_RETRY_DELAY_MS);
     }
 
-    private static int readLocalMessageStatus(long chatRecordId) throws Exception {
-        Object db = LAST_DATABASE;
+    private static int readLocalMessageStatus(long chatRecordId, RuntimeAccount account) throws Exception {
+        Object db = findAccountDatabase(account, false);
         if (db == null) {
             return LocalMessageConfirmation.STATUS_UNKNOWN;
         }
@@ -3534,15 +3196,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static boolean allowsHistoricalMessage(BridgeConfig config, long createTimeSeconds) {
-        if (HISTORICAL_MESSAGE_REPLAY_GUARD.allows(
+        if (config.runtimeAccount.replayGuard.allows(
                 System.currentTimeMillis(),
                 createTimeSeconds,
                 config.staleMessageGraceMs,
                 config.staleMessageReplayLimit)) {
             return true;
         }
-        if (!STALE_MESSAGE_REPLAY_LIMIT_LOGGED) {
-            STALE_MESSAGE_REPLAY_LIMIT_LOGGED = true;
+        if (!config.runtimeAccount.replayLimitLogged) {
+            config.runtimeAccount.replayLimitLogged = true;
             log("stale message replay limit reached; skipping additional historical inserts limit="
                     + config.staleMessageReplayLimit);
         }
@@ -3551,6 +3213,100 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static void log(String message) {
         BridgeLogger.log(message);
+    }
+
+    // --- Diagnostics upload (additive; never changes worker behaviour) ---
+
+    private static void reportDiagnostic(final BridgeConfig config, String stage, String message) {
+        try {
+            if (config == null || !config.enabled || isBlank(config.baseUrl)) {
+                return;
+            }
+            cc.wechat.observatory.gateway.DiagnosticsReporter.Report report =
+                    new cc.wechat.observatory.gateway.DiagnosticsReporter.Report();
+            report.apiKey = config.apiKey;
+            report.device = config.device;
+            report.wxid = config.selfWxid;
+            report.stage = stage;
+            report.message = message;
+            report.moduleVersion = BuildConfig.VERSION_NAME + "/" + BuildConfig.VERSION_CODE;
+            report.wechatVersion = wechatVersion();
+            report.android = "Android " + android.os.Build.VERSION.RELEASE + " sdk=" + android.os.Build.VERSION.SDK_INT
+                    + " " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL;
+            DIAGNOSTICS.report(new cc.wechat.observatory.gateway.DiagnosticsReporter.Transport() {
+                @Override
+                public void post(String path, String body) throws Exception {
+                    postJson(config, path, body);
+                }
+            }, report, System.currentTimeMillis());
+        } catch (Throwable ignored) {
+            // Diagnostics must never affect the module.
+        }
+    }
+
+    private static void reportStartupOnce(BridgeConfig config) {
+        if (STARTUP_REPORTED.compareAndSet(false, true)) {
+            reportDiagnostic(config, "startup", isBlank(LAST_CAPABILITY_REPORT) ? "module started" : LAST_CAPABILITY_REPORT);
+        }
+    }
+
+    /** The WCDB hook failing means no worker ever starts, so report it from its own thread. */
+    private static void reportHookFailureLater(final String message) {
+        try {
+            Thread thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    if (!sleepOnce(20000L)) {
+                        return;
+                    }
+                    reportDiagnostic(BridgeConfig.load(bridgeContext()), "hook", message);
+                }
+            }, "wechat-observatory-hook-report");
+            thread.setDaemon(true);
+            thread.start();
+        } catch (Throwable ignored) {
+            // Diagnostics must never affect the module.
+        }
+    }
+
+    private static void noteOutboxStage(String stage) {
+        LAST_OUTBOX_STAGE = stage;
+        LAST_OUTBOX_PROGRESS_AT = System.currentTimeMillis();
+    }
+
+    /**
+     * Replies stop silently when WeChat's send stack never becomes ready or a
+     * delivery stage hangs, so report both from an independent thread.
+     */
+    private static void startOutboxWatchdog() {
+        if (!OUTBOX_WATCHDOG_STARTED.compareAndSet(false, true)) {
+            return;
+        }
+        Thread thread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (true) {
+                    if (!sleepOnce(OUTBOX_QUIET_REPORT_MS)) {
+                        return;
+                    }
+                    try {
+                        if (!WECHAT_READY) {
+                            reportDiagnostic(BridgeConfig.load(bridgeContext()), "ready",
+                                    "WeChat send stack is not ready: " + LAST_READY_STATE);
+                        }
+                        long stale = System.currentTimeMillis() - LAST_OUTBOX_PROGRESS_AT;
+                        if (stale > OUTBOX_STALL_REPORT_MS) {
+                            reportDiagnostic(BridgeConfig.load(bridgeContext()), "outbox-stalled",
+                                    "reply delivery stalled at stage=" + LAST_OUTBOX_STAGE);
+                        }
+                    } catch (Throwable ignored) {
+                        // Diagnostics must never affect the module.
+                    }
+                }
+            }
+        }, "wechat-observatory-outbox-watchdog");
+        thread.setDaemon(true);
+        thread.start();
     }
 
 }

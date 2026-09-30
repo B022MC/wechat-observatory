@@ -10,8 +10,12 @@ android {
         applicationId "cc.wechat.observatory"
         minSdk 23
         targetSdk 35
-        versionCode 7
-        versionName "0.1.6-contact-capable-db"
+        versionCode 12
+        versionName "0.1.11-outbox-pacing"
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 }
 

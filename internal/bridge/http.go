@@ -15,6 +15,7 @@ type HTTPServer struct {
 	service         *Service
 	adminPass       string
 	deviceAdminPass string
+	diagnosticLimit ipRateLimiter
 }
 
 type HTTPServerOption func(*HTTPServer)
@@ -55,6 +56,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("GET /api/live/events", s.requireAdmin(s.liveEvents))
 	mux.HandleFunc("GET /api/modules/status", s.requireAdmin(s.moduleStatuses))
 	mux.HandleFunc("GET /api/module-contacts", s.requireAdmin(s.moduleContacts))
+	mux.HandleFunc("GET /api/module-diagnostics", s.requireAdmin(s.moduleDiagnostics))
 	mux.HandleFunc("POST /api/send/text", s.requireAdmin(s.sendText))
 	mux.HandleFunc("GET /admin", s.adminPage)
 	mux.HandleFunc("GET /admin/", s.adminPage)
@@ -75,6 +77,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /module/contacts/snapshot", s.recordContacts)
 	mux.HandleFunc("POST /module/outbox/poll", s.pollOutbox)
 	mux.HandleFunc("POST /module/outbox/ack", s.ackOutbox)
+	mux.HandleFunc("POST /module/diagnostics", s.uploadModuleDiagnostic)
 	mux.HandleFunc("GET /module/outbox/ws", s.outboxWebSocket)
 	mux.HandleFunc("POST /webhook/lsposed/message", s.ingestMessageFrom("lsposed"))
 	mux.HandleFunc("POST /webhook/module/message", s.ingestMessageFrom("module"))
@@ -481,6 +484,8 @@ func nonNegativeInt64Query(r *http.Request, name string) (int64, error) {
 }
 
 func (s *HTTPServer) moduleStatusViews() []ModuleStatusView {
+	s.service.accountMu.Lock()
+	defer s.service.accountMu.Unlock()
 	devices := s.service.Devices()
 	sort.Slice(devices, func(i, j int) bool {
 		return devices[i].Name < devices[j].Name
@@ -488,11 +493,12 @@ func (s *HTTPServer) moduleStatusViews() []ModuleStatusView {
 	out := make([]ModuleStatusView, 0, len(devices))
 	for _, device := range devices {
 		item := ModuleStatusView{
-			Device:         device.Name,
-			DeviceWxID:     device.WxID,
-			DeviceNickname: device.Nickname,
-			WeChatNickname: device.WeChatNickname,
-			Enabled:        true,
+			AccountGeneration: s.service.accountCurrent[device.Name].Generation,
+			Device:            device.Name,
+			DeviceWxID:        device.WxID,
+			DeviceNickname:    device.Nickname,
+			WeChatNickname:    device.WeChatNickname,
+			Enabled:           true,
 		}
 		if strings.TrimSpace(device.WxID) != "" {
 			item.Registered = true
@@ -515,7 +521,7 @@ func (s *HTTPServer) sendText(w http.ResponseWriter, r *http.Request) {
 	}
 	outboxID, err := s.service.SendText(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "send_failed", err.Error())
+		writeError(w, moduleErrorStatus(err), "send_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "outbox_id": outboxID})
@@ -529,7 +535,8 @@ func (s *HTTPServer) registerModule(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.service.RegisterModule(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "register_failed", err.Error())
+		s.recordRegisterFailure(r, req, err)
+		writeError(w, moduleErrorStatus(err), "register_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
@@ -543,7 +550,7 @@ func (s *HTTPServer) recordContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	count, err := s.service.RecordModuleContacts(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "contacts_failed", err.Error())
+		writeError(w, moduleErrorStatus(err), "contacts_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": count})
@@ -557,7 +564,7 @@ func (s *HTTPServer) pollOutbox(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := s.service.PollOutbox(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "poll_failed", err.Error())
+		writeError(w, moduleErrorStatus(err), "poll_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": items})
@@ -571,7 +578,7 @@ func (s *HTTPServer) ackOutbox(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := s.service.AckOutbox(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "ack_failed", err.Error())
+		writeError(w, moduleErrorStatus(err), "ack_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": items})
@@ -591,7 +598,7 @@ func (s *HTTPServer) ingestMessageFrom(provider string) http.HandlerFunc {
 		event.RawProvider = provider
 		result, err := s.service.Ingest(r.Context(), event)
 		if err != nil {
-			status := http.StatusBadRequest
+			status := moduleErrorStatus(err)
 			var persistenceError *IngestPersistenceError
 			if errors.As(err, &persistenceError) {
 				status = http.StatusServiceUnavailable
@@ -670,4 +677,11 @@ func writeSSEID(w http.ResponseWriter, id int64, event string, payload any) {
 		_, _ = fmt.Fprintf(w, "id: %d\n", id)
 	}
 	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+func moduleErrorStatus(err error) int {
+	if errors.Is(err, ErrAccountSession) {
+		return http.StatusConflict
+	}
+	return http.StatusBadRequest
 }

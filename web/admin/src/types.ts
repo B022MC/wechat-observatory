@@ -1,4 +1,5 @@
 export type ModuleStatus = {
+  account_generation?: number;
   device: string;
   device_wxid?: string;
   device_nickname?: string;
@@ -73,6 +74,7 @@ export type StoredMessage = {
 };
 
 export type LiveMessageEvent = {
+  owner_wxid?: string;
   id?: string;
   event_id?: number;
   chat_record_id?: number;

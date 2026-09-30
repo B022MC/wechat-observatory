@@ -25,31 +25,32 @@ const (
 )
 
 type MessageEvent struct {
-	Sequence     int64     `json:"-"`
-	EventKey     string    `json:"event_key,omitempty"`
-	APIKey       string    `json:"api_key,omitempty"`
-	ID           string    `json:"id"`
-	EventID      int64     `json:"event_id"`
-	ChatRecordID int64     `json:"chat_record_id"`
-	Device       string    `json:"device"`
-	OwnerWxID    string    `json:"owner_wxid,omitempty"`
-	From         string    `json:"from"`
-	To           string    `json:"to"`
-	RoomID       string    `json:"room_id"`
-	Sender       string    `json:"sender"`
-	Text         string    `json:"text"`
-	MessageType  int32     `json:"message_type"`
-	MediaKind    string    `json:"media_kind,omitempty"`
-	MediaMime    string    `json:"media_mime,omitempty"`
-	MediaName    string    `json:"media_name,omitempty"`
-	MediaURL     string    `json:"media_url,omitempty"`
-	MediaSize    int64     `json:"media_size,omitempty"`
-	MediaBase64  string    `json:"media_base64,omitempty"`
-	CreateTime   int64     `json:"create_time"`
-	Direction    Direction `json:"direction"`
-	RawProvider  string    `json:"raw_provider"`
-	ChatKind     ChatKind  `json:"chat_kind,omitempty"`
-	Conversation string    `json:"chat_id,omitempty"`
+	AccountSession string    `json:"account_session,omitempty"`
+	Sequence       int64     `json:"-"`
+	EventKey       string    `json:"event_key,omitempty"`
+	APIKey         string    `json:"api_key,omitempty"`
+	ID             string    `json:"id"`
+	EventID        int64     `json:"event_id"`
+	ChatRecordID   int64     `json:"chat_record_id"`
+	Device         string    `json:"device"`
+	OwnerWxID      string    `json:"owner_wxid,omitempty"`
+	From           string    `json:"from"`
+	To             string    `json:"to"`
+	RoomID         string    `json:"room_id"`
+	Sender         string    `json:"sender"`
+	Text           string    `json:"text"`
+	MessageType    int32     `json:"message_type"`
+	MediaKind      string    `json:"media_kind,omitempty"`
+	MediaMime      string    `json:"media_mime,omitempty"`
+	MediaName      string    `json:"media_name,omitempty"`
+	MediaURL       string    `json:"media_url,omitempty"`
+	MediaSize      int64     `json:"media_size,omitempty"`
+	MediaBase64    string    `json:"media_base64,omitempty"`
+	CreateTime     int64     `json:"create_time"`
+	Direction      Direction `json:"direction"`
+	RawProvider    string    `json:"raw_provider"`
+	ChatKind       ChatKind  `json:"chat_kind,omitempty"`
+	Conversation   string    `json:"chat_id,omitempty"`
 }
 
 func (e MessageEvent) Validate() error {
@@ -168,10 +169,11 @@ func IsCanonicalEventKeyV2(value string) bool {
 }
 
 type SendTextRequest struct {
-	Device    string   `json:"device"`
-	OwnerWxID string   `json:"owner_wxid,omitempty"`
-	WxIDs     []string `json:"wx_ids"`
-	Text      string   `json:"text"`
+	AccountGeneration *int64   `json:"account_generation,omitempty"`
+	Device            string   `json:"device"`
+	OwnerWxID         string   `json:"owner_wxid,omitempty"`
+	WxIDs             []string `json:"wx_ids"`
+	Text              string   `json:"text"`
 }
 
 func (req SendTextRequest) Validate(defaultDevice string) (SendTextRequest, error) {
@@ -198,10 +200,13 @@ func (req SendTextRequest) Validate(defaultDevice string) (SendTextRequest, erro
 }
 
 type ModuleRegistrationRequest struct {
-	APIKey   string `json:"api_key"`
-	Device   string `json:"device"`
-	WxID     string `json:"wxid"`
-	Nickname string `json:"nickname"`
+	InstanceID        string `json:"instance_id,omitempty"`
+	AccountSession    string `json:"account_session,omitempty"`
+	AccountGeneration int64  `json:"account_generation,omitempty"`
+	APIKey            string `json:"api_key"`
+	Device            string `json:"device"`
+	WxID              string `json:"wxid"`
+	Nickname          string `json:"nickname"`
 }
 
 func (req ModuleRegistrationRequest) Validate(defaultDevice string) (ModuleRegistrationRequest, error) {
@@ -219,10 +224,11 @@ func (req ModuleRegistrationRequest) Validate(defaultDevice string) (ModuleRegis
 }
 
 type ModulePollRequest struct {
-	APIKey string `json:"api_key"`
-	Device string `json:"device"`
-	WxID   string `json:"wxid"`
-	Limit  int    `json:"limit"`
+	AccountSession string `json:"account_session,omitempty"`
+	APIKey         string `json:"api_key"`
+	Device         string `json:"device"`
+	WxID           string `json:"wxid"`
+	Limit          int    `json:"limit"`
 }
 
 func (req ModulePollRequest) Validate(defaultDevice string) (ModulePollRequest, error) {
@@ -248,12 +254,13 @@ func (req ModulePollRequest) Validate(defaultDevice string) (ModulePollRequest, 
 }
 
 type ModuleAckRequest struct {
-	APIKey string          `json:"api_key"`
-	Device string          `json:"device"`
-	WxID   string          `json:"wxid,omitempty"`
-	Items  []ModuleAckItem `json:"items"`
-	IDs    []int64         `json:"ids,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	AccountSession string          `json:"account_session,omitempty"`
+	APIKey         string          `json:"api_key"`
+	Device         string          `json:"device"`
+	WxID           string          `json:"wxid,omitempty"`
+	Items          []ModuleAckItem `json:"items"`
+	IDs            []int64         `json:"ids,omitempty"`
+	Error          string          `json:"error,omitempty"`
 }
 
 type ModuleAckItem struct {
@@ -312,11 +319,12 @@ type ModuleOutboxItem struct {
 }
 
 type ModuleContactSnapshotRequest struct {
-	APIKey   string          `json:"api_key"`
-	Device   string          `json:"device"`
-	WxID     string          `json:"wxid"`
-	Complete bool            `json:"complete"`
-	Contacts []ModuleContact `json:"contacts"`
+	AccountSession string          `json:"account_session,omitempty"`
+	APIKey         string          `json:"api_key"`
+	Device         string          `json:"device"`
+	WxID           string          `json:"wxid"`
+	Complete       bool            `json:"complete"`
+	Contacts       []ModuleContact `json:"contacts"`
 }
 
 type ModuleContact struct {

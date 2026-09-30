@@ -10,7 +10,7 @@ import (
 )
 
 func (s *Store) ListAPIKeys(ctx context.Context, limit int) ([]bridge.APIKeyView, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.executor(ctx).QueryContext(ctx, `
 		SELECT code, device, nickname, enabled, created_at, updated_at
 		FROM bridge_api_keys
 		ORDER BY updated_at DESC, code ASC
@@ -48,7 +48,7 @@ func (s *Store) ListAPIKeys(ctx context.Context, limit int) ([]bridge.APIKeyView
 }
 
 func (s *Store) ListStoredEvents(ctx context.Context, limit int) ([]bridge.StoredEventView, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.executor(ctx).QueryContext(ctx, `
 		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
 			to_wxid, room_id, sender_wxid, text, message_type, media_kind,
 			media_mime, media_name, media_url, media_size, raw_provider, create_time, created_at
@@ -65,7 +65,7 @@ func (s *Store) ListStoredEvents(ctx context.Context, limit int) ([]bridge.Store
 
 func (s *Store) LatestLiveEventID(ctx context.Context) (int64, error) {
 	var id int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM bridge_message_events`).Scan(&id)
+	err := s.executor(ctx).QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM bridge_message_events`).Scan(&id)
 	return id, err
 }
 
@@ -77,7 +77,7 @@ func (s *Store) ListLiveEventsAfter(ctx context.Context, afterID int64, device s
 		args = append(args, device)
 	}
 	args = append(args, normalizeLimit(limit))
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.executor(ctx).QueryContext(ctx, `
 		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid,
 			direction, from_wxid, to_wxid, room_id, sender_wxid, text, message_type,
 			media_kind, media_mime, media_name, media_url, media_size, raw_provider, create_time
@@ -103,7 +103,7 @@ func (s *Store) ListLiveEventsAfter(ctx context.Context, afterID int64, device s
 
 func (s *Store) ListMessages(ctx context.Context, filter bridge.MessageFilter) ([]bridge.StoredEventView, error) {
 	query, args := listMessagesQuery(filter)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.executor(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +268,7 @@ func scanMessageEvent(row rowScanner) (bridge.MessageEvent, error) {
 }
 
 const listModuleStatusesStatement = `
-		SELECT ak.device, d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), d.wechat_nickname, ak.enabled, d.updated_at,
+		SELECT ak.device, COALESCE(ac.generation, 0), d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), d.wechat_nickname, ak.enabled, d.updated_at,
 			rt.last_register_at,
 			rt.last_poll_at,
 			rt.last_ack_at,
@@ -289,6 +289,7 @@ const listModuleStatusesStatement = `
 			last_ob.last_error,
 			last_ob.updated_at
 		FROM bridge_api_keys ak
+		LEFT JOIN bridge_module_account_current ac ON ac.device = ak.device
 		LEFT JOIN bridge_devices d
 			ON d.name = ak.device
 		LEFT JOIN bridge_module_runtime rt
@@ -343,7 +344,7 @@ type moduleEventTimes struct {
 
 func (s *Store) latestModuleEventTimes(ctx context.Context, device string) (moduleEventTimes, error) {
 	var times moduleEventTimes
-	err := s.db.QueryRowContext(
+	err := s.executor(ctx).QueryRowContext(
 		ctx,
 		latestModuleEventTimesStatement,
 		device,
@@ -355,7 +356,7 @@ func (s *Store) latestModuleEventTimes(ctx context.Context, device string) (modu
 }
 
 func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusView, error) {
-	rows, err := s.db.QueryContext(ctx, listModuleStatusesStatement)
+	rows, err := s.executor(ctx).QueryContext(ctx, listModuleStatusesStatement)
 	if err != nil {
 		return nil, err
 	}
@@ -376,6 +377,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 		var lastOutboxStatus, lastOutboxError sql.NullString
 		if err := rows.Scan(
 			&item.Device,
+			&item.AccountGeneration,
 			&deviceWxID,
 			&deviceNickname,
 			&wechatNickname,
@@ -461,7 +463,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 
 func (s *Store) ListModuleContacts(ctx context.Context, filter bridge.ModuleContactFilter) ([]bridge.ModuleContactView, error) {
 	query, args := listModuleContactsQuery(filter)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.executor(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

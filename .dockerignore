@@ -20,3 +20,6 @@ web/device/*.tsbuildinfo
 *.log
 *.apk
 *.aab
+
+web/admin/test-results
+web/admin/playwright-report

@@ -82,7 +82,7 @@ func (s *Store) Close() error {
 
 func (s *Store) ApplyMigrations(ctx context.Context) error {
 	for _, statement := range Migrations() {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			return err
 		}
 	}
@@ -132,7 +132,7 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 }
 
 func (s *Store) ensureDeviceWeChatNicknameColumn(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `ALTER TABLE bridge_devices ADD COLUMN wechat_nickname VARCHAR(255) NULL AFTER nickname`)
+	_, err := s.executor(ctx).ExecContext(ctx, `ALTER TABLE bridge_devices ADD COLUMN wechat_nickname VARCHAR(255) NULL AFTER nickname`)
 	if err == nil || strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return nil
 	}
@@ -153,7 +153,7 @@ var messageEventChatIDIndexStatements = []string{
 
 func (s *Store) ensureMessageEventChatIDIndex(ctx context.Context) error {
 	for _, statement := range messageEventChatIDIndexStatements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			lower := strings.ToLower(err.Error())
 			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
 				continue
@@ -165,7 +165,7 @@ func (s *Store) ensureMessageEventChatIDIndex(ctx context.Context) error {
 }
 
 func (s *Store) ensureMessageEventDeviceCursorIndex(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `CREATE INDEX idx_bridge_message_events_device_id ON bridge_message_events (device, id)`)
+	_, err := s.executor(ctx).ExecContext(ctx, `CREATE INDEX idx_bridge_message_events_device_id ON bridge_message_events (device, id)`)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
 		return nil
 	}
@@ -179,7 +179,7 @@ var messageEventModuleStatusIndexStatements = []string{
 
 func (s *Store) ensureMessageEventModuleStatusIndexes(ctx context.Context) error {
 	for _, statement := range messageEventModuleStatusIndexStatements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
 				continue
 			}
@@ -207,7 +207,7 @@ func (s *Store) ensureMessageEventMediaColumns(ctx context.Context) error {
 		`ALTER TABLE bridge_message_events ADD COLUMN media_size BIGINT NULL AFTER media_url`,
 	}
 	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 				continue
 			}
@@ -223,7 +223,7 @@ func (s *Store) ensureMessageEventOwnerColumns(ctx context.Context) error {
 		`CREATE INDEX idx_bridge_message_events_owner_time ON bridge_message_events (device, owner_wxid, id)`,
 	}
 	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			lower := strings.ToLower(err.Error())
 			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
 				continue
@@ -242,7 +242,7 @@ func (s *Store) ensureMessageEventEventKey(ctx context.Context) error {
 		`CREATE UNIQUE INDEX uniq_bridge_message_events_event_key ON bridge_message_events (event_key)`,
 	}
 	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			lower := strings.ToLower(err.Error())
 			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
 				continue
@@ -254,7 +254,7 @@ func (s *Store) ensureMessageEventEventKey(ctx context.Context) error {
 }
 
 func (s *Store) backfillMessageEventOwnerWxID(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, messageEventOwnerBackfillStatement)
+	_, err := s.executor(ctx).ExecContext(ctx, messageEventOwnerBackfillStatement)
 	return err
 }
 
@@ -264,7 +264,7 @@ func (s *Store) ensureOutboxOwnerColumns(ctx context.Context) error {
 		`CREATE INDEX idx_bridge_module_outbox_owner_status ON bridge_module_outbox (device, owner_wxid, status, id)`,
 	}
 	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			lower := strings.ToLower(err.Error())
 			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
 				continue
@@ -288,7 +288,7 @@ func (s *Store) ensureModuleContactOwnerKey(ctx context.Context) error {
 		`CREATE INDEX idx_bridge_module_contacts_owner_deleted ON bridge_module_contacts (device, owner_wxid, is_deleted, updated_at)`,
 	}
 	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			lower := strings.ToLower(err.Error())
 			if strings.Contains(lower, "can't drop") ||
 				strings.Contains(lower, "check that column/key exists") ||
@@ -302,7 +302,7 @@ func (s *Store) ensureModuleContactOwnerKey(ctx context.Context) error {
 }
 
 func (s *Store) ensureAPIKeyEnabledColumn(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `ALTER TABLE bridge_api_keys ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT TRUE AFTER nickname`)
+	_, err := s.executor(ctx).ExecContext(ctx, `ALTER TABLE bridge_api_keys ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT TRUE AFTER nickname`)
 	if err == nil {
 		return nil
 	}
@@ -321,7 +321,7 @@ func (s *Store) ensureAPIKeyCredentialColumns(ctx context.Context) error {
 		`CREATE UNIQUE INDEX uniq_bridge_api_keys_credential_id ON bridge_api_keys (credential_id)`,
 	}
 	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			lower := strings.ToLower(err.Error())
 			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "duplicate key name") {
 				continue
@@ -333,7 +333,7 @@ func (s *Store) ensureAPIKeyCredentialColumns(ctx context.Context) error {
 }
 
 func (s *Store) ensureDeviceSessionLeaseTable(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS bridge_device_session_lease (
+	_, err := s.executor(ctx).ExecContext(ctx, `CREATE TABLE IF NOT EXISTS bridge_device_session_lease (
 		device VARCHAR(128) NOT NULL,
 		owner_wxid VARCHAR(191) NOT NULL,
 		holder_id VARCHAR(191) NOT NULL,
@@ -352,7 +352,7 @@ func (s *Store) ensureRetentionIndexes(ctx context.Context) error {
 		`CREATE INDEX idx_bridge_module_outbox_retention ON bridge_module_outbox (status, updated_at)`,
 	}
 	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.executor(ctx).ExecContext(ctx, statement); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
 				continue
 			}
@@ -363,7 +363,7 @@ func (s *Store) ensureRetentionIndexes(ctx context.Context) error {
 }
 
 func Migrations() []string {
-	return []string{
+	return append(append([]string{
 		`CREATE TABLE IF NOT EXISTS bridge_api_keys (
 			code VARCHAR(128) NOT NULL PRIMARY KEY,
 			credential_id VARCHAR(64) NOT NULL,
@@ -485,7 +485,7 @@ func Migrations() []string {
 			PRIMARY KEY (device, owner_wxid),
 			KEY idx_bridge_device_session_lease_until (lease_until)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-	}
+	}, accountSessionMigrations...), moduleDiagnosticMigrations...)
 }
 
 type RetentionCleanup struct {
@@ -567,13 +567,13 @@ func purgeBatches(ctx context.Context, execer retentionExecer, query string, bat
 
 func (s *Store) DatabaseSizeBytes(ctx context.Context) (int64, error) {
 	var size int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(data_length + index_length), 0)
+	err := s.executor(ctx).QueryRowContext(ctx, `SELECT COALESCE(SUM(data_length + index_length), 0)
 		FROM information_schema.tables WHERE table_schema = DATABASE()`).Scan(&size)
 	return size, err
 }
 
 func (s *Store) SeedFromConfig(ctx context.Context, cfg config.Config) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.executor(ctx).BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -608,17 +608,17 @@ func (s *Store) LoadSnapshot(ctx context.Context) (Snapshot, error) {
 }
 
 func (s *Store) UpsertAPIKey(ctx context.Context, key config.APIKey) error {
-	return upsertAPIKey(ctx, s.db, key)
+	return upsertAPIKey(ctx, s.executor(ctx), key)
 }
 
 func (s *Store) UpsertDevice(ctx context.Context, device config.Device) error {
-	return upsertDevice(ctx, s.db, device)
+	return upsertDevice(ctx, s.executor(ctx), device)
 }
 
 func (s *Store) UpdateDeviceIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error {
 	deviceName = strings.TrimSpace(deviceName)
 	nickname = firstNonEmpty(strings.TrimSpace(nickname), deviceName)
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.executor(ctx).ExecContext(ctx, `
 		INSERT INTO bridge_devices (name, wxid, nickname, wechat_nickname, timeout_ms)
 		VALUES (?, ?, ?, NULL, 5000)
 		ON DUPLICATE KEY UPDATE
@@ -635,7 +635,7 @@ func (s *Store) UpdateDeviceWeChatIdentity(ctx context.Context, deviceName strin
 	if deviceName == "" {
 		return errors.New("device name is required")
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.executor(ctx).ExecContext(ctx, `
 		INSERT INTO bridge_devices (name, wxid, nickname, wechat_nickname, timeout_ms)
 		VALUES (?, ?, ?, ?, 5000)
 		ON DUPLICATE KEY UPDATE
@@ -650,7 +650,7 @@ func (s *Store) UpdateDeviceWeChatIdentity(ctx context.Context, deviceName strin
 }
 
 func (s *Store) LookupAPIKey(ctx context.Context, code string) (config.APIKey, bool, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.executor(ctx).QueryRowContext(ctx, `
 		SELECT code, credential_id, auth_version, device, nickname, enabled
 		FROM bridge_api_keys
 		WHERE code = ?`, strings.TrimSpace(code))
@@ -658,7 +658,7 @@ func (s *Store) LookupAPIKey(ctx context.Context, code string) (config.APIKey, b
 }
 
 func (s *Store) LookupAPIKeyByCredentialRef(ctx context.Context, credentialRef string) (config.APIKey, bool, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.executor(ctx).QueryRowContext(ctx, `
 		SELECT code, credential_id, auth_version, device, nickname, enabled
 		FROM bridge_api_keys
 		WHERE credential_id = ?`, strings.TrimSpace(credentialRef))
@@ -682,7 +682,7 @@ func scanAPIKey(row interface{ Scan(...any) error }) (config.APIKey, bool, error
 }
 
 func (s *Store) LookupDevice(ctx context.Context, name string) (config.Device, bool, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.executor(ctx).QueryRowContext(ctx, `
 		SELECT name, wxid, nickname, wechat_nickname, timeout_ms
 		FROM bridge_devices
 		WHERE name = ?`, strings.TrimSpace(name))
@@ -704,7 +704,7 @@ func (s *Store) ClaimModuleSession(ctx context.Context, lease bridge.ModuleSessi
 	if err := validateModuleSessionLease(lease); err != nil {
 		return false, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.executor(ctx).BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
@@ -750,7 +750,7 @@ func (s *Store) RenewModuleSession(ctx context.Context, lease bridge.ModuleSessi
 	if err := validateModuleSessionLease(lease); err != nil {
 		return false, err
 	}
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.executor(ctx).ExecContext(ctx, `
 		UPDATE bridge_device_session_lease
 		SET lease_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)
 		WHERE device = ? AND owner_wxid = ? AND holder_id = ? AND lease_token = ?
@@ -767,7 +767,7 @@ func (s *Store) ReleaseModuleSession(ctx context.Context, lease bridge.ModuleSes
 	if err := validateModuleSessionLease(lease); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.executor(ctx).ExecContext(ctx, `
 		DELETE FROM bridge_device_session_lease
 		WHERE device = ? AND owner_wxid = ? AND holder_id = ? AND lease_token = ?`,
 		lease.Device, lease.OwnerWxID, lease.HolderID, lease.Token)
@@ -797,7 +797,7 @@ func (s *Store) LookupDeviceByWxID(ctx context.Context, wxid string) (config.Dev
 	if wxid == "" {
 		return config.Device{}, false, nil
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.executor(ctx).QueryRowContext(ctx, `
 		SELECT d.name, d.wxid, d.nickname, d.wechat_nickname, d.timeout_ms
 		FROM bridge_devices d
 		WHERE d.wxid = ?
@@ -844,7 +844,7 @@ func (s *Store) RecordOutboundEvent(ctx context.Context, event bridge.MessageEve
 func (s *Store) RecordModuleActivity(ctx context.Context, activity bridge.ModuleActivity) error {
 	switch strings.TrimSpace(activity.Kind) {
 	case "register":
-		_, err := s.db.ExecContext(ctx, `
+		_, err := s.executor(ctx).ExecContext(ctx, `
 			INSERT INTO bridge_module_runtime (
 				device, wxid, api_key, last_register_at, last_error
 			) VALUES (?, ?, ?, CURRENT_TIMESTAMP, NULL)
@@ -859,7 +859,7 @@ func (s *Store) RecordModuleActivity(ctx context.Context, activity bridge.Module
 		)
 		return err
 	case "poll":
-		_, err := s.db.ExecContext(ctx, `
+		_, err := s.executor(ctx).ExecContext(ctx, `
 			INSERT INTO bridge_module_runtime (
 				device, wxid, last_poll_at, last_poll_limit, last_poll_item_count
 			) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)
@@ -875,7 +875,7 @@ func (s *Store) RecordModuleActivity(ctx context.Context, activity bridge.Module
 		)
 		return err
 	case "ack":
-		_, err := s.db.ExecContext(ctx, `
+		_, err := s.executor(ctx).ExecContext(ctx, `
 			INSERT INTO bridge_module_runtime (
 				device, last_ack_at, last_ack_sent_count, last_ack_failed_count, last_error
 			) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)
@@ -1011,7 +1011,7 @@ func recordModuleContacts(ctx context.Context, execer moduleContactExecer, snaps
 }
 
 func (s *Store) RecordModuleContacts(ctx context.Context, snapshot bridge.ModuleContactSnapshotRequest) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.executor(ctx).BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -1031,7 +1031,7 @@ const (
 )
 
 func (s *Store) EnqueueReply(ctx context.Context, action bridge.ReplyAction) (bridge.ModuleOutboxItem, error) {
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.executor(ctx).ExecContext(ctx, `
 		INSERT INTO bridge_module_outbox (device, owner_wxid, wxid, text, chat_record_id, status)
 		VALUES (?, ?, ?, ?, ?, 'pending')`,
 		strings.TrimSpace(action.Device),
@@ -1067,7 +1067,7 @@ func (s *Store) ModuleOnline(ctx context.Context, device string, ownerWxID strin
 		return false, nil
 	}
 	var online bool
-	err := s.db.QueryRowContext(ctx, moduleOnlineStatement, device, ownerWxID, leaseMicroseconds(offlineAfter)).Scan(&online)
+	err := s.executor(ctx).QueryRowContext(ctx, moduleOnlineStatement, device, ownerWxID, leaseMicroseconds(offlineAfter)).Scan(&online)
 	return online, err
 }
 
@@ -1169,7 +1169,7 @@ const cancelOfflineOutboxStatement = `
 
 func (s *Store) PollReplyActions(ctx context.Context, req bridge.ModulePollRequest) ([]bridge.ModuleOutboxItem, error) {
 	limit := normalizeLimit(req.Limit)
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.executor(ctx).BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1239,7 +1239,7 @@ const ackOutboxItemStatement = `
 func (s *Store) AckReplyActions(ctx context.Context, req bridge.ModuleAckRequest) ([]bridge.ModuleOutboxItem, error) {
 	ids := make([]int64, 0, len(req.Items))
 	for _, item := range req.Items {
-		result, err := s.db.ExecContext(ctx, ackOutboxItemStatement,
+		result, err := s.executor(ctx).ExecContext(ctx, ackOutboxItemStatement,
 			item.Status,
 			nullString(item.Error),
 			nullInt64(item.ChatRecordID),
@@ -1266,7 +1266,7 @@ func (s *Store) AckReplyActions(ctx context.Context, req bridge.ModuleAckRequest
 }
 
 func (s *Store) findOutboxItem(ctx context.Context, id int64) (bridge.ModuleOutboxItem, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.executor(ctx).QueryContext(ctx, `
 		SELECT id, device, owner_wxid, wxid, text, chat_record_id, status, attempt_count, last_error, created_at, updated_at
 		FROM bridge_module_outbox
 		WHERE id = ?`,
@@ -1306,7 +1306,7 @@ func (s *Store) listOutboxItemsForDevice(ctx context.Context, ids []int64, devic
 		deviceFilter = " AND device = ?"
 		args = append(args, device)
 	}
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+	rows, err := s.executor(ctx).QueryContext(ctx, fmt.Sprintf(`
 		SELECT id, device, owner_wxid, wxid, text, chat_record_id, status, attempt_count, last_error, created_at, updated_at
 		FROM bridge_module_outbox
 		WHERE id IN (%s)
@@ -1345,7 +1345,7 @@ func storedMessageEventKey(event bridge.MessageEvent) string {
 func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEvent) (bridge.MessageEvent, error) {
 	event = event.Normalize()
 	event.EventKey = storedMessageEventKey(event)
-	result, err := s.db.ExecContext(ctx, recordMessageEventStatement,
+	result, err := s.executor(ctx).ExecContext(ctx, recordMessageEventStatement,
 		event.EventKey,
 		nullString(event.ID),
 		nullInt64(event.EventID),
@@ -1378,7 +1378,7 @@ func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEven
 }
 
 func (s *Store) messageEventByID(ctx context.Context, id int64) (bridge.MessageEvent, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.executor(ctx).QueryRowContext(ctx, `
 		SELECT id, event_key, source_id, event_id, chat_record_id, device, owner_wxid,
 			direction, from_wxid, to_wxid, room_id, sender_wxid, text, message_type,
 			media_kind, media_mime, media_name, media_url, media_size, raw_provider, create_time
@@ -1415,7 +1415,7 @@ func upsertAPIKey(ctx context.Context, exec sqlExecutor, key config.APIKey) erro
 
 func (s *Store) DeleteAPIKey(ctx context.Context, code string) error {
 	code = strings.TrimSpace(code)
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.executor(ctx).BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -1443,7 +1443,7 @@ func (s *Store) DeleteAPIKey(ctx context.Context, code string) error {
 
 func (s *Store) SetAPIKeyEnabled(ctx context.Context, code string, enabled bool) error {
 	code = strings.TrimSpace(code)
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.executor(ctx).BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -1514,7 +1514,7 @@ func upsertDevice(ctx context.Context, exec sqlExecutor, device config.Device) e
 }
 
 func (s *Store) loadAPIKeys(ctx context.Context, out map[string]config.APIKey) error {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.executor(ctx).QueryContext(ctx, `
 		SELECT code, credential_id, auth_version, device, nickname, enabled
 		FROM bridge_api_keys`)
 	if err != nil {
@@ -1537,7 +1537,7 @@ func (s *Store) loadAPIKeys(ctx context.Context, out map[string]config.APIKey) e
 }
 
 func (s *Store) loadDevices(ctx context.Context, out map[string]config.Device) error {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.executor(ctx).QueryContext(ctx, `
 		SELECT name, wxid, nickname, wechat_nickname, timeout_ms
 		FROM bridge_devices`)
 	if err != nil {

@@ -1,4 +1,5 @@
-﻿import React from "react";
+import { AccountScope, belongsToAccount } from "./accountScope";
+import React from "react";
 import { createRoot } from "react-dom/client";
 import { formatBeijingClock, formatBeijingDateTime, formatBeijingTimeAgo } from "@/time";
 import {
@@ -110,8 +111,14 @@ function App() {
     [modules, selectedDevice]
   );
   const selectedOwnerWxid = moduleOwnerWxid(selectedModule);
-  const selectedScopeKey = `${selectedDevice}:${selectedOwnerWxid}`;
-  const selectedScopeRef = React.useRef(selectedScopeKey);
+  const selectedGeneration = selectedModule?.account_generation ?? 0;
+  const selectedScopeKey = `${selectedDevice}:${selectedOwnerWxid}:${selectedGeneration}`;
+  const accountScope = React.useRef(new AccountScope());
+  const moduleRequest = React.useRef(0);
+  const deviceRef = React.useRef(selectedDevice);
+  deviceRef.current = selectedDevice;
+  accountScope.current.update(selectedDevice, selectedOwnerWxid, selectedGeneration);
+  accountScope.current.selectChat(selectedWxid);
   const messageListRef = React.useRef<HTMLDivElement>(null);
   const loadedMessageChatRef = React.useRef("");
   const pendingBottomScrollChatRef = React.useRef("");
@@ -121,9 +128,6 @@ function App() {
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
-  React.useEffect(() => {
-    selectedScopeRef.current = selectedScopeKey;
-  }, [selectedScopeKey]);
 
   React.useEffect(() => {
     setDeviceNicknameDraft(selectedModule?.device_nickname || selectedModule?.device || "");
@@ -185,9 +189,7 @@ function App() {
   const leftListCountText = messageListActive ? `${visibleRecentMessages.length} 个会话` : `${visibleContacts.length} 个对象`;
   const leftListTitle = messageListActive ? "消息列表" : "好友列表";
   const leftSearchPlaceholder = messageListActive ? "搜索消息、昵称、备注" : "搜索昵称、备注、别名";
-  const scopeMatches = React.useCallback((device: string, ownerWxid: string) => {
-    return selectedScopeRef.current === `${device}:${ownerWxid || ""}`;
-  }, []);
+
 
   const refreshApiKeys = React.useCallback(async () => {
     if (!adminPassword) {
@@ -205,8 +207,12 @@ function App() {
       setNotice("请输入管理密码");
       return [] as ModuleStatus[];
     }
+    const request = ++moduleRequest.current;
     const payload = await getModules(adminPassword);
+    if (request !== moduleRequest.current) return [] as ModuleStatus[];
     const nextModules = payload.modules || [];
+    const active = nextModules.find((item) => item.device === deviceRef.current) ?? nextModules[0];
+    accountScope.current.update(active?.device ?? "", moduleOwnerWxid(active), active?.account_generation ?? 0);
     setModules(nextModules);
     setSelectedDevice((current) => {
       if (current && nextModules.some((item) => item.device === current)) return current;
@@ -222,6 +228,8 @@ function App() {
         setSelectedWxid("");
         return [] as ModuleContact[];
       }
+      const ticket = accountScope.current.begin("contacts", device, ownerWxid);
+      if (!ticket) return [] as ModuleContact[];
       const payload = await getContacts({
         password: adminPassword,
         device,
@@ -230,10 +238,10 @@ function App() {
         includeDeleted: contactIncludeDeleted,
         limit: CONTACT_SNAPSHOT_LIMIT
       });
-      if (!scopeMatches(device, ownerWxid)) {
+      if (!accountScope.current.matches(ticket)) {
         return [] as ModuleContact[];
       }
-      const nextContacts = payload.contacts || [];
+      const nextContacts = (payload.contacts || []).filter((row) => belongsToAccount(row, device, ownerWxid));
       setContacts(nextContacts);
       setSelectedWxid((current) => {
         if (current && nextContacts.some((item) => item.wxid === current)) return current;
@@ -241,7 +249,7 @@ function App() {
       });
       return nextContacts;
     },
-    [adminPassword, contactIncludeDeleted, contactQuery, scopeMatches, selectedOwnerWxid]
+    [adminPassword, contactIncludeDeleted, contactQuery, selectedOwnerWxid, selectedGeneration]
   );
 
   const refreshMessages = React.useCallback(
@@ -251,6 +259,8 @@ function App() {
         setMessages([]);
         return [] as StoredMessage[];
       }
+      const ticket = accountScope.current.begin("messages", device, ownerWxid, wxid);
+      if (!ticket) return [] as StoredMessage[];
       const contact = contacts.find((item) => item.wxid === wxid);
       const payload = await getMessages({
         password: adminPassword,
@@ -261,15 +271,15 @@ function App() {
         chatKind: chatKindForContact(wxid, contact),
         limit: 180
       });
-      if (!scopeMatches(device, ownerWxid)) {
+      if (!accountScope.current.matches(ticket)) {
         return [] as StoredMessage[];
       }
-      const nextMessages = (payload.messages || []).slice().reverse();
+      const nextMessages = (payload.messages || []).filter((row) => belongsToAccount(row, device, ownerWxid)).reverse();
       loadedMessageChatRef.current = wxid;
       setMessages(nextMessages);
       return nextMessages;
     },
-    [adminPassword, contacts, scopeMatches, selectedOwnerWxid]
+    [adminPassword, contacts, selectedOwnerWxid, selectedGeneration]
   );
 
   const refreshRecentMessages = React.useCallback(
@@ -278,20 +288,22 @@ function App() {
         setRecentMessages([]);
         return [] as StoredMessage[];
       }
+      const ticket = accountScope.current.begin("recent", device, ownerWxid);
+      if (!ticket) return [] as StoredMessage[];
       const payload = await getMessages({
         password: adminPassword,
         device,
         ownerWxid,
         limit: 500
       });
-      if (!scopeMatches(device, ownerWxid)) {
+      if (!accountScope.current.matches(ticket)) {
         return [] as StoredMessage[];
       }
-      const nextMessages = payload.messages || [];
+      const nextMessages = (payload.messages || []).filter((row) => belongsToAccount(row, device, ownerWxid));
       setRecentMessages(nextMessages);
       return nextMessages;
     },
-    [adminPassword, scopeMatches, selectedOwnerWxid]
+    [adminPassword, selectedOwnerWxid, selectedGeneration]
   );
 
   const refreshAll = React.useCallback(async () => {
@@ -304,7 +316,8 @@ function App() {
         ? selectedDevice
         : nextModules[0]?.device || "";
       const ownerWxid = moduleOwnerWxid(nextModules.find((item) => item.device === device));
-      selectedScopeRef.current = `${device}:${ownerWxid}`;
+      const active = nextModules.find((item) => item.device === device);
+      accountScope.current.update(device, ownerWxid, active?.account_generation ?? 0);
       if (device) {
         setSelectedDevice(device);
       }
@@ -327,13 +340,16 @@ function App() {
     }
   }, [adminPassword, refreshApiKeys, refreshContacts, refreshMessages, refreshModules, refreshRecentMessages, selectedDevice, selectedWxid]);
 
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     loadedMessageChatRef.current = "";
     pendingBottomScrollChatRef.current = "";
     setContacts([]);
     setMessages([]);
     setRecentMessages([]);
     setSelectedWxid("");
+    setDraft("");
+    setSendOpen(false);
+    setSending(false);
   }, [selectedScopeKey]);
 
   React.useEffect(() => {
@@ -397,7 +413,7 @@ function App() {
   }, [refreshRecentMessages, selectedDevice, selectedOwnerWxid]);
 
   React.useEffect(() => {
-    if (!autoRefresh || !selectedDevice || !selectedWxid) return;
+    if (!autoRefresh || !selectedDevice) return;
     const timer = window.setInterval(() => {
       void refreshMessages(selectedDevice, selectedWxid, selectedOwnerWxid).catch(() => undefined);
       void refreshRecentMessages(selectedDevice, selectedOwnerWxid).catch(() => undefined);
@@ -420,6 +436,7 @@ function App() {
         const payload = parseLiveMessageEvent((event as globalThis.MessageEvent).data);
         if (payload.device !== selectedDevice) return;
         void refreshModules().catch(() => undefined);
+        if (!belongsToAccount(payload, selectedDevice, selectedOwnerWxid)) return;
         if (payload.raw_provider === RAW_PROVIDER_MODULE_ACK) return;
         void refreshContacts(selectedDevice, selectedOwnerWxid).catch(() => undefined);
         void refreshRecentMessages(selectedDevice, selectedOwnerWxid).catch(() => undefined);
@@ -442,7 +459,8 @@ function App() {
 
   const selectDevice = (device: string) => {
     const nextOwnerWxid = moduleOwnerWxid(modules.find((item) => item.device === device));
-    selectedScopeRef.current = `${device}:${nextOwnerWxid}`;
+    const active = modules.find((item) => item.device === device);
+    accountScope.current.update(device, nextOwnerWxid, active?.account_generation ?? 0);
     setSelectedDevice(device);
     setContacts([]);
     setMessages([]);
@@ -454,6 +472,10 @@ function App() {
 
   const selectChat = (wxid: string) => {
     pendingBottomScrollChatRef.current = wxid;
+    accountScope.current.selectChat(wxid);
+    setSending(false);
+    setDraft("");
+    setSendOpen(false);
     setSelectedWxid(wxid);
     if (selectedWxid === wxid && loadedMessageChatRef.current === wxid) {
       window.requestAnimationFrame(() => {
@@ -500,6 +522,8 @@ function App() {
 	  if (selectedModuleOffline) setNotice("当前微信离线，不能创建发送任务");
 	  return;
 	}
+    const ticket = accountScope.current.begin("send", selectedDevice, selectedOwnerWxid);
+    if (!ticket) return;
     setSending(true);
     setNotice("正在加入发送队列");
     try {
@@ -509,21 +533,24 @@ function App() {
         password: adminPassword,
         device: sentDevice,
         ownerWxid: selectedOwnerWxid,
+        accountGeneration: selectedGeneration,
         wxid: sentWxid,
         text: draft.trim()
       });
+      if (!accountScope.current.matches(ticket)) return;
       setDraft("");
       setSendOpen(false);
       setNotice("消息已加入模块发送队列");
       void refreshModules().catch(() => undefined);
       window.setTimeout(() => {
+        if (!accountScope.current.matches(ticket)) return;
         void refreshMessages(sentDevice, sentWxid, selectedOwnerWxid).catch(() => undefined);
         void refreshModules().catch(() => undefined);
       }, 800);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "发送失败");
+      if (accountScope.current.matches(ticket)) setNotice(error instanceof Error ? error.message : "发送失败");
     } finally {
-      setSending(false);
+      if (accountScope.current.matches(ticket)) setSending(false);
     }
   };
 
@@ -825,7 +852,7 @@ function App() {
                   ) : (
                     visibleContacts.map((item) => (
                       <button
-                        key={`${item.device}:${item.wxid}`}
+                        key={`${item.device}:${item.owner_wxid}:${item.wxid}`}
                         className={
                           item.wxid === selectedWxid
                             ? "w-full rounded-lg border border-primary bg-secondary p-3 text-left shadow-sm"

@@ -12,7 +12,8 @@
 - 版本一换，发送链路静默失效（观测还能用，回复发不出去）；
 - 现有代码在 `findClass` 失败时静默 fallback，线上只能靠 adb 抓 logcat 排查。
 
-实测（`tools/wechat_hook_probe.py`，8.0.74 用的是从手机导出的官方包）：
+历史探针结果（0.1.6；其中 identity 只检索 SQL 字符串，未验证当前登录归属；
+0.1.7 身份校验以第 9 节为准）：
 
 | 微信版本 | versionCode | observation | identity | 可用发送路径 | bootstrap | 结论 |
 |---|---|---|---|---|---|---|
@@ -22,7 +23,7 @@
 
 判定规则（已与真机行为交叉验证）：
 
-1. `observation` / `identity` 用非混淆名，缺失即致命；
+1. `observation` 检查 WCDB；0.1.7 的 `identity` 校验当前内核与 ConfigStorage 方法；
 2. **`bootstrap` 是真正的门控**：`HookEntry.isWeChatReadyForSend()` 必须先解析
    `fs.g` 注册表槽位与 `i95.n0` 内核标志，否则直接跳过 outbox 投递，表现就是
    "能收不能发"。8.0.76 / 8.0.78 正好缺 `i95.n0`、`i95.y`；
@@ -49,7 +50,7 @@
 ```
 HookEntry（与版本无关的稳定核心）
   · 观测 hook：WCDB insertWithOnConflict / sActiveDatabases      ← 非混淆名，天然稳定
-  · 身份识别：userinfo id=2/42 + looksLikeAccountId              ← 非混淆名
+  · 身份识别：当前内核的 ConfigStorage key=2 / nickname key=4    ← 需要版本绑定
   · outbox 轮询 / ack                                            ← HTTP，与微信无关
   · 发送：只调用 SendAdapter 接口，具体 binding 由解析层给出
             │
@@ -69,14 +70,9 @@ HookEntry（与版本无关的稳定核心）
   "wechat": { "versionName": "8.0.74", "versionCode": "3120" },
   "dexHash": "sha256:...",
   "identity": {
-    "idQueries": [
-      "SELECT value FROM userinfo WHERE id=2 LIMIT 1",
-      "SELECT value FROM userinfo WHERE id=42 LIMIT 1"
-    ],
-    "nicknameQueries": [
-      "SELECT value FROM userinfo WHERE id=4 LIMIT 1",
-      "SELECT value FROM userinfo WHERE id=5 LIMIT 1"
-    ]
+    "source": "current_kernel_config",
+    "usernameKey": 2,
+    "nicknameKey": 4
   },
   "send": {
     "preferred": "builder",
@@ -169,7 +165,7 @@ python tools/wechat_hook_probe.py --from-device --profile \
 
 ## 5. 兼容老版本的保证
 
-1. 观测/身份/outbox 不依赖混淆名，保持单一实现、零分支；
+1. 观测/outbox 使用公共接口；身份采用已核验的当前内核绑定，未知版本等待适配；
 2. 发送仍是"多路径依次尝试"，新版本加路径即可，老路径不删除；
 3. CI 回归：`tools/wechat_hook_probe.py <apk>` 对每个受支持版本断言
    observation / identity / bootstrap 全绿（实测 20s/包），退出码非 0 即失败。
@@ -228,73 +224,85 @@ capability report: wechat=8.0.78/3180 observation=ok identity=ok
 
 版本适配按第 4 节的"插 USB 四步走"人工完成，工具负责定位差别。
 
-## 9. 控制台"全是未收录"的根因与处置（0.1.6）
+## 9. 当前账号隔离与“未收录”修复（0.1.7）
 
-### 症状与判据
+“未收录”表示按 `device + owner_wxid` 查询的有效联系人中找不到会话对端。
+原因可能是 owner 错配、快照停更、联系人已删除或确实未收录；仅看在线 `ready`
+状态或按设备联表，不足以判断联系人同步成功。
 
-微信看台（`/device` PWA）里某个设备的会话全部显示 **未收录好友 / 未收录群聊**。
+### 61538E 的核实结论
 
-`device-assets/index-*.js` 的渲染逻辑是：
+0.1.6 以联系人数量和 API Key 保存的旧身份挑库。旧登录数据库仍打开时，
+它可能胜出；跨库补读群聊还会让空库看起来有联系人。目录哈希、消息编号连续、
+通讯录重合均不足以证明当前登录账号。用户报告当前账号可能为“雨雨”，
+服务器有两个不同 wxid 同名，现有旧通讯录则指向“兰兰”。
 
-```js
-As(target, contact) = contact ? 昵称 : (target.endsWith("@chatroom") ? "未收录群聊" : "未收录好友")
+此前合并将 180 行联系人去重为 91 行，并重写了 12 条旧消息 owner。
+35 条备份消息的其他字段保持原样。实际有效联系人接口仅匹配 4 个会话中的 2 个；
+已删除联系人被排除，所以此前“3/4 已恢复”的结论不成立。
+
+### 当前内核读取
+
+| 微信版本 | 当前 core storage | 主库路径 | ConfigStorage | getter |
+| --- | --- | --- | --- | --- |
+| 8.0.74 | `gm0.j1.u() -> gm0.b0` | `g()` | `c() -> storage.n3` | `l(int,Object)` |
+| 8.0.78 | `gp0.j1.x() -> gp0.b0` | `g()` | `c() -> storage.q3` | `m(int,Object)` |
+
+主线程读取 key 2 的正式账号 ID、key 4 的昵称和 `g()` 返回的主库路径。
+`g()` 经 `h()` 调用内核账号初始化检查；8.0.78 配置可由 MMKV 承载，
+直接查 SQL `userinfo` 不是可靠身份来源。key 42 是可变别名，不作为 owner 回退。
+ID 缺失、读取中账号改变或版本绑定缺失时，等待重试。
+
+`RuntimeAccount` 持有当前账号目录、库句柄、消息游标、重放额度和同步时间。
+只探测同一规范化目录内的 `rcontact` / `message`；联系人及群聊可补读同目录分库。
+媒体读取也限定在该目录。旧目录数据量更大不会改变选择。
+切号后新建上下文；上报、注册和主线程发送前重新核验账号，旧 outbox 任务失败退出。
+注册与上报串行，避免并发注册改变服务端推断的 owner。
+仅主进程运行采集和注册；插入钩子复制数据后异步处理，避免占着数据库锁等待主线程。
+
+零联系人或查询失败时保留服务端旧快照并重试。观察链路独立于发送适配 readiness。
+新账号轮询游标初始化到其当前最大消息 ID；插入钩子上传不推进有序轮询游标，
+以免跳过较早失败的上报。首轮游标初始化前的窗口仍需手机联调验证。
+
+### 校验与上线顺序
+
+```powershell
+# 校验当前账号绑定的方法定义、返回类型和账号目录检查
+python tools/wechat_account_probe.py path/to/weixin.apk
+# 综合探针也调用当前账号校验（需要 androguard）
+python tools/wechat_hook_probe.py path/to/weixin.apk
 ```
 
-而取数与联系人都是按 owner 过滤的：
+1. 停用 61538E 旧模块，在批准执行的恢复窗口按下面的工具预检并还原备份范围内数据。
+2. 先部署支持持久化账号会话的服务端，再安装 `0.1.8-account-sessions`（versionCode 9）调试包，按现有 Vector/LSPosed 流程确认模块加载。详见 [账号会话隔离与升级顺序](account-session-isolation.md)。
+3. 登录目标账号，核对日志 `current WeChat account wxid=... nickname=... path=...`，
+   并确认对应 owner 出现新的 `contact sync uploaded`。这一步自动识别 wxid，避免凭昵称猜。
+4. 切换两个账号验证联系人、消息与发送隔离；发送测试需用户授权。
+5. 新的账号映射另行依据手机证据处理。
 
-```
-/api/messages?device=<D>&owner_wxid=<O>
-/api/module-contacts?device=<D>&owner_wxid=<O>
-```
+8.0.74 / 8.0.78 的方法形状已校验；8.0.76 尚未添加当前账号绑定。
+APK 形状校验和 JVM 测试不代替手机运行验证，也不证明全部发送路径可用。
 
-所以只要"消息的 owner"与"联系人的 owner"不是同一个值，联系人集合为空 → 每条会话都未收录。
+### 备份范围内的历史恢复
 
-### 判据 SQL
+`tools/restore_61538e_owner_merge.py` 默认只读，固定处理此次 61538E 事故。
+连接配置来自 `OBS_DB_HOST/USER/PASSWORD/NAME`（可选 `OBS_DB_PORT`）。
+会话时区设为 `+08:00`，与事故记录一致。
 
-```sql
-SELECT e.peer, COUNT(*) msgs,
-       MAX(CASE WHEN c.wxid IS NULL THEN 0 ELSE 1 END) in_contacts,
-       MAX(CASE WHEN c.owner_wxid = e.owner_wxid THEN 1 ELSE 0 END) owner_match
-FROM (SELECT COALESCE(chat_id, room_id, IF(direction='sent', to_wxid, from_wxid)) peer, owner_wxid
-      FROM bridge_message_events WHERE device='<D>') e
-LEFT JOIN bridge_module_contacts c ON c.device='<D>' AND c.wxid = e.peer
-GROUP BY e.peer;
-```
+预检必须逐列匹配 03:06:02 合并结果：91 行保留联系人、35 条备份消息。
+任何新增联系人快照、内容变动、缺失或 ID 冲突都会使执行停止。
+恢复后保留原始两个 owner 的 180 行联系人及删除标志；12 条旧消息还原 owner；
+备份之后的新消息保持原样。恢复原始 hash 分区不等于确认 hash 对应哪个真实账号。
 
-`in_contacts=0` 占多数即命中此问题。
-
-### 模块侧根因（0.1.5 及更早）
-
-`findContactDatabase()` 先挑"有身份"的库并**立即返回**，而 `readWeChatIdentity()` 有
-账号目录哈希兜底，于是**每个** `MicroMsg/<hash>/EnMicroMsg.db` 看起来都"有身份"：
-扫描到的第一个库被锁定，即使它 `readContacts()` 返回 0。表现为：
-
-- 身份 = 该目录哈希（`acct_<hash>`），且随微信重启/账号目录增减而漂移；
-- 联系人快照每轮 `contact sync skipped: no friend contacts read`，永久停在旧批次；
-- 同一个登录的联系人与消息落在不同 owner 上 → 看台未收录。
-
-### 0.1.6 的修复
-
-1. 扫描时对每个候选库同时取"身份 + 可读联系人数"，按
-   `已绑定/已固定身份且有联系人 > 有真实身份且有联系人 > 联系人数最多 > 其它` 打分选择，
-   **不再选读不出联系人的库**；
-2. 选择结果按 `api_key` 固定到 `wechat_observatory_state`（微信私有 prefs），跨重启不再漂移；
-3. 连续 2 次读不出联系人 → 丢弃缓存库句柄强制重扫；
-4. 身份变化时立即重传联系人快照（旧快照在新 owner 下永远匹配不上）。
-
-### 服务端兜底（历史数据）
-
-模块固定身份后，仍可能有历史行散落在旧 owner 下，按 wxid 去重合并到一个 owner 即可：
-
-```sql
--- 备份
-CREATE TABLE bak_<D>_contacts AS SELECT * FROM bridge_module_contacts WHERE device='<D>';
-CREATE TABLE bak_<D>_events   AS SELECT * FROM bridge_message_events WHERE device='<D>';
--- 联系人：按 wxid 保留 last_seen_at 最新的一行（唯一索引是 device+owner_wxid+wxid）
-DELETE FROM bridge_module_contacts WHERE device='<D>' AND id NOT IN (<每个 wxid 最新行 id>);
-UPDATE bridge_module_contacts SET owner_wxid='<O>' WHERE device='<D>';
-UPDATE bridge_message_events SET owner_wxid='<O>' WHERE device='<D>' AND owner_wxid<>'<O>';
+```bash
+# 先停用旧模块，避免恢复后再次写入错误快照；默认 dry-run
+python tools/restore_61538e_owner_merge.py
+# 经审阅后，在同一连接配置下执行；指纹来自本次预览，备份文件须为新路径
+python tools/restore_61538e_owner_merge.py --apply \
+  --expected-plan REVIEWED_SHA256 --recovery-backup NEW_RECOVERY_BACKUP.json
 ```
 
-注意：多账号手机（如 61538A 同时有两个 `wxid_*` owner）是**合法**的，不要在服务端做
-"每设备只留一个 owner"的自动合并，否则会把两个真实账号压成一个。
+Apply 使用 InnoDB 事务和行锁，在第一次写入前落盘并 fsync 新备份；失败整体回滚。
+新消息增加不会改变预览指纹；目标旧记录变化会使指纹或前置条件失败。
+已完整恢复的状态会返回 no-op。工具没有按设备全量统一 owner 的操作。
+若新模块已刷新联系人导致预检失败，应重新审阅快照，不应跳过校验强行恢复。

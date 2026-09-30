@@ -16,6 +16,7 @@ import java.util.Map;
 import cc.wechat.observatory.gateway.GatewayEndpoint;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.util.Strings;
+import cc.wechat.observatory.wechat.RuntimeAccount;
 import de.robv.android.xposed.XSharedPreferences;
 
 public final class BridgeConfig {
@@ -36,6 +37,8 @@ public final class BridgeConfig {
     public String selfWxid;
     public String apiKey;
     public String nickname;
+    /** Filled only from the current WeChat kernel, never from saved operator settings. */
+    public RuntimeAccount runtimeAccount;
     public long pollIntervalMs;
     public int pollLimit;
     public boolean outboxWebSocketEnabled;

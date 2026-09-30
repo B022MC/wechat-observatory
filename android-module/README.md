@@ -96,9 +96,11 @@ when it is explicitly configured. WebSocket is disabled by default so account
 switches stay bound to the latest wxid; enabling it is available through
 `outbox_websocket_enabled=1`, and failures still fall back to HTTP polling.
 
-`poll_interval_ms` controls how often the module checks the gateway outbox.
-The worker currently sleeps at least 1000ms between polls, so values below
-1000 do not make sends faster.
+`poll_interval_ms` controls how often the module checks an empty gateway outbox.
+The worker sleeps at least 1000ms after an empty poll or an error, so values
+below 1000 do not make idle polling faster. After a task is sent and ACKed,
+the worker immediately checks for the next task without a fixed extra sleep;
+delivery remains serial because WeChat can reject consecutive queue submissions.
 
 On Android builds where the WeChat process cannot resolve the module config
 provider, the module log can show `read config from provider returned null

@@ -80,6 +80,7 @@ func main() {
 	if store != nil {
 		go startHistoryRetention(ctx, store, cfg.RetentionDays, cfg.RetentionPoll)
 		go startOfflineOutboxCancellation(ctx, store, cfg.ModuleOfflineAfter, cfg.OfflineOutboxSweep)
+		go startDiagnosticRetention(ctx, store, moduleDiagnosticRetentionDays, time.Hour)
 	}
 
 	errs := make(chan error, 1)
@@ -152,6 +153,35 @@ func startOfflineOutboxCancellation(ctx context.Context, store offlineOutboxStor
 			log.Printf("offline outbox cancellation failed: %v", err)
 		} else if cancelled > 0 {
 			log.Printf("offline outbox cancellation complete: cancelled=%d", cancelled)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+const moduleDiagnosticRetentionDays = 7
+
+type diagnosticRetentionStore interface {
+	PurgeExpiredModuleDiagnostics(context.Context, int) (int64, error)
+}
+
+func startDiagnosticRetention(ctx context.Context, store diagnosticRetentionStore, retentionDays int, interval time.Duration) {
+	if store == nil || retentionDays <= 0 || interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		cleanupCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		deleted, err := store.PurgeExpiredModuleDiagnostics(cleanupCtx, retentionDays)
+		cancel()
+		if err != nil {
+			log.Printf("module diagnostic cleanup failed: %v", err)
+		} else if deleted > 0 {
+			log.Printf("module diagnostic cleanup complete: deleted=%d", deleted)
 		}
 		select {
 		case <-ctx.Done():

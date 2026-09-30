@@ -7,6 +7,8 @@ public final class MessagePayload {
     public long eventId;
     public long chatRecordId;
     public String apiKey;
+    public String ownerWxid;
+    public String accountSession;
     public String device;
     public String chatId;
     public String chatKind;
@@ -30,6 +32,8 @@ public final class MessagePayload {
                 + "\"event_id\":" + eventId + ","
                 + "\"chat_record_id\":" + chatRecordId + ","
                 + "\"api_key\":\"" + Strings.json(apiKey) + "\","
+                + "\"owner_wxid\":\"" + Strings.json(ownerWxid) + "\","
+                + "\"account_session\":\"" + Strings.json(accountSession) + "\","
                 + "\"device\":\"" + Strings.json(device) + "\","
                 + "\"chat_id\":\"" + Strings.json(chatId) + "\","
                 + "\"chat_kind\":\"" + Strings.json(chatKind) + "\","

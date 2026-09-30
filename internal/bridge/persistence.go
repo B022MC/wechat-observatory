@@ -216,6 +216,7 @@ type ModuleContactView struct {
 }
 
 type ModuleStatusView struct {
+	AccountGeneration  int64  `json:"account_generation"`
 	Device             string `json:"device"`
 	DeviceWxID         string `json:"device_wxid,omitempty"`
 	DeviceNickname     string `json:"device_nickname,omitempty"`

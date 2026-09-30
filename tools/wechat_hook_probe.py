@@ -49,8 +49,6 @@ STABLE = [
      "message table insert hook"),
     ("observation", "class", "com.tencent.wcdb.support.CancellationSignal",
      "rawQuery overload signature"),
-    ("identity", "sql", "SELECT value FROM userinfo",
-     "current account row query"),
     ("send", "class", "com.tencent.mm.modelbase.z2",
      "NetScene queue entry point"),
     ("send", "class", "com.tencent.mm.modelbase.m1",
@@ -118,7 +116,6 @@ OBSERVATION_TOKENS = [
     "insertWithOnConflict",
     "com.tencent.wcdb.support.CancellationSignal",
 ]
-IDENTITY_TOKENS = ["SELECT value FROM userinfo"]
 SEND_PATHS = [
     ("builder", ["w11.s1", "w11.r1", "w11.n1"]),
     ("netscene", ["w11.r0", "com.tencent.mm.modelbase.z2", "com.tencent.mm.modelbase.m1"]),
@@ -395,6 +392,11 @@ def probe(apk: Path, source: Path | None, want_shapes: bool) -> dict:
         "dexHash": dex_digest(blobs),
         "hooks": rows + extra,
     }
+    try:
+        from wechat_account_probe import probe_account
+        result["accountIdentity"] = probe_account(apk)
+    except ImportError:
+        result["accountIdentity"] = {"identity": "unverified", "reason": "Install androguard for binding verification"}
     if want_shapes:
         result["shapeCandidates"] = shape_scan(apk)
     return result
@@ -414,7 +416,7 @@ def summarize(result: dict) -> dict[str, str]:
 
     observation/identity/bootstrap gate the module:
 
-    * observation and identity use non-obfuscated names, so a miss is fatal;
+    * observation checks WCDB; identity checks the current-kernel method definitions;
     * bootstrap gates the send stack - HookEntry.isWeChatReadyForSend() refuses
       to poll the outbox unless the fs.g registry slot and the i95.n0 kernel flag
       resolve, which is what actually breaks the module on new WeChat builds;
@@ -429,7 +431,7 @@ def summarize(result: dict) -> dict[str, str]:
     """
     present = present_map(result)
     observation = "ok" if all(present.get(t) for t in OBSERVATION_TOKENS) else "broken"
-    identity = "ok" if all(present.get(t) for t in IDENTITY_TOKENS) else "broken"
+    identity = result.get("accountIdentity", {}).get("identity", "unverified")
     bootstrap_missing = [t for t in BOOTSTRAP_CLASSES if not present.get(t)]
     bootstrap = "ok" if not bootstrap_missing else "incomplete(%s)" % ",".join(bootstrap_missing)
     paths = complete_paths(present) or ["none"]
@@ -517,15 +519,10 @@ def build_profile(result: dict) -> dict:
         "completePaths": paths,
         "advisoryMissing": advisory_missing(result),
         "identity": {
-            "idQueries": [
-                "SELECT value FROM userinfo WHERE id=2 LIMIT 1",
-                "SELECT value FROM userinfo WHERE id=42 LIMIT 1",
-            ],
-            "nicknameQueries": [
-                "SELECT value FROM userinfo WHERE id=4 LIMIT 1",
-                "SELECT value FROM userinfo WHERE id=5 LIMIT 1",
-                "SELECT value FROM userinfo WHERE id=6 LIMIT 1",
-            ],
+            "source": "current_kernel_config",
+            "usernameKey": 2,
+            "nicknameKey": 4,
+            "bindingProbe": result.get("accountIdentity", {}),
         },
         "observation": {
             "class": "com.tencent.wcdb.database.SQLiteDatabase",

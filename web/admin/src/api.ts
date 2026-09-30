@@ -144,6 +144,7 @@ export async function getMessages(params: {
 }
 
 export async function sendText(params: {
+  accountGeneration: number;
   password: string;
   device: string;
   ownerWxid: string;
@@ -156,6 +157,7 @@ export async function sendText(params: {
     body: {
       device: params.device,
       owner_wxid: params.ownerWxid,
+      account_generation: params.accountGeneration,
       wx_ids: [params.wxid],
       text: params.text
     }

@@ -88,7 +88,7 @@ func (o *MemoryOutbox) AckReplyActions(_ context.Context, req ModuleAckRequest) 
 	out := []ModuleOutboxItem{}
 	for i := range o.items {
 		ack, ok := acks[o.items[i].ID]
-		if !ok || o.items[i].Device != req.Device {
+		if !ok || o.items[i].Device != req.Device || o.items[i].Status != "leased" {
 			continue
 		}
 		if strings.TrimSpace(req.WxID) != "" && strings.TrimSpace(o.items[i].OwnerWxID) != strings.TrimSpace(req.WxID) {
@@ -104,6 +104,21 @@ func (o *MemoryOutbox) AckReplyActions(_ context.Context, req ModuleAckRequest) 
 		out = append(out, o.items[i].ModuleOutboxItem)
 	}
 	return out, nil
+}
+
+func (o *MemoryOutbox) CancelAccountOutbox(_ context.Context, device string) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := range o.items {
+		item := &o.items[i]
+		if item.Device == device && (item.Status == "pending" || item.Status == "leased") {
+			item.Status = "cancelled"
+			item.LastError = "account session changed"
+			item.leaseUntil = time.Time{}
+			item.UpdatedAt = formatRFC3339(o.now())
+		}
+	}
+	return nil
 }
 
 func formatRFC3339(t time.Time) string {

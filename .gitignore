@@ -30,3 +30,6 @@ __pycache__/
 .wechat-apks/
 *.apk
 
+
+web/admin/test-results/
+web/admin/playwright-report/
