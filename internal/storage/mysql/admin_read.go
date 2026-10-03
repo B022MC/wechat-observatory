@@ -268,7 +268,7 @@ func scanMessageEvent(row rowScanner) (bridge.MessageEvent, error) {
 }
 
 const listModuleStatusesStatement = `
-		SELECT ak.device, COALESCE(ac.generation, 0), d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), d.wechat_nickname, ak.enabled, d.updated_at,
+		SELECT ak.device, COALESCE(ac.epoch, 0), d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), d.wechat_nickname, ak.enabled, d.updated_at,
 			rt.last_register_at,
 			rt.last_poll_at,
 			rt.last_ack_at,

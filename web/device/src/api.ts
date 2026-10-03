@@ -1,4 +1,4 @@
-import type { DeviceApiKey, DeviceModule } from "./types";
+import type { DeviceApiKey, DeviceModule, ModuleSwitchRequest } from "./types";
 
 type RequestOptions = {
   password: string;
@@ -31,6 +31,14 @@ async function requestJSON<T>(path: string, options: RequestOptions): Promise<T>
 
 export function getDeviceModules(password: string) {
   return requestJSON<{ modules: DeviceModule[] }>("/api/device-admin/modules", { password });
+}
+
+/** Ask the server to hand the device binding to another phone on its next heartbeat. */
+export function switchDeviceInstallation(params: { password: string; device: string; installationId: number }) {
+  return requestJSON<{ ok: boolean; switch_request?: ModuleSwitchRequest }>(
+    `/api/device-admin/modules/${encodeURIComponent(params.device)}/switch`,
+    { password: params.password, method: "POST", body: { installation_id: params.installationId } }
+  );
 }
 
 export function getDeviceApiKeys(password: string) {

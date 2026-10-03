@@ -54,7 +54,7 @@ func TestAccountSessionsMySQLIntegration(t *testing.T) {
 	defer func() {
 		cleanup, done := context.WithTimeout(context.Background(), 10*time.Second)
 		defer done()
-		for _, table := range []string{"bridge_module_account_history", "bridge_module_account_current", "bridge_module_outbox", "bridge_module_contacts", "bridge_message_events", "bridge_module_runtime", "bridge_device_session_lease", "bridge_api_keys"} {
+		for _, table := range []string{"bridge_module_account_history", "bridge_module_account_current", "bridge_module_outbox", "bridge_module_contacts", "bridge_message_events", "bridge_module_runtime", "bridge_device_session_lease", "bridge_module_installations", "bridge_module_switch_requests", "bridge_api_keys"} {
 			if _, err := first.db.ExecContext(cleanup, "DELETE FROM "+table+" WHERE device=?", device); err != nil {
 				t.Error(err)
 			}
@@ -162,7 +162,8 @@ func TestAccountSessionsMySQLIntegration(t *testing.T) {
 	}
 	rollbackSession := "rollback-session-00001"
 	err = first.WithDeviceAccountLock(ctx, device, func(locked context.Context) error {
-		return first.RegisterAccountBinding(locked, bridge.AccountBinding{Device: device, InstanceID: a.InstanceID, SessionID: rollbackSession, Generation: 4, OwnerWxID: "wxid_B", CredentialID: key, AuthVersion: 1}, config.Device{Name: device, WxID: "wxid_B", Nickname: device, WeChatNickname: strings.Repeat("x", 256)}, key)
+		_, err := first.RegisterAccountBinding(locked, bridge.AccountBinding{Device: device, InstanceID: a.InstanceID, SessionID: rollbackSession, Generation: 4, OwnerWxID: "wxid_B", CredentialID: key, AuthVersion: 1}, config.Device{Name: device, WxID: "wxid_B", Nickname: device, WeChatNickname: strings.Repeat("x", 256)}, key)
+		return err
 	})
 	if err == nil {
 		t.Fatal("expected SQL length failure")
@@ -211,7 +212,7 @@ func TestAccountSessionsMySQLIntegration(t *testing.T) {
 	for _, status := range statuses {
 		if status.Device == device {
 			found = true
-			if status.AccountGeneration != 23 || status.DeviceWxID != current.OwnerWxID {
+			if status.AccountGeneration != current.Epoch || status.DeviceWxID != current.OwnerWxID {
 				t.Fatalf("status scope: %+v", status)
 			}
 		}

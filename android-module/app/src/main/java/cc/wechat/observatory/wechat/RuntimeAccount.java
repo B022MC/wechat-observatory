@@ -6,7 +6,7 @@ import java.io.IOException;
 /** A verified login and its own polling state; database handles never cross this scope. */
 public final class RuntimeAccount {
     public String registrationTarget;
-    public AccountSession session; // Assigned before publishing CURRENT_ACCOUNT.
+    public volatile AccountSession session; // Assigned before publishing CURRENT_ACCOUNT.
     public final String wxid;
     public final String nickname;
     public final String mainDatabasePath;
@@ -54,6 +54,12 @@ public final class RuntimeAccount {
             lastMessageId = Math.max(0L, id);
             watermarkReady = true;
         }
+    }
+
+    /** Restart ordered polling from the newest row (after a standby period). */
+    public synchronized void resetMessageWatermark() {
+        lastMessageId = 0L;
+        watermarkReady = false;
     }
 
     public synchronized void advanceWatermark(long id) {

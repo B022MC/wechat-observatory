@@ -116,6 +116,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureAPIKeyCredentialColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureAccountEpochColumns(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDeviceSessionLeaseTable(ctx); err != nil {
 		return err
 	}

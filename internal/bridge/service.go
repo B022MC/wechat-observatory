@@ -17,15 +17,21 @@ type Service struct {
 	accountMu      sync.Mutex
 	accountCurrent map[string]AccountBinding
 	accountHistory map[string]AccountBinding
-	cfg            Config
-	hub            *Hub
-	persistence    Persistence
-	outbox         Outbox
-	adminReader    AdminReader
-	instanceID     string
-	sessionTTL     time.Duration
-	pollEvery      time.Duration
-	offlineAfter   time.Duration
+	// In-memory installation tracking; MySQL deployments use AccountSessionStore.
+	accountInstallations map[string]*InstallationRecord
+	accountInstallSeq    int64
+	accountSwitch        map[string]AccountSwitchRequest
+	takeoverAfter        time.Duration
+	clock                func() time.Time
+	cfg                  Config
+	hub                  *Hub
+	persistence          Persistence
+	outbox               Outbox
+	adminReader          AdminReader
+	instanceID           string
+	sessionTTL           time.Duration
+	pollEvery            time.Duration
+	offlineAfter         time.Duration
 
 	mu               sync.RWMutex
 	nextChatRecordID int64
@@ -72,22 +78,26 @@ type Config struct {
 	SessionTTL             time.Duration
 	PollInterval           time.Duration
 	OfflineAfter           time.Duration
+	TakeoverAfter          time.Duration
 	EventIdentityV2Devices map[string]struct{}
 }
 
 func NewService(cfg Config, opts ...Option) *Service {
 	service := &Service{
-		cfg:              cfg,
-		accountCurrent:   map[string]AccountBinding{},
-		accountHistory:   map[string]AccountBinding{},
-		hub:              NewHub(500),
-		outbox:           NewMemoryOutbox(),
-		outboxNotify:     map[string]map[chan struct{}]struct{}{},
-		nextChatRecordID: time.Now().Unix() * 1000,
-		instanceID:       firstNonEmpty(cfg.InstanceID, "local"),
-		sessionTTL:       cfg.SessionTTL,
-		pollEvery:        cfg.PollInterval,
-		offlineAfter:     cfg.OfflineAfter,
+		cfg:                  cfg,
+		accountCurrent:       map[string]AccountBinding{},
+		accountHistory:       map[string]AccountBinding{},
+		accountInstallations: map[string]*InstallationRecord{},
+		accountSwitch:        map[string]AccountSwitchRequest{},
+		takeoverAfter:        cfg.TakeoverAfter,
+		hub:                  NewHub(500),
+		outbox:               NewMemoryOutbox(),
+		outboxNotify:         map[string]map[chan struct{}]struct{}{},
+		nextChatRecordID:     time.Now().Unix() * 1000,
+		instanceID:           firstNonEmpty(cfg.InstanceID, "local"),
+		sessionTTL:           cfg.SessionTTL,
+		pollEvery:            cfg.PollInterval,
+		offlineAfter:         cfg.OfflineAfter,
 	}
 	if service.sessionTTL <= 0 {
 		service.sessionTTL = 15 * time.Second
@@ -97,6 +107,9 @@ func NewService(cfg Config, opts ...Option) *Service {
 	}
 	if service.offlineAfter <= 0 {
 		service.offlineAfter = 5 * time.Minute
+	}
+	if service.takeoverAfter <= 0 {
+		service.takeoverAfter = DefaultModuleTakeoverAfter
 	}
 	for _, opt := range opts {
 		opt(service)
@@ -932,6 +945,9 @@ type ModuleRegistrationResult struct {
 	AccountSession    string           `json:"account_session,omitempty"`
 	AccountGeneration int64            `json:"account_generation,omitempty"`
 	Device            ModuleDeviceView `json:"device"`
+	// Takeover is foreground, admin or stale when this registration replaced
+	// another installation.
+	Takeover string `json:"takeover,omitempty"`
 }
 
 type ModuleDeviceView struct {

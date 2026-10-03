@@ -27,6 +27,7 @@ type Config struct {
 	SessionTTL          time.Duration
 	PollInterval        time.Duration
 	ModuleOfflineAfter  time.Duration
+	ModuleTakeoverAfter time.Duration
 	OfflineOutboxSweep  time.Duration
 	RetentionDays       int
 	RetentionPoll       time.Duration
@@ -72,6 +73,7 @@ func LoadFromEnv() (Config, error) {
 		SessionTTL:          getenvDuration("BRIDGE_DEVICE_SESSION_LEASE_TTL", 15*time.Second),
 		PollInterval:        getenvDuration("BRIDGE_OUTBOX_POLL_INTERVAL", defaultOutboxPollInterval),
 		ModuleOfflineAfter:  getenvDuration("BRIDGE_MODULE_OFFLINE_AFTER", 5*time.Minute),
+		ModuleTakeoverAfter: getenvDuration("BRIDGE_MODULE_TAKEOVER_AFTER", 2*time.Minute),
 		OfflineOutboxSweep:  getenvDuration("BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL", 30*time.Second),
 		RetentionDays:       getenvPositiveInt("BRIDGE_HISTORY_RETENTION_DAYS", 15),
 		RetentionPoll:       getenvDuration("BRIDGE_HISTORY_RETENTION_INTERVAL", time.Hour),

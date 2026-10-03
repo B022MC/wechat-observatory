@@ -1,4 +1,4 @@
-import type { ApiKey, LiveMessageEvent, ModuleContact, ModuleStatus, StoredMessage } from "@/types";
+import type { ApiKey, LiveMessageEvent, ModuleContact, ModuleStatus, ModuleSwitchRequest, StoredMessage } from "@/types";
 
 type ApiOptions = {
   password: string;
@@ -36,6 +36,18 @@ async function requestJSON<T>(path: string, options: ApiOptions): Promise<T> {
 
 export async function getModules(password: string) {
   return requestJSON<{ modules: ModuleStatus[] }>("/api/modules/status", { password });
+}
+
+/** Ask the server to hand the device binding to another phone on its next heartbeat. */
+export async function switchModuleInstallation(params: { password: string; device: string; installationId: number }) {
+  return requestJSON<{ ok: boolean; switch_request?: ModuleSwitchRequest }>(
+    `/api/modules/${encodeURIComponent(params.device)}/switch`,
+    {
+      password: params.password,
+      method: "POST",
+      body: { installation_id: params.installationId }
+    }
+  );
 }
 
 export async function getApiKeys(password: string) {

@@ -3,6 +3,7 @@ package bridge
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -10,12 +11,14 @@ import (
 const deviceAdminAPIKeyPrefix = "/api/device-admin/api-keys/"
 
 type DeviceAdminModuleView struct {
-	Device         string `json:"device"`
-	DeviceWxID     string `json:"device_wxid,omitempty"`
-	DeviceNickname string `json:"device_nickname,omitempty"`
-	Enabled        bool   `json:"enabled"`
-	RuntimeStatus  string `json:"runtime_status"`
-	LastSeenAt     string `json:"last_seen_at,omitempty"`
+	Device         string                   `json:"device"`
+	DeviceWxID     string                   `json:"device_wxid,omitempty"`
+	DeviceNickname string                   `json:"device_nickname,omitempty"`
+	Enabled        bool                     `json:"enabled"`
+	RuntimeStatus  string                   `json:"runtime_status"`
+	LastSeenAt     string                   `json:"last_seen_at,omitempty"`
+	Installations  []ModuleInstallationView `json:"installations,omitempty"`
+	SwitchRequest  *ModuleSwitchRequestView `json:"switch_request,omitempty"`
 }
 
 func (s *HTTPServer) requireDeviceAdmin(next http.HandlerFunc) http.HandlerFunc {
@@ -53,9 +56,11 @@ func (s *HTTPServer) loadModuleStatuses(r *http.Request) ([]ModuleStatusView, er
 		if err != nil {
 			return nil, err
 		}
-		return s.service.NormalizeModuleStatuses(statuses), nil
+		statuses = s.service.NormalizeModuleStatuses(statuses)
+		return statuses, s.service.AttachInstallations(r.Context(), statuses)
 	}
-	return s.service.NormalizeModuleStatuses(s.moduleStatusViews()), nil
+	statuses := s.service.NormalizeModuleStatuses(s.moduleStatusViews())
+	return statuses, s.service.AttachInstallations(r.Context(), statuses)
 }
 
 func newDeviceAdminModuleView(status ModuleStatusView) DeviceAdminModuleView {
@@ -79,6 +84,33 @@ func newDeviceAdminModuleView(status ModuleStatusView) DeviceAdminModuleView {
 		Enabled:        status.Enabled,
 		RuntimeStatus:  runtimeStatus,
 		LastSeenAt:     lastSeenAt,
+		Installations:  status.Installations,
+		SwitchRequest:  status.SwitchRequest,
+	}
+}
+
+// switchModuleInstallation asks a standby phone of one device binding to take
+// over. It is shared by the admin console and the device admin PWA.
+func (s *HTTPServer) switchModuleInstallation(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		InstallationID int64 `json:"installation_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	view, err := s.service.RequestInstallationSwitch(r.Context(), r.PathValue("device"), body.InstallationID)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "switch_request": view})
+	case errors.Is(err, ErrInstallationSwitchArg):
+		writeError(w, http.StatusBadRequest, "switch_invalid", err.Error())
+	case errors.Is(err, ErrInstallationNotFound):
+		writeError(w, http.StatusNotFound, "installation_not_found", err.Error())
+	case errors.Is(err, ErrInstallationActive):
+		writeError(w, http.StatusConflict, "installation_active", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "switch_failed", err.Error())
 	}
 }
 

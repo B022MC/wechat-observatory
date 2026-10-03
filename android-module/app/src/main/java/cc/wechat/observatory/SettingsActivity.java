@@ -52,6 +52,7 @@ public final class SettingsActivity extends Activity {
     }
 
     private final Map<String, EditText> fields = new LinkedHashMap<>();
+    private TextView statusView;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -59,6 +60,31 @@ public final class SettingsActivity extends Activity {
         setTitle(getString(R.string.settings_title));
         setContentView(createContentView());
         loadValues();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        showRuntimeStatus();
+    }
+
+    /** Shows whether this phone serves its Key or waits on standby (written by the WeChat process). */
+    private void showRuntimeStatus() {
+        if (statusView == null) {
+            return;
+        }
+        SharedPreferences status = getSharedPreferences(BridgeConfigProvider.STATUS_PREFS_NAME, Context.MODE_PRIVATE);
+        String state = status.getString("state", "");
+        String detail = status.getString("detail", "");
+        long updatedAt = status.getLong("updated_at", 0L);
+        String time = updatedAt <= 0L ? "" : android.text.format.DateFormat.format("MM-dd HH:mm:ss", updatedAt).toString();
+        if ("standby".equals(state)) {
+            statusView.setText(getString(R.string.status_standby, detail, time));
+        } else if ("active".equals(state)) {
+            statusView.setText(getString(R.string.status_active, detail, time));
+        } else {
+            statusView.setText(R.string.status_unknown);
+        }
     }
 
     private View createContentView() {
@@ -82,6 +108,11 @@ public final class SettingsActivity extends Activity {
         hint.setTextSize(14);
         hint.setPadding(0, 0, 0, dp(14));
         root.addView(hint);
+
+        statusView = new TextView(this);
+        statusView.setTextSize(14);
+        statusView.setPadding(0, 0, 0, dp(14));
+        root.addView(statusView);
 
         addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         addField(root, "api_key", R.string.label_api_key, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);

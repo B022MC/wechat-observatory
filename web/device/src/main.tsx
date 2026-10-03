@@ -27,9 +27,12 @@ import {
   getDeviceApiKeys,
   getDeviceModules,
   setDeviceApiKeyEnabled,
+  switchDeviceInstallation,
   updateDeviceName
 } from "./api";
-import type { DeviceApiKey, DeviceModule } from "./types";
+import type { DeviceApiKey, DeviceModule, ModuleInstallation } from "./types";
+import { InstallationList, type InstallationNotice } from "@/components/InstallationList";
+import { INSTALLATION_ALREADY_ACTIVE, INSTALLATION_SWITCH_REQUESTED, installationDisplayName, parseApiError } from "@/installations";
 import "../../admin/src/index.css";
 
 const PASSWORD_KEY = "wgc_device_admin_password";
@@ -55,6 +58,8 @@ function App() {
   const [newDevice, setNewDevice] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState("输入设备管理密码后连接");
+  const [switchingInstallation, setSwitchingInstallation] = React.useState<number | null>(null);
+  const [installationNotice, setInstallationNotice] = React.useState<(InstallationNotice & { device: string }) | null>(null);
 
   const credential = password.trim();
   const selectedModule = modules.find((item) => item.device === selectedDevice);
@@ -74,6 +79,12 @@ function App() {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+
+  React.useEffect(() => {
+    if (!installationNotice) return;
+    const timer = window.setTimeout(() => setInstallationNotice(null), 20000);
+    return () => window.clearTimeout(timer);
+  }, [installationNotice]);
 
   React.useEffect(() => {
     setNickname(selectedModule?.device_nickname || selectedModule?.device || "");
@@ -181,6 +192,31 @@ function App() {
     }
   };
 
+  const switchInstallation = async (installation: ModuleInstallation) => {
+    const device = selectedDevice;
+    if (!credential || !device || installation.active || switchingInstallation !== null) return;
+    if (!window.confirm(`确认切到 ${installationDisplayName(installation)}？目标手机下一次心跳时接管。`)) return;
+    setSwitchingInstallation(installation.id);
+    setInstallationNotice(null);
+    try {
+      await switchDeviceInstallation({ password: credential, device, installationId: installation.id });
+      setInstallationNotice({ device, tone: "info", text: INSTALLATION_SWITCH_REQUESTED });
+      setNotice("已请求切换手机");
+      window.setTimeout(() => void refresh(true), 11000);
+    } catch (error) {
+      const info = parseApiError(error, "切换失败");
+      if (info.code === "installation_active") {
+        setInstallationNotice({ device, tone: "info", text: INSTALLATION_ALREADY_ACTIVE });
+      } else {
+        setInstallationNotice({ device, tone: "error", text: info.message });
+        setNotice(info.message);
+      }
+    } finally {
+      setSwitchingInstallation(null);
+      await refresh(true);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="sticky top-0 z-20 border-b bg-background/95 backdrop-blur">
@@ -222,13 +258,16 @@ function App() {
             <CardHeader><CardTitle className="text-base">设备</CardTitle></CardHeader>
             <CardContent className="grid gap-2">
               {modules.length === 0 ? <p className="text-sm text-muted-foreground">暂无设备数据</p> : modules.map((item) => (
-                <button key={item.device} onClick={() => setSelectedDevice(item.device)} className={`flex items-center justify-between rounded-md border px-3 py-3 text-left transition-colors ${selectedDevice === item.device ? "border-primary bg-secondary" : "hover:bg-secondary/60"}`}>
-                  <span className="min-w-0">
-                    <strong className="block truncate text-sm">{item.device_nickname || item.device}</strong>
-                    <small className="block truncate text-muted-foreground">{item.device}</small>
-                  </span>
-                  <StatusBadge status={item.runtime_status} />
-                </button>
+                <div key={item.device} className={`rounded-md border transition-colors ${selectedDevice === item.device ? "border-primary bg-secondary" : "hover:bg-secondary/60"}`}>
+                  <button type="button" onClick={() => setSelectedDevice(item.device)} className="flex w-full items-center justify-between px-3 py-3 text-left">
+                    <span className="min-w-0">
+                      <strong className="block truncate text-sm">{item.device_nickname || item.device}</strong>
+                      <small className="block truncate text-muted-foreground">{item.device}</small>
+                    </span>
+                    <StatusBadge status={item.runtime_status} />
+                  </button>
+                  <InstallationList compact className="border-t px-3 pb-3 pt-2" installations={item.installations} switchRequest={item.switch_request} />
+                </div>
               ))}
             </CardContent>
           </Card>
@@ -257,6 +296,16 @@ function App() {
                   <Save className="h-4 w-4" />保存名称
                 </Button>
               </div>
+              <InstallationList
+                className="rounded-lg border p-3 md:col-span-2"
+                installations={selectedModule?.installations}
+                switchRequest={selectedModule?.switch_request}
+                switchingId={switchingInstallation}
+                disabled={!credential || busy}
+                onSwitch={(installation) => void switchInstallation(installation)}
+                notice={installationNotice?.device === selectedDevice ? installationNotice : null}
+                hint
+              />
             </CardContent>
           </Card>
 

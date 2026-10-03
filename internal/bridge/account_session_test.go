@@ -66,8 +66,8 @@ func TestAccountSessionSwitchAndHistoricalMessage(t *testing.T) {
 	}
 	other := accountRegistration(a.WxID, 4)
 	other.InstanceID = "installation-00002"
-	if _, err := s.RegisterModule(t.Context(), other); !errors.Is(err, ErrAccountSession) {
-		t.Fatalf("second installation: %v", err)
+	if _, err := s.RegisterModule(t.Context(), other); !errors.Is(err, ErrDeviceStandby) {
+		t.Fatalf("second installation should stand by: %v", err)
 	}
 	for _, session := range []string{a.AccountSession, b.AccountSession, ""} {
 		if _, err := s.PollOutbox(t.Context(), ModulePollRequest{APIKey: testAPIKey, WxID: a.WxID, AccountSession: session}); !errors.Is(err, ErrAccountSession) {

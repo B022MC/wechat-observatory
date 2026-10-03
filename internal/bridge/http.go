@@ -55,6 +55,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("GET /api/messages", s.requireAdmin(s.messages))
 	mux.HandleFunc("GET /api/live/events", s.requireAdmin(s.liveEvents))
 	mux.HandleFunc("GET /api/modules/status", s.requireAdmin(s.moduleStatuses))
+	mux.HandleFunc("POST /api/modules/{device}/switch", s.requireAdmin(s.switchModuleInstallation))
 	mux.HandleFunc("GET /api/module-contacts", s.requireAdmin(s.moduleContacts))
 	mux.HandleFunc("GET /api/module-diagnostics", s.requireAdmin(s.moduleDiagnostics))
 	mux.HandleFunc("POST /api/send/text", s.requireAdmin(s.sendText))
@@ -68,6 +69,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("GET /device-offline.html", s.devicePWAAsset)
 	mux.HandleFunc("GET /device-icons/", s.devicePWAAsset)
 	mux.HandleFunc("GET /api/device-admin/modules", s.requireDeviceAdmin(s.deviceAdminModules))
+	mux.HandleFunc("POST /api/device-admin/modules/{device}/switch", s.requireDeviceAdmin(s.switchModuleInstallation))
 	mux.HandleFunc("GET /api/device-admin/api-keys", s.requireDeviceAdmin(s.deviceAdminAPIKeys))
 	mux.HandleFunc("POST /api/device-admin/api-keys", s.requireDeviceAdmin(s.deviceAdminUpsertAPIKey))
 	mux.HandleFunc("POST /api/device-admin/api-keys/", s.requireDeviceAdmin(s.deviceAdminUpdateAPIKeyState))
@@ -493,7 +495,7 @@ func (s *HTTPServer) moduleStatusViews() []ModuleStatusView {
 	out := make([]ModuleStatusView, 0, len(devices))
 	for _, device := range devices {
 		item := ModuleStatusView{
-			AccountGeneration: s.service.accountCurrent[device.Name].Generation,
+			AccountGeneration: s.service.accountCurrent[device.Name].Epoch,
 			Device:            device.Name,
 			DeviceWxID:        device.WxID,
 			DeviceNickname:    device.Nickname,
@@ -534,6 +536,17 @@ func (s *HTTPServer) registerModule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.service.RegisterModule(r.Context(), req)
+	var standby *StandbyError
+	if errors.As(err, &standby) {
+		// Standby is a normal state, not a registration failure diagnostic.
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"ok":      false,
+			"code":    "device_standby",
+			"message": standby.Error(),
+			"active":  standby.Active,
+		})
+		return
+	}
 	if err != nil {
 		s.recordRegisterFailure(r, req, err)
 		writeError(w, moduleErrorStatus(err), "register_failed", err.Error())
@@ -680,7 +693,7 @@ func writeSSEID(w http.ResponseWriter, id int64, event string, payload any) {
 }
 
 func moduleErrorStatus(err error) int {
-	if errors.Is(err, ErrAccountSession) {
+	if errors.Is(err, ErrAccountSession) || errors.Is(err, ErrDeviceStandby) {
 		return http.StatusConflict
 	}
 	return http.StatusBadRequest

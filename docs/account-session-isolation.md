@@ -106,3 +106,38 @@ handling before any historical repair.
   `npm run test:ui`, `npm run build`. Desktop/mobile tests mock API sends locally.
 - Android: `:app:testDebugUnitTest :app:assembleDebug` with the Android 35 SDK.
 - Build the Linux amd64 image from the repository Dockerfile.
+## Multi-phone binding and standby takeover (module 0.1.12, code 13)
+
+One API Key may have multiple installation UUIDs, but exactly one installation is
+active for a device binding. `POST /module/register` accepts optional
+`takeover: "foreground"` plus `device_model`, `android_version`,
+`wechat_version`, and `module_version`. A different installation is recorded as
+standby and receives HTTP 409 with `code: "device_standby"` until it carries a
+foreground claim, an operator switch request, or the active installation has
+missed `BRIDGE_MODULE_TAKEOVER_AFTER` (default two minutes) of heartbeats.
+
+The server assigns the public device epoch (`account_generation`) monotonically
+on every accepted binding change. Registration still echoes the module's own
+client generation so old modules can validate their session; status and manual
+send guards use the server epoch. Installation status is exposed in
+`installations[]` and includes `active|standby|offline`, owner wxid/nickname,
+device and software versions, last seen/active timestamps, and switch state.
+`POST /api/modules/{device}/switch` and
+`POST /api/device-admin/modules/{device}/switch` accept
+`{"installation_id": <id>}` and create a ten-minute request consumed by the
+target's next registration heartbeat.
+
+When the owner wxid is unchanged, a takeover cancels leased rows but preserves
+pending rows for delivery by the new installation. A different owner cancels
+both pending and leased rows. The module skips contacts, inbound polling, and
+outbox delivery while on standby; it only registers heartbeats. A standby to
+active transition resets the message watermark and forces a contact snapshot.
+Transient account resolver failures retain the current RuntimeAccount for 60
+seconds, preventing a spurious generation and queue cancellation.
+
+Validation: run `go test ./...`, `go vet ./...`, `go build ./...`, the MySQL
+integration suite with `WECHAT_OBSERVATORY_MYSQL_TEST_DSN` pointing to a
+disposable database whose name contains `test`, Android
+`:app:testDebugUnitTest :app:assembleDebug`, admin `npm test` and `npm run
+test:ui`, and both web builds. Connected-phone foreground transitions and
+production deployment remain manual checks.

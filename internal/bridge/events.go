@@ -207,6 +207,11 @@ type ModuleRegistrationRequest struct {
 	Device            string `json:"device"`
 	WxID              string `json:"wxid"`
 	Nickname          string `json:"nickname"`
+	Takeover          string `json:"takeover,omitempty"`
+	DeviceModel       string `json:"device_model,omitempty"`
+	AndroidVersion    string `json:"android_version,omitempty"`
+	WeChatVersion     string `json:"wechat_version,omitempty"`
+	ModuleVersion     string `json:"module_version,omitempty"`
 }
 
 func (req ModuleRegistrationRequest) Validate(defaultDevice string) (ModuleRegistrationRequest, error) {
@@ -214,6 +219,14 @@ func (req ModuleRegistrationRequest) Validate(defaultDevice string) (ModuleRegis
 	req.Device = strings.TrimSpace(req.Device)
 	req.WxID = strings.TrimSpace(req.WxID)
 	req.Nickname = strings.TrimSpace(req.Nickname)
+	req.Takeover = strings.ToLower(strings.TrimSpace(req.Takeover))
+	if req.Takeover != TakeoverForeground {
+		req.Takeover = ""
+	}
+	req.DeviceModel = truncateRunes(strings.TrimSpace(req.DeviceModel), 128)
+	req.AndroidVersion = truncateRunes(strings.TrimSpace(req.AndroidVersion), 64)
+	req.WeChatVersion = truncateRunes(strings.TrimSpace(req.WeChatVersion), 64)
+	req.ModuleVersion = truncateRunes(strings.TrimSpace(req.ModuleVersion), 64)
 	if req.APIKey == "" {
 		return req, errors.New("api_key is required")
 	}

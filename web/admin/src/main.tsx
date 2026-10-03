@@ -41,6 +41,7 @@ import {
   publicPath,
   setApiKeyEnabled,
   sendText,
+  switchModuleInstallation,
   updateDevice
 } from "@/api";
 import { Badge } from "@/components/ui/badge";
@@ -60,7 +61,9 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import type { ApiKey, LiveMessageEvent, ModuleContact, ModuleStatus, StoredMessage } from "@/types";
+import { InstallationList, InstallationSwitchHint, type InstallationNotice } from "@/components/InstallationList";
+import { INSTALLATION_ALREADY_ACTIVE, INSTALLATION_SWITCH_REQUESTED, installationDisplayName, parseApiError } from "@/installations";
+import type { ApiKey, LiveMessageEvent, ModuleContact, ModuleInstallation, ModuleStatus, StoredMessage } from "@/types";
 import "./index.css";
 
 const PASSWORD_KEY = "wgc_admin_password";
@@ -104,6 +107,8 @@ function App() {
   const [newApiKeyNickname, setNewApiKeyNickname] = React.useState("");
   const [deviceNicknameDraft, setDeviceNicknameDraft] = React.useState("");
   const [notice, setNotice] = React.useState("输入管理密码后连接");
+  const [switchingInstallation, setSwitchingInstallation] = React.useState<{ device: string; id: number } | null>(null);
+  const [installationNotice, setInstallationNotice] = React.useState<(InstallationNotice & { device: string }) | null>(null);
 
   const adminPassword = password.trim();
   const selectedModule = React.useMemo(
@@ -127,6 +132,12 @@ function App() {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+
+  React.useEffect(() => {
+    if (!installationNotice) return;
+    const timer = window.setTimeout(() => setInstallationNotice(null), 20000);
+    return () => window.clearTimeout(timer);
+  }, [installationNotice]);
 
 
   React.useEffect(() => {
@@ -637,6 +648,30 @@ function App() {
     }
   };
 
+  const requestInstallationSwitch = async (device: string, installation: ModuleInstallation) => {
+    if (!adminPassword || !device || installation.active || switchingInstallation) return;
+    const ok = window.confirm(`确认把设备 ${device} 切到 ${installationDisplayName(installation)}？目标手机下一次心跳时接管。`);
+    if (!ok) return;
+    setSwitchingInstallation({ device, id: installation.id });
+    setInstallationNotice(null);
+    try {
+      await switchModuleInstallation({ password: adminPassword, device, installationId: installation.id });
+      setInstallationNotice({ device, tone: "info", text: INSTALLATION_SWITCH_REQUESTED });
+      setNotice("已请求切换手机");
+    } catch (error) {
+      const info = parseApiError(error, "切换手机失败");
+      if (info.code === "installation_active") {
+        setInstallationNotice({ device, tone: "info", text: INSTALLATION_ALREADY_ACTIVE });
+      } else {
+        setInstallationNotice({ device, tone: "error", text: info.message });
+        setNotice(info.message);
+      }
+    } finally {
+      setSwitchingInstallation(null);
+      void refreshModules().catch(() => undefined);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-muted/30 text-foreground">
       <header className="sticky top-0 z-30 border-b border-border/70 bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
@@ -700,31 +735,44 @@ function App() {
               {modules.length === 0 ? (
                 <EmptyState icon={<Smartphone className="h-5 w-5" />} text="未读取到模块状态" />
               ) : (
-                modules.map((item) => (
-                  <button
-                    key={item.device}
-                    className={
-                      item.device === selectedDevice
-                        ? "rounded-lg border border-primary bg-secondary p-3 text-left shadow-sm"
-                        : "rounded-lg border bg-card p-3 text-left transition hover:bg-secondary"
-                    }
-                    onClick={() => selectDevice(item.device)}
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="truncate font-medium">{item.device || "-"}</div>
-                        <div className="truncate text-xs text-muted-foreground">
-                          {item.device_nickname || "未上报微信信息"}
+                <>
+                  {modules.map((item) => (
+                    <div
+                      key={item.device}
+                      className={
+                        item.device === selectedDevice
+                          ? "rounded-lg border border-primary bg-secondary shadow-sm"
+                          : "rounded-lg border bg-card transition hover:bg-secondary"
+                      }
+                    >
+                      <button type="button" className="block w-full p-3 text-left" onClick={() => selectDevice(item.device)}>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="truncate font-medium">{item.device || "-"}</div>
+                            <div className="truncate text-xs text-muted-foreground">
+                              {item.device_nickname || "未上报微信信息"}
+                            </div>
+                          </div>
+                          <StatusBadge status={item.runtime_status} />
                         </div>
-                      </div>
-                      <StatusBadge status={item.runtime_status} />
+                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-muted-foreground">
+                          <span>待发：{item.pending_outbox ?? 0}</span>
+                          <span>失败：{item.failed_outbox ?? 0}</span>
+                        </div>
+                      </button>
+                      <InstallationList
+                        className="border-t border-border/70 px-3 pb-3 pt-2"
+                        installations={item.installations}
+                        switchRequest={item.switch_request}
+                        switchingId={switchingInstallation?.device === item.device ? switchingInstallation.id : null}
+                        disabled={!adminPassword || switchingInstallation !== null}
+                        onSwitch={(installation) => void requestInstallationSwitch(item.device, installation)}
+                        notice={installationNotice?.device === item.device ? installationNotice : null}
+                      />
                     </div>
-                    <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-muted-foreground">
-                      <span>待发：{item.pending_outbox ?? 0}</span>
-                      <span>失败：{item.failed_outbox ?? 0}</span>
-                    </div>
-                  </button>
-                ))
+                  ))}
+                  {modules.some((item) => (item.installations?.length ?? 0) > 0) ? <InstallationSwitchHint /> : null}
+                </>
               )}
             </CardContent>
           </Card>
@@ -1127,12 +1175,13 @@ function App() {
                       <TableHead className="min-w-[120px]">状态</TableHead>
                       <TableHead className="min-w-[140px]">队列</TableHead>
                       <TableHead className="min-w-[220px]">最近活动</TableHead>
+                      <TableHead className="min-w-[280px]">手机</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {modules.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={4}>
+                        <TableCell colSpan={5}>
                           <EmptyState icon={<Smartphone className="h-5 w-5" />} text="未读取到模块状态" />
                         </TableCell>
                       </TableRow>
@@ -1156,6 +1205,13 @@ function App() {
                           <TableCell className="text-xs">
                             <div>拉取：{formatBeijingDateTime(item.last_poll_at)}</div>
                             <div className="text-muted-foreground">回执：{formatBeijingDateTime(item.last_ack_at || item.last_outbound_ack_at)}</div>
+                          </TableCell>
+                          <TableCell className="text-xs">
+                            {item.installations?.length ? (
+                              <InstallationList compact installations={item.installations} switchRequest={item.switch_request} />
+                            ) : (
+                              <span className="text-muted-foreground">-</span>
+                            )}
                           </TableCell>
                         </TableRow>
                       ))

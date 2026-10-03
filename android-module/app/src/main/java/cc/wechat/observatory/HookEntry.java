@@ -3,7 +3,10 @@ package cc.wechat.observatory;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageInfo;
+import android.app.Activity;
 import android.app.Application;
+import android.net.Uri;
+import android.widget.Toast;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Base64;
@@ -58,6 +61,8 @@ import cc.wechat.observatory.wechat.RuntimeAccount;
 import cc.wechat.observatory.wechat.AccountSession;
 import cc.wechat.observatory.wechat.AccountDatabaseSelector;
 import cc.wechat.observatory.wechat.WeChatAccountResolver;
+import cc.wechat.observatory.wechat.DeviceRole;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -107,6 +112,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final long OUTBOX_QUIET_REPORT_MS = 60000L;
     private static final long OUTBOX_STALL_REPORT_MS = 300000L;
     private static final AtomicBoolean OUTBOX_WATCHDOG_STARTED = new AtomicBoolean(false);
+    private static final DeviceRole ROLE = new DeviceRole();
+    private static volatile boolean FORCE_REREGISTER;
+    private static final AtomicInteger STARTED_ACTIVITIES = new AtomicInteger(0);
+    private static volatile long BACKGROUND_SINCE = 0L;
+    private static final long FOREGROUND_DEBOUNCE_MS = 1500L;
+    private static final String STATUS_PROVIDER_URI = "content://cc.wechat.observatory.config/status";
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -149,6 +160,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             log("hooked WeChat WCDB access methods");
             hookApplicationAttach(lpparam.classLoader);
             hookWeChatApplication(lpparam.classLoader);
+            hookForeground();
         } catch (Throwable t) {
             log("hook failed: " + t);
             reportHookFailureLater("hook failed: " + t);
@@ -224,6 +236,44 @@ public final class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("hook WeChat application init failed, start worker with readiness gate: " + t);
             startWorker(classLoader);
+        }
+    }
+
+    /**
+     * Detects the user opening WeChat on this phone: the number of started
+     * activities in the main process goes from 0 to 1. Configuration changes stop
+     * and start activities within milliseconds, so short gaps are ignored.
+     */
+    private static void hookForeground() {
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onStart", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (STARTED_ACTIVITIES.incrementAndGet() != 1) {
+                        return;
+                    }
+                    long now = System.currentTimeMillis();
+                    long since = BACKGROUND_SINCE;
+                    if (since == 0L || now - since >= FOREGROUND_DEBOUNCE_MS) {
+                        ROLE.onForeground(now);
+                        if (ROLE.isStandby()) {
+                            log("WeChat opened on a standby phone; claiming the device binding");
+                        }
+                    }
+                }
+            });
+            XposedHelpers.findAndHookMethod(Activity.class, "onStop", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (STARTED_ACTIVITIES.decrementAndGet() <= 0) {
+                        STARTED_ACTIVITIES.set(0);
+                        BACKGROUND_SINCE = System.currentTimeMillis();
+                    }
+                }
+            });
+            log("hooked WeChat foreground transitions");
+        } catch (Throwable t) {
+            log("hook foreground transitions failed: " + t);
         }
     }
 
@@ -827,10 +877,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     } catch (Exception e) {
                         // Only the serialized main-thread resolver invalidates a binding.
                         // A delayed worker failure must not clear a newer successful one.
-                        CURRENT_ACCOUNT = null;
-                        CURRENT_WXID = "";
+                        // Short read failures (kernel busy, WeChat restarting its UI) keep
+                        // the session so the server does not see a new generation and
+                        // cancel queued replies; a persistent failure drops the binding.
+                        if (ROLE.identityFailed(System.currentTimeMillis())) {
+                            CURRENT_ACCOUNT = null;
+                            CURRENT_WXID = "";
+                        }
                         throw e;
                     }
+                    ROLE.identityResolved();
                     RuntimeAccount account = CURRENT_ACCOUNT;
                     String target = config.baseUrl + "\n" + config.apiKey;
                     if (!detected.sameLogin(account) || !target.equals(account.registrationTarget)) {
@@ -892,34 +948,71 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
             String key = config.apiKey + "\n" + config.selfWxid + "\n" + config.signature + "\n" + config.runtimeAccount.session.id;
             long now = System.currentTimeMillis();
-            if (key.equals(REGISTERED_KEY) && !isBlank(REGISTERED_DEVICE)) {
+            // A 409 elsewhere means another phone may own the binding now: ask again.
+            if (FORCE_REREGISTER) {
+                FORCE_REREGISTER = false;
+                REGISTERED_KEY = "";
+            }
+            String takeover = ROLE.takeoverFor(now);
+            if (!ROLE.isStandby() && key.equals(REGISTERED_KEY) && !isBlank(REGISTERED_DEVICE)) {
                 config.device = REGISTERED_DEVICE;
                 if (now - LAST_REGISTER_SUCCESS_AT < 60000L) {
                     return true;
                 }
             }
-            if (now - LAST_REGISTER_ATTEMPT_AT < 5000L) {
+            // The user just opened WeChat on a standby phone: claim without pacing.
+            if (isBlank(takeover) && now - LAST_REGISTER_ATTEMPT_AT < 5000L) {
                 return false;
             }
             LAST_REGISTER_ATTEMPT_AT = now;
-            return registerModule(config, key);
+            return registerModule(config, key, takeover);
         }
     }
 
-    private static boolean registerModule(BridgeConfig config, String key) throws Exception {
+    private static boolean registerModule(BridgeConfig config, String key, String takeover) throws Exception {
         if (isBlank(config.apiKey) || isBlank(config.selfWxid)) {
             return false;
         }
+        RuntimeAccount runtimeAccount = config.runtimeAccount;
         JSONObject registration = new JSONObject();
         registration.put("api_key", config.apiKey);
         registration.put("device", config.device);
         registration.put("wxid", config.selfWxid);
         registration.put("nickname", config.nickname);
-        registration.put("instance_id", config.runtimeAccount.session.instanceId);
-        registration.put("account_session", config.runtimeAccount.session.id);
-        registration.put("account_generation", config.runtimeAccount.session.generation);
+        registration.put("instance_id", runtimeAccount.session.instanceId);
+        registration.put("account_session", runtimeAccount.session.id);
+        registration.put("account_generation", runtimeAccount.session.generation);
+        if (!isBlank(takeover)) {
+            registration.put("takeover", takeover);
+        }
+        registration.put("device_model", deviceModel());
+        registration.put("android_version", android.os.Build.VERSION.RELEASE);
+        registration.put("wechat_version", wechatVersion());
+        registration.put("module_version", BuildConfig.VERSION_NAME + "/" + BuildConfig.VERSION_CODE);
         String body = registration.toString();
-        String response = postJson(config, "/module/register", body);
+        String response;
+        try {
+            response = postJson(config, "/module/register", body);
+        } catch (IllegalStateException e) {
+            String message = String.valueOf(e.getMessage());
+            if (message.startsWith("bridge returned HTTP 409") && message.contains("\"device_standby\"")) {
+                if (!isBlank(takeover)) {
+                    ROLE.claimSent();
+                }
+                enterStandby(config, standbySummary(message));
+                return false;
+            }
+            if (message.startsWith("bridge returned HTTP 409") && message.contains("account session conflict")) {
+                // This session can never be accepted again (older generation, revoked
+                // credential or reused identity). A fresh generation recovers.
+                runtimeAccount.session = AccountSession.allocate(bridgeContext());
+                REGISTERED_KEY = "";
+                LAST_REGISTER_PROBLEM = "account session rejected by server; allocated a new session";
+                log(LAST_REGISTER_PROBLEM);
+                return false;
+            }
+            throw e;
+        }
         JSONObject root = new JSONObject(response);
         JSONObject result = root.optJSONObject("result");
         String device = "";
@@ -935,17 +1028,35 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 }
             }
         }
-        if (result == null || !config.runtimeAccount.session.acceptsEcho(
+        if (result == null || !runtimeAccount.session.acceptsEcho(
                 result.optString("account_session", ""), result.optLong("account_generation", 0))) {
             log("module register pending: server account-session support required");
             LAST_REGISTER_PROBLEM = "server did not confirm account session: " + shorten(response, 300);
             return false;
         }
-        if (!isCurrentAccount(config.runtimeAccount)) return false;
+        if (!isBlank(takeover)) {
+            ROLE.claimSent();
+        }
+        if (!isCurrentAccount(runtimeAccount)) return false;
         if (isBlank(device)) {
             log("module register response missing server device");
             LAST_REGISTER_PROBLEM = "register response missing server device";
             return false;
+        }
+        DeviceRole.State previous = ROLE.enterActive();
+        String takeoverReason = result.optString("takeover", "");
+        if (previous == DeviceRole.State.STANDBY) {
+            // Never replay what arrived while another phone was serving this Key:
+            // restart message polling from now and refresh the contact snapshot.
+            runtimeAccount.resetMessageWatermark();
+            runtimeAccount.lastContactSyncAt = 0L;
+        }
+        if (previous != DeviceRole.State.ACTIVE) {
+            publishRoleStatus("active", device + (isBlank(takeoverReason) ? "" : " takeover=" + takeoverReason));
+        }
+        if (!isBlank(takeoverReason)) {
+            log("this phone took over device=" + device + " reason=" + takeoverReason);
+            showToast("微信网关：本机已接管 " + device);
         }
         LAST_REGISTER_PROBLEM = "";
         REGISTERED_KEY = key;
@@ -954,6 +1065,93 @@ public final class HookEntry implements IXposedHookLoadPackage {
         config.device = device;
         log("module registered device=" + device + " wxid=" + config.selfWxid);
         return true;
+    }
+
+    private static void enterStandby(BridgeConfig config, String summary) {
+        REGISTERED_KEY = "";
+        // Standby is a normal state, not a registration problem to diagnose.
+        LAST_REGISTER_PROBLEM = "";
+        if (ROLE.enterStandby(summary)) {
+            String who = isBlank(summary) ? "另一台手机" : summary;
+            log("this phone is on standby; active phone: " + who);
+            showToast("微信网关：本机待命中，" + who + " 正在使用该 Key。打开本机微信即可接管。");
+            publishRoleStatus("standby", who);
+        }
+    }
+
+    /** Builds "model（nickname）" from a device_standby response body. */
+    static String standbySummary(String message) {
+        try {
+            int start = message.indexOf('{');
+            if (start < 0) {
+                return "";
+            }
+            JSONObject active = new JSONObject(message.substring(start)).optJSONObject("active");
+            if (active == null) {
+                return "";
+            }
+            String model = active.optString("device_model", "");
+            if (isBlank(model)) {
+                String shortId = active.optString("short_id", "");
+                model = "另一台手机" + (isBlank(shortId) ? "" : " #" + shortId);
+            }
+            String name = active.optString("wechat_nickname", "");
+            if (isBlank(name)) {
+                name = active.optString("owner_wxid", "");
+            }
+            return isBlank(name) ? model : model + "（" + name + "）";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String deviceModel() {
+        String manufacturer = android.os.Build.MANUFACTURER == null ? "" : android.os.Build.MANUFACTURER.trim();
+        String model = android.os.Build.MODEL == null ? "" : android.os.Build.MODEL.trim();
+        if (model.toLowerCase(Locale.US).startsWith(manufacturer.toLowerCase(Locale.US))) {
+            return model;
+        }
+        return (manufacturer + " " + model).trim();
+    }
+
+    private static void noteConflictStatus(String path, int status) {
+        if (status == 409 && path != null && !path.startsWith("/module/register") && !path.startsWith("/module/diagnostics")) {
+            FORCE_REREGISTER = true;
+        }
+    }
+
+    private static void showToast(final String text) {
+        final Context context = bridgeContext();
+        if (context == null) {
+            return;
+        }
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Toast.makeText(context, text, Toast.LENGTH_LONG).show();
+                } catch (Throwable ignored) {
+                    // A toast is only a hint; never disturb WeChat.
+                }
+            }
+        });
+    }
+
+    /** Lets the module settings page show "active" or "standby" for this phone. */
+    private static void publishRoleStatus(String state, String detail) {
+        Context context = bridgeContext();
+        if (context == null) {
+            return;
+        }
+        try {
+            ContentValues values = new ContentValues();
+            values.put("state", state);
+            values.put("detail", detail == null ? "" : detail);
+            values.put("updated_at", System.currentTimeMillis());
+            context.getContentResolver().update(Uri.parse(STATUS_PROVIDER_URI), values, null, null);
+        } catch (Throwable t) {
+            log("publish module status failed: " + shortError(t));
+        }
     }
 
     private static void syncContactsIfDue(BridgeConfig config) {
@@ -2117,7 +2315,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 } else if ("ready".equals(type)) {
                     log("outbox websocket ready");
                 } else if ("error".equals(type)) {
-                    log("outbox websocket server error: " + root.optString("error", ""));
+                    String error = root.optString("error", "");
+                    log("outbox websocket server error: " + error);
+                    if (error.contains("account session conflict")) {
+                        FORCE_REREGISTER = true;
+                        return;
+                    }
                 }
             }
         }
@@ -2173,6 +2376,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
         String headers = readHttpHeaders(input);
         String[] lines = headers.split("\r\n");
         if (lines.length == 0 || !lines[0].contains("101")) {
+            if (lines.length > 0 && lines[0].contains(" 409")) {
+                // account_session_conflict or device_session_active: re-check the role.
+                FORCE_REREGISTER = true;
+            }
             throw new IOException("websocket upgrade failed: " + (lines.length == 0 ? "" : lines[0]));
         }
         String accept = "";
@@ -3097,6 +3304,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 ? decodeChunkedBody(bodyBytes)
                 : new String(bodyBytes, StandardCharsets.UTF_8);
         if (status < 200 || status >= 300) {
+            noteConflictStatus(path, status);
             throw new IllegalStateException("bridge returned HTTP " + status + ": " + responseBody);
         }
         return responseBody;
@@ -3158,6 +3366,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         String response = readResponse(status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream());
         connection.disconnect();
         if (status < 200 || status >= 300) {
+            noteConflictStatus(path, status);
             throw new IllegalStateException("bridge returned HTTP " + status + ": " + response);
         }
         return response;

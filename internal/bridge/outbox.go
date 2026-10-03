@@ -106,12 +106,12 @@ func (o *MemoryOutbox) AckReplyActions(_ context.Context, req ModuleAckRequest) 
 	return out, nil
 }
 
-func (o *MemoryOutbox) CancelAccountOutbox(_ context.Context, device string) error {
+func (o *MemoryOutbox) CancelAccountOutbox(_ context.Context, device, keepOwner string) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for i := range o.items {
 		item := &o.items[i]
-		if item.Device == device && (item.Status == "pending" || item.Status == "leased") {
+		if item.Device == device && (item.Status == "leased" || (item.Status == "pending" && item.OwnerWxID != keepOwner)) {
 			item.Status = "cancelled"
 			item.LastError = "account session changed"
 			item.leaseUntil = time.Time{}

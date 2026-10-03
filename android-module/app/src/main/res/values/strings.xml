@@ -18,4 +18,7 @@
     <string name="label_media_upload_limit">媒体上传大小上限字节</string>
     <string name="label_stale_message_grace">历史消息判定宽限毫秒</string>
     <string name="label_stale_message_replay_limit">历史消息回灌上限</string>
+    <string name="status_unknown">运行状态：尚未连接（打开微信后回到本页刷新）</string>
+    <string name="status_active">运行状态：本机在用 %1$s（%2$s）</string>
+    <string name="status_standby">运行状态：本机待命中，%1$s 正在使用该 Key（%2$s）。打开本机微信即可接管，也可以在后台切换。</string>
 </resources>

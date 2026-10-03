@@ -12,6 +12,7 @@ import java.util.Map;
 
 public final class BridgeConfigProvider extends ContentProvider {
     static final String PREFS_NAME = "bridge_config";
+    static final String STATUS_PREFS_NAME = "bridge_status";
     static final String AUTHORITY = "cc.wechat.observatory.config";
     static final String[] CONFIG_KEYS = new String[]{
             "enabled",
@@ -70,6 +71,27 @@ public final class BridgeConfigProvider extends ContentProvider {
 
     @Override
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
-        return 0;
+        // The hooked WeChat process reports whether this phone is active or on standby.
+        Context context = getContext();
+        if (context == null || values == null || uri == null || !"/status".equals(uri.getPath())) {
+            return 0;
+        }
+        String state = values.getAsString("state");
+        if (!"active".equals(state) && !"standby".equals(state)) {
+            return 0;
+        }
+        String detail = values.getAsString("detail");
+        if (detail == null) {
+            detail = "";
+        } else if (detail.length() > 200) {
+            detail = detail.substring(0, 200);
+        }
+        Long updatedAt = values.getAsLong("updated_at");
+        context.getSharedPreferences(STATUS_PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString("state", state)
+                .putString("detail", detail)
+                .putLong("updated_at", updatedAt == null ? System.currentTimeMillis() : updatedAt)
+                .apply();
+        return 1;
     }
 }
