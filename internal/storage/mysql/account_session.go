@@ -52,7 +52,7 @@ var accountSessionMigrations = []string{
 		wechat_version VARCHAR(64) NULL,
 		module_version VARCHAR(64) NULL,
 		last_state VARCHAR(16) NOT NULL DEFAULT 'standby',
-		last_seen_at TIMESTAMP(6) NOT NULL,
+		last_seen_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 		last_active_at TIMESTAMP(6) NULL,
 		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE KEY uniq_bridge_module_installation (device, instance_id),
@@ -62,8 +62,35 @@ var accountSessionMigrations = []string{
 		device VARCHAR(128) NOT NULL PRIMARY KEY,
 		target_instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
 		requested_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-		expires_at TIMESTAMP(6) NOT NULL
+		expires_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+}
+
+// Every TIMESTAMP NOT NULL column above carries an explicit DEFAULT. With
+// explicit_defaults_for_timestamp=0 (Aliyun RDS ships that), MySQL otherwise
+// gives the first such column an implicit ON UPDATE CURRENT_TIMESTAMP and makes
+// the next one an invalid zero-date default (error 1067). A table created
+// under that mode before this fix is repaired by ensureInstallationTimestamps.
+
+// ensureInstallationTimestamps removes the implicit ON UPDATE clause that
+// explicit_defaults_for_timestamp=0 attached to last_seen_at: a heartbeat must
+// be written explicitly, never as a side effect of updating last_state.
+func (s *Store) ensureInstallationTimestamps(ctx context.Context) error {
+	var extra string
+	err := s.executor(ctx).QueryRowContext(ctx, `SELECT COALESCE(EXTRA, '') FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'bridge_module_installations' AND column_name = 'last_seen_at'`).Scan(&extra)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(strings.ToLower(extra), "on update") {
+		return nil
+	}
+	_, err = s.executor(ctx).ExecContext(ctx, `ALTER TABLE bridge_module_installations
+		MODIFY COLUMN last_seen_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)`)
+	return err
 }
 
 // ensureAccountEpochColumns adds the server epoch to bindings created before

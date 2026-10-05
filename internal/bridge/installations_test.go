@@ -229,6 +229,57 @@ func TestStandbyTakesOverWhenActivePhoneStopsHeartbeating(t *testing.T) {
 	}
 }
 
+// With foreground takeover disabled, opening WeChat on another phone (or on a
+// WeChat clone of the same phone) never steals the binding. The operator switch
+// and the stale-phone fallback keep working.
+func TestForegroundClaimIgnoredWhenForegroundTakeoverDisabled(t *testing.T) {
+	s, clock := newClockedService(t)
+	s.cfg.DisableForegroundTakeover = true
+	phone1 := phoneRegistration("a", "wxid_self", 1)
+	if _, err := s.RegisterModule(t.Context(), phone1); err != nil {
+		t.Fatal(err)
+	}
+	pendingID, err := s.SendText(t.Context(), SendTextRequest{Device: "phone-a", OwnerWxID: "wxid_self", WxIDs: []string{"friend"}, Text: "reply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clone := phoneRegistration("b", "wxid_clone", 1)
+	clone.Takeover = TakeoverForeground
+	var standby *StandbyError
+	if _, err := s.RegisterModule(t.Context(), clone); !errors.As(err, &standby) || standby.Active.DeviceModel != "Model a" {
+		t.Fatalf("foreground claim should stand by while disabled: %v %+v", err, standby)
+	}
+	if status := outboxStatuses(s)[pendingID]; status != "pending" {
+		t.Fatalf("ignored claim touched the active phone's queue: %s", status)
+	}
+	if items, err := s.PollOutbox(t.Context(), ModulePollRequest{APIKey: testAPIKey, WxID: phone1.WxID, AccountSession: phone1.AccountSession}); err != nil || len(items) != 1 {
+		t.Fatalf("active phone lost its binding: %+v %v", items, err)
+	}
+
+	// An operator can still move the device to the standby phone.
+	status := moduleStatus(t, s, "phone-a")
+	standbyID := status.Installations[1].ID
+	if _, err := s.RequestInstallationSwitch(t.Context(), "phone-a", standbyID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.RegisterModule(t.Context(), clone)
+	if err != nil || result.Takeover != takeoverAdmin {
+		t.Fatalf("admin switch with foreground disabled: %+v %v", result, err)
+	}
+
+	// And a silent active phone is still replaced after the takeover window.
+	phone1Next := phoneRegistration("a", "wxid_self", 2)
+	phone1Next.Takeover = TakeoverForeground
+	if _, err := s.RegisterModule(t.Context(), phone1Next); !errors.Is(err, ErrDeviceStandby) {
+		t.Fatalf("foreground claim back to phone a honoured: %v", err)
+	}
+	clock.Advance(DefaultModuleTakeoverAfter + time.Second)
+	result, err = s.RegisterModule(t.Context(), phone1Next)
+	if err != nil || result.Takeover != takeoverStale {
+		t.Fatalf("stale takeover with foreground disabled: %+v %v", result, err)
+	}
+}
+
 func TestBindingWithoutInstallationRecordGetsOneTakeoverWindow(t *testing.T) {
 	s, clock := newClockedService(t)
 	if _, err := s.RegisterModule(t.Context(), phoneRegistration("a", "wxid_self", 1)); err != nil {

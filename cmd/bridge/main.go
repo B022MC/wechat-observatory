@@ -64,6 +64,9 @@ func main() {
 		OfflineAfter:           cfg.ModuleOfflineAfter,
 		TakeoverAfter:          cfg.ModuleTakeoverAfter,
 		EventIdentityV2Devices: cfg.EventIdentityV2,
+		// The config keeps the positive spelling for operators; the zero value
+		// of bridge.Config must stay the historical behaviour for tests.
+		DisableForegroundTakeover: !cfg.ModuleForegroundTakeover,
 	}, opts...)
 
 	httpServer := &http.Server{

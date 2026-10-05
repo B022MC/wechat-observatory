@@ -247,7 +247,7 @@ func (s *Service) clearSwitchRequest(ctx context.Context, device, instance strin
 // takeoverReason decides whether another installation may replace the current
 // one. An empty reason means the caller stays on standby.
 func (s *Service) takeoverReason(ctx context.Context, device string, current AccountBinding, req ModuleRegistrationRequest) (string, error) {
-	if req.Takeover == TakeoverForeground {
+	if req.Takeover == TakeoverForeground && !s.cfg.DisableForegroundTakeover {
 		return TakeoverForeground, nil
 	}
 	switchReq, ok, err := s.currentSwitchRequest(ctx, device)

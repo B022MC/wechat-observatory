@@ -10,6 +10,9 @@ import android.net.Uri;
 
 import java.util.Map;
 
+import cc.wechat.observatory.wechat.HookTargets;
+import cc.wechat.observatory.wechat.WeChatScope;
+
 public final class BridgeConfigProvider extends ContentProvider {
     static final String PREFS_NAME = "bridge_config";
     static final String STATUS_PREFS_NAME = "bridge_status";
@@ -27,7 +30,14 @@ public final class BridgeConfigProvider extends ContentProvider {
             "media_upload_enabled",
             "media_upload_limit_bytes",
             "stale_message_grace_ms",
-            "stale_message_replay_limit"
+            "stale_message_replay_limit",
+            WeChatScope.KEY,
+            HookTargets.KEY_BIND,
+            HookTargets.KEY_OBSERVATION_CLASS,
+            HookTargets.KEY_OBSERVATION_METHOD,
+            HookTargets.KEY_APP_CLASS,
+            HookTargets.KEY_APP_ATTACH_METHOD,
+            HookTargets.KEY_APP_CREATE_METHOD
     };
 
     @Override

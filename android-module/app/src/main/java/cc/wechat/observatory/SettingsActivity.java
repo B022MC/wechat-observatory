@@ -11,6 +11,8 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -20,6 +22,7 @@ import java.util.Map;
 
 import cc.wechat.observatory.config.BridgeConfig;
 import cc.wechat.observatory.gateway.GatewayEndpoint;
+import cc.wechat.observatory.wechat.WeChatScope;
 
 public final class SettingsActivity extends Activity {
     private static final String DEFAULT_POLL_INTERVAL_MS = "1000";
@@ -52,6 +55,7 @@ public final class SettingsActivity extends Activity {
     }
 
     private final Map<String, EditText> fields = new LinkedHashMap<>();
+    private final Map<String, RadioButton> scopeButtons = new LinkedHashMap<>();
     private TextView statusView;
 
     @Override
@@ -117,6 +121,7 @@ public final class SettingsActivity extends Activity {
         addField(root, "bridge_url", R.string.label_bridge_url, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         addField(root, "api_key", R.string.label_api_key, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         maskSensitiveFields();
+        addScopeSelector(root);
         addField(root, "poll_interval_ms", R.string.label_poll_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "poll_limit", R.string.label_poll_limit, InputType.TYPE_CLASS_NUMBER);
         addField(root, "outbox_websocket_enabled", R.string.label_outbox_websocket_enabled, InputType.TYPE_CLASS_NUMBER);
@@ -165,6 +170,54 @@ public final class SettingsActivity extends Activity {
         fields.put(key, editText);
     }
 
+    /** Single choice of which WeChat on this phone the module works in. */
+    private void addScopeSelector(LinearLayout root) {
+        TextView label = new TextView(this);
+        label.setText(R.string.label_wechat_scope);
+        label.setTextSize(14);
+        label.setPadding(0, dp(10), 0, dp(4));
+        root.addView(label);
+
+        RadioGroup group = new RadioGroup(this);
+        group.setOrientation(RadioGroup.VERTICAL);
+        addScopeButton(group, WeChatScope.MAIN, R.string.scope_main);
+        addScopeButton(group, WeChatScope.CLONE, R.string.scope_clone);
+        addScopeButton(group, WeChatScope.ALL, R.string.scope_all);
+        root.addView(group, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView hint = new TextView(this);
+        hint.setText(R.string.hint_wechat_scope);
+        hint.setTextSize(12);
+        hint.setPadding(0, dp(2), 0, dp(4));
+        root.addView(hint);
+    }
+
+    private void addScopeButton(RadioGroup group, String scope, int labelResId) {
+        RadioButton button = new RadioButton(this);
+        button.setId(View.generateViewId());
+        button.setText(labelResId);
+        group.addView(button);
+        scopeButtons.put(scope, button);
+    }
+
+    private void setScope(String scope) {
+        String normalized = WeChatScope.normalize(scope);
+        for (Map.Entry<String, RadioButton> entry : scopeButtons.entrySet()) {
+            entry.getValue().setChecked(entry.getKey().equals(normalized));
+        }
+    }
+
+    private String selectedScope() {
+        for (Map.Entry<String, RadioButton> entry : scopeButtons.entrySet()) {
+            if (entry.getValue().isChecked()) {
+                return entry.getKey();
+            }
+        }
+        return WeChatScope.MAIN;
+    }
+
     private void maskSensitiveFields() {
         for (String key : SENSITIVE_CONFIG_KEYS) {
             EditText field = fields.get(key);
@@ -181,6 +234,7 @@ public final class SettingsActivity extends Activity {
                 setValue(key, prefs.getString(key, DEFAULTS.get(key)));
             }
         }
+        setScope(prefs.getString(WeChatScope.KEY, WeChatScope.MAIN));
     }
 
     private void saveValues() {
@@ -208,6 +262,10 @@ public final class SettingsActivity extends Activity {
         for (String key : BridgeConfigProvider.CONFIG_KEYS) {
             if ("enabled".equals(key)) {
                 editor.putString(key, "1");
+                continue;
+            }
+            if (WeChatScope.KEY.equals(key)) {
+                editor.putString(key, selectedScope());
                 continue;
             }
             EditText field = fields.get(key);

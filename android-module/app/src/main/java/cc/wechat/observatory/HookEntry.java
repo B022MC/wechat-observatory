@@ -1,11 +1,15 @@
 package cc.wechat.observatory;
 
+import android.content.BroadcastReceiver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageInfo;
 import android.app.Activity;
 import android.app.Application;
 import android.net.Uri;
+import android.os.Build;
 import android.widget.Toast;
 import android.os.Handler;
 import android.os.Looper;
@@ -62,6 +66,9 @@ import cc.wechat.observatory.wechat.AccountSession;
 import cc.wechat.observatory.wechat.AccountDatabaseSelector;
 import cc.wechat.observatory.wechat.WeChatAccountResolver;
 import cc.wechat.observatory.wechat.DeviceRole;
+import cc.wechat.observatory.wechat.HookTargets;
+import cc.wechat.observatory.wechat.ScreenAwarePacing;
+import cc.wechat.observatory.wechat.WeChatScope;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -113,6 +120,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final long OUTBOX_STALL_REPORT_MS = 300000L;
     private static final AtomicBoolean OUTBOX_WATCHDOG_STARTED = new AtomicBoolean(false);
     private static final DeviceRole ROLE = new DeviceRole();
+    private static final ScreenAwarePacing SCREEN_PACING = new ScreenAwarePacing();
+    private static final AtomicBoolean SCREEN_RECEIVER_REGISTERED = new AtomicBoolean(false);
+    private static volatile HookTargets HOOK_TARGETS = HookTargets.defaults();
     private static volatile boolean FORCE_REREGISTER;
     private static final AtomicInteger STARTED_ACTIVITIES = new AtomicInteger(0);
     private static volatile long BACKGROUND_SINCE = 0L;
@@ -129,11 +139,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return; // Only the main process owns the logged-in account and its registration.
         }
 
+        // Resolve hook targets before the first findClass. A WeChat release that
+        // renamed an internal class is exactly what a bound override exists for.
+        HookTargets targets = resolveHookTargets();
+        HOOK_TARGETS = targets;
+
         try {
-            Class<?> sqliteDatabase = XposedHelpers.findClass("com.tencent.wcdb.database.SQLiteDatabase", lpparam.classLoader);
+            Class<?> sqliteDatabase = XposedHelpers.findClass(targets.observationClass, lpparam.classLoader);
             XposedHelpers.findAndHookMethod(
                     sqliteDatabase,
-                    "insertWithOnConflict",
+                    targets.observationMethod,
                     String.class,
                     String.class,
                     ContentValues.class,
@@ -157,13 +172,33 @@ public final class HookEntry implements IXposedHookLoadPackage {
                             }
                         }
                     });
-            log("hooked WeChat WCDB access methods");
+            log("hooked WeChat WCDB access methods via "
+                    + targets.observationClass + "#" + targets.observationMethod);
             hookApplicationAttach(lpparam.classLoader);
-            hookWeChatApplication(lpparam.classLoader);
+            hookWeChatApplication(lpparam.classLoader, targets);
             hookForeground();
+            registerScreenStateReceiver();
         } catch (Throwable t) {
             log("hook failed: " + t);
             reportHookFailureLater("hook failed: " + t);
+        }
+    }
+
+    /**
+     * Hook targets for this run, falling back to the built-in defaults.
+     *
+     * <p>An override is honoured only when it declares this exact WeChat build, so
+     * a stale config can never redirect a working hook onto a wrong class.
+     */
+    private static HookTargets resolveHookTargets() {
+        try {
+            BridgeConfig config = BridgeConfig.load(bridgeContext());
+            HookTargets targets = config.hookTargets(wechatVersion());
+            log("hook targets: " + targets.describe());
+            return targets;
+        } catch (Throwable t) {
+            log("hook target resolve failed, using built-in targets: " + shortError(t));
+            return HookTargets.defaults();
         }
     }
 
@@ -188,6 +223,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 ClassLoader runtimeLoader = param.thisObject == null ? null : param.thisObject.getClass().getClassLoader();
                                 log("Application.attach captured context; start outbox worker");
                                 startWorker(runtimeLoader == null ? classLoader : runtimeLoader);
+                                registerScreenStateReceiver();
                             }
                         }
                     });
@@ -197,12 +233,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private static void hookWeChatApplication(final ClassLoader classLoader) {
+    private static void hookWeChatApplication(final ClassLoader classLoader, final HookTargets targets) {
         try {
             XposedHelpers.findAndHookMethod(
-                    "com.tencent.mm.app.MMApplicationLike",
+                    targets.appClass,
                     classLoader,
-                    "onBaseContextAttached",
+                    targets.appAttachMethod,
                     Context.class,
                     new XC_MethodHook() {
                         @Override
@@ -216,9 +252,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         }
                     });
             XposedHelpers.findAndHookMethod(
-                    "com.tencent.mm.app.MMApplicationLike",
+                    targets.appClass,
                     classLoader,
-                    "onCreate",
+                    targets.appCreateMethod,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
@@ -274,6 +310,47 @@ public final class HookEntry implements IXposedHookLoadPackage {
             log("hooked WeChat foreground transitions");
         } catch (Throwable t) {
             log("hook foreground transitions failed: " + t);
+        }
+    }
+
+    /**
+     * Watches screen state so an idle phone polls less.
+     *
+     * <p>Messages arrive through the database insert hook, so a slower poll loop
+     * only delays reconciliation. The receiver is registered from inside the hooked
+     * process, for that process alone.
+     */
+    private static void registerScreenStateReceiver() {
+        Context context = APP_CONTEXT;
+        if (context == null || !SCREEN_RECEIVER_REGISTERED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_SCREEN_ON);
+            filter.addAction(Intent.ACTION_SCREEN_OFF);
+            BroadcastReceiver receiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context ignored, Intent intent) {
+                    String action = intent == null ? null : intent.getAction();
+                    if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                        SCREEN_PACING.onScreenOn();
+                        log("screen on; resume the configured poll interval");
+                    } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                        SCREEN_PACING.onScreenOff();
+                        log("screen off; idle pacing " + SCREEN_PACING.describe());
+                    }
+                }
+            };
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, filter);
+            }
+            log("screen state receiver registered");
+        } catch (Throwable t) {
+            SCREEN_RECEIVER_REGISTERED.set(false);
+            log("screen state receiver registration failed: " + shortError(t));
         }
     }
 
@@ -412,7 +489,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 log("worker failed: " + t);
                 reportDiagnostic(config, stage, String.valueOf(t));
             }
-            if (!sleepOnce(Math.max(1000L, config.pollIntervalMs))) {
+            if (!sleepPaced(Math.max(1000L, config.pollIntervalMs))) {
                 return;
             }
         }
@@ -471,7 +548,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 reportDiagnostic(config, "outbox-worker", String.valueOf(t));
             }
             long delay = OutboxDeliveryPacing.nextDelayMs(completedOutboxItem, config.pollIntervalMs);
-            if (delay > 0 && !sleepOnce(delay)) {
+            if (delay > 0 && !sleepPaced(delay)) {
                 return;
             }
         }
@@ -485,6 +562,31 @@ public final class HookEntry implements IXposedHookLoadPackage {
             Thread.currentThread().interrupt();
             return false;
         }
+    }
+
+    /**
+     * Sleeps one paced delay, served in slices so a screen-on transition shortens
+     * the wait instead of being noticed only after the whole idle delay.
+     */
+    private static boolean sleepPaced(long baseDelayMs) {
+        if (SCREEN_PACING.consumeWakeRequest()) {
+            return true;
+        }
+        long remaining = SCREEN_PACING.paceDelay(baseDelayMs);
+        while (remaining > 0L) {
+            long slice = ScreenAwarePacing.nextSlice(remaining);
+            if (slice <= 0L) {
+                return true;
+            }
+            if (!sleepOnce(slice)) {
+                return false;
+            }
+            remaining -= slice;
+            if (SCREEN_PACING.consumeWakeRequest()) {
+                return true;
+            }
+        }
+        return true;
     }
 
     /**
@@ -502,6 +604,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         CAPABILITY_REPORTED = true;
         StringBuilder report = new StringBuilder("capability report: wechat=");
         report.append(wechatVersion());
+        report.append(" instance=").append(WeChatScope.describe(android.os.Process.myUid()));
         report.append(" observation=").append(checkObservation(classLoader));
         report.append(" identity=").append(isBlank(CURRENT_WXID) ? "pending" : "ok");
         report.append(" send.builder=").append(checkPath(classLoader,
@@ -518,6 +621,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 new String[]{"tg3.t1", "rn3.u1"}));
         report.append(" bootstrap=").append(checkBootstrap(classLoader));
         report.append(" gates=").append(readinessDetail(classLoader));
+        report.append(" targets=").append(HOOK_TARGETS.describe());
         LAST_CAPABILITY_REPORT = report.toString();
         log(LAST_CAPABILITY_REPORT);
     }
@@ -556,9 +660,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return detail.toString();
     }
 
+    /**
+     * The running WeChat build as {@code <versionName>/<versionCode>}.
+     *
+     * <p>Falls back to the system context because hook targets are resolved during
+     * {@code handleLoadPackage}, before the WeChat application has attached and
+     * {@code APP_CONTEXT} is available.
+     */
     private static String wechatVersion() {
         try {
-            Context context = bridgeContext();
+            Context context = packageManagerContext();
             if (context == null) {
                 return "unknown";
             }
@@ -567,6 +678,28 @@ public final class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             return "unknown";
         }
+    }
+
+    private static Context packageManagerContext() {
+        Context context = bridgeContext();
+        if (context != null) {
+            return context;
+        }
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method currentThread = activityThreadClass.getDeclaredMethod("currentActivityThread");
+            Object thread = currentThread.invoke(null);
+            if (thread == null) {
+                return null;
+            }
+            Method getSystemContext = activityThreadClass.getDeclaredMethod("getSystemContext");
+            Object value = getSystemContext.invoke(thread);
+            if (value instanceof Context) {
+                return (Context) value;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private static String checkObservation(ClassLoader classLoader) {
@@ -1074,7 +1207,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (ROLE.enterStandby(summary)) {
             String who = isBlank(summary) ? "另一台手机" : summary;
             log("this phone is on standby; active phone: " + who);
-            showToast("微信网关：本机待命中，" + who + " 正在使用该 Key。打开本机微信即可接管。");
+            showToast("微信网关：本机待命中，" + who + " 正在使用该 Key。需要切到本机请在后台点“切到这台手机”。");
             publishRoleStatus("standby", who);
         }
     }

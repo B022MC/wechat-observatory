@@ -80,6 +80,9 @@ type Config struct {
 	OfflineAfter           time.Duration
 	TakeoverAfter          time.Duration
 	EventIdentityV2Devices map[string]struct{}
+	// DisableForegroundTakeover keeps the current phone when another phone only
+	// opens WeChat. Admin switches and stale-phone takeover still apply.
+	DisableForegroundTakeover bool
 }
 
 func NewService(cfg Config, opts ...Option) *Service {

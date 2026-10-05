@@ -28,13 +28,17 @@ type Config struct {
 	PollInterval        time.Duration
 	ModuleOfflineAfter  time.Duration
 	ModuleTakeoverAfter time.Duration
-	OfflineOutboxSweep  time.Duration
-	RetentionDays       int
-	RetentionPoll       time.Duration
-	EventIdentityV2     map[string]struct{}
-	Devices             map[string]Device
-	APIKeys             map[string]APIKey
-	MySQL               MySQLConfig
+	// ModuleForegroundTakeover lets a standby phone claim the device binding
+	// just by opening WeChat. When false, only an admin switch or the active
+	// phone going silent past ModuleTakeoverAfter moves the binding.
+	ModuleForegroundTakeover bool
+	OfflineOutboxSweep       time.Duration
+	RetentionDays            int
+	RetentionPoll            time.Duration
+	EventIdentityV2          map[string]struct{}
+	Devices                  map[string]Device
+	APIKeys                  map[string]APIKey
+	MySQL                    MySQLConfig
 }
 
 type MySQLConfig struct {
@@ -97,6 +101,11 @@ func LoadFromEnv() (Config, error) {
 		return Config{}, err
 	}
 	cfg.MySQL.AutoMigrate = autoMigrate
+	foregroundTakeover, err := getenvBool("BRIDGE_MODULE_FOREGROUND_TAKEOVER", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ModuleForegroundTakeover = foregroundTakeover
 
 	devices, err := parseDevices(os.Getenv("BRIDGE_DEVICES"))
 	if err != nil {

@@ -20,5 +20,10 @@
     <string name="label_stale_message_replay_limit">历史消息回灌上限</string>
     <string name="status_unknown">运行状态：尚未连接（打开微信后回到本页刷新）</string>
     <string name="status_active">运行状态：本机在用 %1$s（%2$s）</string>
-    <string name="status_standby">运行状态：本机待命中，%1$s 正在使用该 Key（%2$s）。打开本机微信即可接管，也可以在后台切换。</string>
+    <string name="status_standby">运行状态：本机待命中，%1$s 正在使用该 Key（%2$s）。需要切到本机时请在后台点“切到这台手机”；在用手机离线超过 2 分钟也会自动切换。</string>
+    <string name="label_wechat_scope">模块作用于哪个微信</string>
+    <string name="scope_main">主微信（默认）</string>
+    <string name="scope_clone">微信分身</string>
+    <string name="scope_all">两个都作用（不推荐，会争抢同一个 Key）</string>
+    <string name="hint_wechat_scope">一台手机只让一个微信使用这个 Key。保存后无需重启微信，通常几秒内生效。</string>
 </resources>

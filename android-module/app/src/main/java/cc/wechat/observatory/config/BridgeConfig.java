@@ -17,6 +17,8 @@ import cc.wechat.observatory.gateway.GatewayEndpoint;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.util.Strings;
 import cc.wechat.observatory.wechat.RuntimeAccount;
+import cc.wechat.observatory.wechat.HookTargets;
+import cc.wechat.observatory.wechat.WeChatScope;
 import de.robv.android.xposed.XSharedPreferences;
 
 public final class BridgeConfig {
@@ -49,7 +51,16 @@ public final class BridgeConfig {
     public long mediaUploadLimitBytes;
     public long staleMessageGraceMs;
     public int staleMessageReplayLimit;
+    /** Which WeChat on this phone the module serves: main, clone or all. */
+    public String wechatScope;
+    /** True when this process is the WeChat instance the scope excludes. */
+    public boolean scopeExcluded;
     public String signature;
+    /**
+     * Only the {@code hook_*} keys. Hook targets are resolved against the running
+     * WeChat build, which is unknown while parsing properties.
+     */
+    private Properties hookOverrideProperties = new Properties();
 
     private BridgeConfig() {
     }
@@ -57,8 +68,22 @@ public final class BridgeConfig {
     public static BridgeConfig load(Context context) {
         Properties properties = readProperties(context);
         BridgeConfig config = fromProperties(properties);
+        applyWeChatScope(config, android.os.Process.myUid());
         logConfigOnce(config, properties);
         return config;
+    }
+
+    /**
+     * Turns the module off inside a WeChat instance the operator did not select.
+     * Every worker, upload, registration and diagnostic path already stops when
+     * {@code enabled} is false, so the unselected main WeChat or clone never
+     * claims the device binding nor reports anything.
+     */
+    static void applyWeChatScope(BridgeConfig config, int uid) {
+        if (config != null && config.enabled && !WeChatScope.serves(config.wechatScope, uid)) {
+            config.enabled = false;
+            config.scopeExcluded = true;
+        }
     }
 
     static BridgeConfig fromProperties(Properties properties) {
@@ -81,8 +106,39 @@ public final class BridgeConfig {
         config.mediaUploadLimitBytes = longSetting(properties, "media_upload_limit_bytes", 5L * 1024L * 1024L);
         config.staleMessageGraceMs = nonNegativeLongSetting(properties, "stale_message_grace_ms", DEFAULT_STALE_MESSAGE_GRACE_MS);
         config.staleMessageReplayLimit = nonNegativeIntSetting(properties, "stale_message_replay_limit", DEFAULT_STALE_MESSAGE_REPLAY_LIMIT);
+        config.wechatScope = WeChatScope.normalize(setting(properties, WeChatScope.KEY, WeChatScope.MAIN));
+        config.hookOverrideProperties = hookOverrideProperties(properties);
         config.signature = configSignature(properties);
         return config;
+    }
+
+    /**
+     * Which WeChat internals to hook on the given build.
+     *
+     * <p>The bind value is the running {@code versionName/versionCode}. An override
+     * that does not carry that exact bind is ignored, so a config written for
+     * another WeChat release can never move a working hook onto a wrong class.
+     */
+    public HookTargets hookTargets(String runtimeBind) {
+        return HookTargets.resolve(hookOverrideProperties, runtimeBind);
+    }
+
+    private static Properties hookOverrideProperties(Properties source) {
+        Properties out = new Properties();
+        if (source == null) {
+            return out;
+        }
+        String bind = setting(source, HookTargets.KEY_BIND, "");
+        if (!Strings.isBlank(bind)) {
+            out.setProperty(HookTargets.KEY_BIND, bind);
+        }
+        for (String key : HookTargets.OVERRIDE_KEYS) {
+            String value = setting(source, key, "");
+            if (!Strings.isBlank(value)) {
+                out.setProperty(key, value);
+            }
+        }
+        return out;
     }
 
     private static Properties readProperties(Context context) {
@@ -301,6 +357,8 @@ public final class BridgeConfig {
         lastConfigLogAt = now;
         BridgeLogger.log("config loaded keys=" + properties.size()
                 + " enabled=" + config.enabled
+                + " wechatScope=" + config.wechatScope
+                + (config.scopeExcluded ? "(excluded:" + WeChatScope.describe(android.os.Process.myUid()) + ")" : "")
                 + " baseUrl=" + (Strings.isBlank(config.baseUrl) ? "<empty>" : config.baseUrl)
                 + " device=" + config.device
                 + " selfWxid=" + (Strings.isBlank(config.selfWxid) ? "<empty>" : config.selfWxid)
@@ -384,8 +442,16 @@ public final class BridgeConfig {
                 "media_upload_enabled",
                 "media_upload_limit_bytes",
                 "stale_message_grace_ms",
-                "stale_message_replay_limit"
+                "stale_message_replay_limit",
+                WeChatScope.KEY
         }) {
+            out.append(key).append('=').append(setting(properties, key, "")).append('\n');
+        }
+        // Hook targets are part of the effective config: changing them must restart
+        // the workers exactly like changing the bridge URL does.
+        out.append(HookTargets.KEY_BIND).append('=')
+                .append(setting(properties, HookTargets.KEY_BIND, "")).append('\n');
+        for (String key : HookTargets.OVERRIDE_KEYS) {
             out.append(key).append('=').append(setting(properties, key, "")).append('\n');
         }
         return out.toString();

@@ -66,6 +66,24 @@ func TestEventIdentityV2DevicesDefaultOffAndMatchExactly(t *testing.T) {
 	}
 }
 
+func TestModuleForegroundTakeoverDefaultsOnAndCanBeDisabled(t *testing.T) {
+	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
+	t.Setenv("BRIDGE_MODULE_FOREGROUND_TAKEOVER", "")
+	cfg, err := LoadFromEnv()
+	if err != nil || !cfg.ModuleForegroundTakeover {
+		t.Fatalf("foreground takeover should default on: %+v %v", cfg.ModuleForegroundTakeover, err)
+	}
+	t.Setenv("BRIDGE_MODULE_FOREGROUND_TAKEOVER", "false")
+	cfg, err = LoadFromEnv()
+	if err != nil || cfg.ModuleForegroundTakeover {
+		t.Fatalf("foreground takeover should be disabled: %+v %v", cfg.ModuleForegroundTakeover, err)
+	}
+	t.Setenv("BRIDGE_MODULE_FOREGROUND_TAKEOVER", "sometimes")
+	if _, err := LoadFromEnv(); err == nil {
+		t.Fatal("invalid foreground takeover flag accepted")
+	}
+}
+
 func TestLoadFromEnvDefaultsOutboxPollIntervalToThreeSeconds(t *testing.T) {
 	t.Setenv("BRIDGE_MYSQL_DSN", "wechat:secret@tcp(db.example:3306)/wechat_observatory?parseTime=true")
 	t.Setenv("BRIDGE_OUTBOX_POLL_INTERVAL", "")

@@ -8,6 +8,8 @@ import java.util.Properties;
 import org.junit.Test;
 
 import cc.wechat.observatory.gateway.GatewayEndpoint;
+import cc.wechat.observatory.wechat.HookTargets;
+import cc.wechat.observatory.wechat.WeChatScope;
 
 public final class BridgeConfigTest {
     @Test
@@ -93,5 +95,96 @@ public final class BridgeConfigTest {
         BridgeConfig config = BridgeConfig.fromProperties(properties);
 
         assertEquals(BridgeConfig.DEFAULT_STALE_MESSAGE_REPLAY_LIMIT, config.staleMessageReplayLimit);
+    }
+
+    @Test
+    public void hookTargetsResolveAgainstTheRunningWeChatBuild() {
+        Properties properties = new Properties();
+        properties.setProperty("hook_override_bind", "8.0.76/3141");
+        properties.setProperty("hook_observation_class", "com.tencent.wcdb.database.SQLiteDatabaseX");
+
+        BridgeConfig config = BridgeConfig.fromProperties(properties);
+
+        assertEquals("com.tencent.wcdb.database.SQLiteDatabaseX",
+                config.hookTargets("8.0.76/3141").observationClass);
+        assertEquals(HookTargets.DEFAULT_OBSERVATION_CLASS,
+                config.hookTargets("8.0.78/3180").observationClass);
+        assertEquals("bind-mismatch", config.hookTargets("8.0.78/3180").rejection);
+    }
+
+    @Test
+    public void hookTargetOverridesArePartOfTheConfigSignature() {
+        Properties first = new Properties();
+        first.setProperty("hook_observation_class", "com.tencent.wcdb.database.SQLiteDatabaseA");
+        Properties second = new Properties();
+        second.setProperty("hook_observation_class", "com.tencent.wcdb.database.SQLiteDatabaseB");
+
+        assertNotEquals(
+                BridgeConfig.fromProperties(first).signature,
+                BridgeConfig.fromProperties(second).signature);
+    }
+
+    @Test
+    public void configWithoutHookKeysUsesBuiltInTargets() {
+        BridgeConfig config = BridgeConfig.fromProperties(new Properties());
+
+        assertEquals(HookTargets.DEFAULT_APP_CLASS, config.hookTargets("8.0.76/3141").appClass);
+        assertEquals("", config.hookTargets("8.0.76/3141").rejection);
+    }
+
+    @Test
+    public void wechatScopeDefaultsToTheMainWeChat() {
+        assertEquals(WeChatScope.MAIN, BridgeConfig.fromProperties(new Properties()).wechatScope);
+        Properties clone = new Properties();
+        clone.setProperty("wechat_scope", "clone");
+        assertEquals(WeChatScope.CLONE, BridgeConfig.fromProperties(clone).wechatScope);
+        Properties invalid = new Properties();
+        invalid.setProperty("wechat_scope", "everything");
+        assertEquals(WeChatScope.MAIN, BridgeConfig.fromProperties(invalid).wechatScope);
+    }
+
+    @Test
+    public void wechatScopeIsPartOfTheConfigSignature() {
+        Properties main = new Properties();
+        main.setProperty("wechat_scope", "main");
+        Properties clone = new Properties();
+        clone.setProperty("wechat_scope", "clone");
+
+        assertNotEquals(
+                BridgeConfig.fromProperties(main).signature,
+                BridgeConfig.fromProperties(clone).signature);
+    }
+
+    @Test
+    public void unselectedWeChatInstanceIsDisabled() {
+        int mainUid = 10234;
+        int cloneUid = 99910234;
+        Properties properties = new Properties();
+        properties.setProperty("api_key", "test-key");
+
+        BridgeConfig mainInMain = BridgeConfig.fromProperties(properties);
+        BridgeConfig.applyWeChatScope(mainInMain, mainUid);
+        assertEquals(true, mainInMain.enabled);
+        assertEquals(false, mainInMain.scopeExcluded);
+
+        BridgeConfig mainInClone = BridgeConfig.fromProperties(properties);
+        BridgeConfig.applyWeChatScope(mainInClone, cloneUid);
+        assertEquals(false, mainInClone.enabled);
+        assertEquals(true, mainInClone.scopeExcluded);
+
+        properties.setProperty("wechat_scope", "clone");
+        BridgeConfig cloneInMain = BridgeConfig.fromProperties(properties);
+        BridgeConfig.applyWeChatScope(cloneInMain, mainUid);
+        assertEquals(false, cloneInMain.enabled);
+        BridgeConfig cloneInClone = BridgeConfig.fromProperties(properties);
+        BridgeConfig.applyWeChatScope(cloneInClone, cloneUid);
+        assertEquals(true, cloneInClone.enabled);
+
+        properties.setProperty("wechat_scope", "main");
+        properties.setProperty("enabled", "0");
+        BridgeConfig disabled = BridgeConfig.fromProperties(properties);
+        BridgeConfig.applyWeChatScope(disabled, mainUid);
+        assertEquals(false, disabled.enabled);
+        assertEquals(false, disabled.scopeExcluded);
     }
 }

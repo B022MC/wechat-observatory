@@ -15,3 +15,6 @@ data:
   BRIDGE_OFFLINE_OUTBOX_SWEEP_INTERVAL: "30s"
   # Enable only after every Gateway control Pod permanently understands v2.
   BRIDGE_EVENT_IDENTITY_V2_DEVICES: ""
+  # false: opening WeChat on another phone (or a WeChat clone) no longer takes
+  # over a device. Admin switch and stale-phone takeover still apply.
+  BRIDGE_MODULE_FOREGROUND_TAKEOVER: "true"

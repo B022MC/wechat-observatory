@@ -216,6 +216,58 @@ capability report: wechat=8.0.78/3180 observation=ok identity=ok
 `wechat.8.0.74.json`（手机导出包生成，可用）、`wechat.8.0.76.json`、
 `wechat.8.0.78.json`（后两者 bootstrap 不完整、不可用）。这些文件当前只是**记录**，
 模块仍在代码里解析 hook 点；后续如果要让模块直接读它们，再单独做读取层。
+7.4 是这条路上的一个受控子集：模块不读 profile，只接受运行时的**单点覆盖**。
+
+### 7.4 Hook 目标覆盖
+
+`HookTargets` 允许在不重发 APK 的前提下改掉**类名/方法名级别**的 hook 点，
+但覆盖必须声明它写的是哪个微信版本，否则整包拒绝：
+
+| key | 覆盖对象 | 内置默认 |
+|---|---|---|
+| `hook_override_bind` | 绑定版本，格式 `<versionName>/<versionCode>` | 空 = 不启用覆盖 |
+| `hook_observation_class` | 观测 hook 的类 | `com.tencent.wcdb.database.SQLiteDatabase` |
+| `hook_observation_method` | 观测 hook 的方法 | `insertWithOnConflict` |
+| `hook_app_class` | 引导 hook 的类 | `com.tencent.mm.app.MMApplicationLike` |
+| `hook_app_attach_method` | 引导 attach 方法 | `onBaseContextAttached` |
+| `hook_app_create_method` | 引导 onCreate 方法 | `onCreate` |
+
+规则：
+
+1. `hook_override_bind` 必须等于运行时 `versionName/versionCode`。不相等、为空、
+   或运行时版本未知（`wechatVersion()` 返回 `unknown`）时，**全部回退内置默认**，
+   并在 capability report 的 `targets=` 段记 `rejected=bind-mismatch` 或 `missing-bind`。
+   写错版本的配置不能让一个能用的 hook 指向错的类，这是这条规则存在的唯一理由。
+2. 类名/方法名逐个做语法校验（类名必须含包路径）。不合法的那一项单独回退，
+   记 `rejected=invalid-class:<key>` 或 `invalid-method:<key>`，其余合法项照常生效。
+3. 解析发生在 `handleLoadPackage` 第一次 `findClass` 之前，覆盖当次启动即生效；
+   配置变化会改变 `BridgeConfig.signature`，worker 随之重建。
+
+下发走**既有**配置通道，不新增 gateway 接口：`config.properties`
+（`/data/local/tmp/wechat-observatory/`、`Android/media/`、`Download/`）、
+LSPosed prefs、ContentProvider，或广播 `cc.wechat.observatory.SET_CONFIG`
+（这些 key 已在 `BridgeConfigProvider.CONFIG_KEYS` 白名单里，`BridgeConfigReceiver`
+自动接受）。
+
+> **广播是整包替换语义。** `BridgeConfigReceiver` 先 `editor.clear()` 再写入 intent
+> 携带的 key，所以只带 `hook_*` 的广播会连带清掉 `bridge_url` 和 `api_key`，模块随即失联。
+> 用广播改 hook 覆盖时必须把**全部有效 key 一起带上**，例如：
+>
+> ```bash
+> adb shell am broadcast -a cc.wechat.observatory.SET_CONFIG \
+>   --es enabled 1 \
+>   --es bridge_url https://47.108.232.203/observatory \
+>   --es api_key "$API_KEY" \
+>   --es hook_override_bind "8.0.78/3180" \
+>   --es hook_observation_class com.tencent.wcdb.database.SQLiteDatabase
+> ```
+>
+> 只想改 hook 覆盖、不想碰其它配置时，改 `config.properties` 文件更安全：
+> `BridgeConfig.readLocalTmpProperties()` 是整文件读取，不做清空。
+
+覆盖范围**不含** `fs.g` / `i95.n0` / `com.tencent.mm.app.p0` 这组引导类，也不含
+发送路径的字段名。第 6 节已说明前者没有可靠形状特征、只能人工判断；后者是字段级
+候选数组，属于 L0/L1 profile 的范畴。
 
 ## 8. 明确不做的部分
 
@@ -223,6 +275,10 @@ capability report: wechat=8.0.78/3180 observation=ok identity=ok
 - 不做无障碍/企业微信等替代通道。
 
 版本适配按第 4 节的"插 USB 四步走"人工完成，工具负责定位差别。
+
+7.4 的 hook 目标覆盖是这条结论下的例外，不是它的反面：没有新增分发接口、没有
+自动定位、没有灰度，只是让既有配置通道能改 6 个已命名项，而且不带匹配的绑定版本
+就一律不生效。
 
 ## 9. 当前账号隔离与“未收录”修复（0.1.7）
 
